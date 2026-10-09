@@ -1,0 +1,5 @@
+# Unreviewed drafts and local workflow receipts never enter formal Git history.
+/inbox/
+/.local/
+# Original chat storage is separate from permission to commit or upload it.
+/conversations/raw/
