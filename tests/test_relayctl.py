@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -271,6 +272,41 @@ class Workflow(unittest.TestCase):
             self.call(relay.recover)
         self.assertEqual('# External change\n', (self.agent / 'state.md').read_text())
         self.assertTrue((self.agent / '.local/transaction.json').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX file modes are not portable to Windows')
+    def test_apply_preserves_document_file_mode(self):
+        mapping = dict(self.mapping(), **{'lessons.md': '# Reviewed lesson fixture\n'})
+        (self.agent / 'lessons.md').chmod(0o644)
+        self.prepare(mapping)
+        self.assertEqual(0o644, stat.S_IMODE((self.agent / 'lessons.md').stat().st_mode))
+        self.assertEqual(0o644, stat.S_IMODE((self.agent / 'state.md').stat().st_mode))
+
+    def test_abandoned_tempfile_does_not_stale_approved_batch(self):
+        bid = self.call(relay.draft, self.mapping(), 'leftover')
+        self.call(relay.review, bid, approve=list(self.mapping()), reviewer='human fixture')
+        # An interrupted apply (SIGKILL, power loss) can leave mkstemp output behind.
+        # It is not memory and must not count as a repository change, or apply and
+        # commit-check would reject the approved batch and recovery would not help.
+        (self.agent / '.relay-abandoned').write_text('partial bytes')
+        self.call(relay.apply, bid)
+        self.git('add', '.')
+        self.call(relay.commit_check)
+        self.assertNotIn('.agent/.relay-abandoned', self.git('ls-files').decode())
+
+    def test_snapshot_counts_ignored_non_markdown_agent_assets(self):
+        # A repository or global ignore rule can hide .agent/ before its first commit,
+        # so Git lists none of it. The assets the first commit must stage (.gitignore,
+        # tools/relayctl.py) still belong to the snapshot; otherwise the documented
+        # forced staging shrinks the approved snapshot and forces a second review.
+        (self.root / '.gitignore').write_text('.agent/\n')
+        self.git('rm', '-r', '--cached', '--quiet', '.agent')
+        self.git('add', '.gitignore')
+        self.git('commit', '-m', 'Hide .agent before its first commit')
+        self.assertNotIn('.agent', self.git('ls-files').decode())
+        snapshot = relay.snapshot(self.root)
+        tracked = {**snapshot['code'], **snapshot['memory']}
+        self.assertIn('.agent/.gitignore', tracked)
+        self.assertIn('.agent/tools/relayctl.py', tracked)
 
     def test_repeated_init_preserves_docs_runtime_and_pending(self):
         self.prepare()

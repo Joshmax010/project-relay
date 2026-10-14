@@ -23,6 +23,9 @@ PRIVATE = ('inbox', '.local', 'conversations/raw')
 CORE = ('agent.md', 'human.md', 'project.md', 'state.md', 'structure.md',
         'decisions.md', 'lessons.md', 'changelog.md', 'sessions/index.md',
         'conversations/index.md')
+# Mode for a newly created formal document. mkstemp creates 0600, so atomic()
+# must restore this instead of letting the temporary mode reach the destination.
+DOC_MODE = 0o644
 
 
 class RelayError(Exception):
@@ -44,6 +47,17 @@ def digest(data):
 
 def private(rel):
     return any(rel == p or rel.startswith(p + '/') for p in PRIVATE)
+
+
+def leftover(rel):
+    """Temporary file abandoned by an interrupted atomic() write.
+
+    A SIGKILL or power loss skips the cleanup in atomic()'s finally block, so the
+    file survives as non-Git content. It is never memory, and must not count as a
+    repository change: otherwise the next commit-check rejects an approved batch
+    that recovery cannot restore.
+    """
+    return PurePosixPath(rel).name.startswith('.relay-')
 
 
 def safe(root, rel):
@@ -72,12 +86,19 @@ def formal(agent, rel):
 def atomic(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     require(not path.is_symlink(), '拒绝符号链接: ' + str(path))
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = DOC_MODE
     fd, name = tempfile.mkstemp(prefix='.relay-', dir=str(path.parent))
     try:
         with os.fdopen(fd, 'wb') as out:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
+        # mkstemp creates 0600; keep the destination's own mode so a successful
+        # apply never silently restricts reviewed documents to the owner.
+        os.chmod(name, mode)
         os.replace(name, str(path))
     finally:
         if os.path.exists(name):
@@ -135,12 +156,20 @@ def snapshot(root):
                 '--exclude-standard', '-z').stdout.split(b'\0') if p)
     if anchor(root)['head']:
         paths.update(os.fsdecode(p) for p in git(root, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split(b'\0') if p)
+    paths = {p for p in paths if not leftover(p)}
     filemode = git(root, 'config', '--get', 'core.filemode', check=False).stdout.strip() != b'false'
+    # Walk every .agent asset, not only Markdown. When a repository or global ignore
+    # rule hides .agent/, Git lists none of it, yet the first commit must stage
+    # .agent/.gitignore and .agent/tools/relayctl.py. Omitting them would let the
+    # documented forced staging change the snapshot and force a second review.
     agent = root / '.agent'
-    for p in agent.rglob('*.md'):
+    for p in agent.rglob('*'):
+        if not (p.is_file() or p.is_symlink()):
+            continue
         rel = p.relative_to(agent).as_posix()
-        if not private(rel) and not rel.startswith(('tools/', 'archive/')):
-            paths.add('.agent/' + rel)
+        if private(rel) or rel.startswith('archive/') or leftover(rel):
+            continue
+        paths.add('.agent/' + rel)
     code, memory = {}, {}
     for rel in sorted(paths):
         ar = rel[len('.agent/'):] if rel.startswith('.agent/') else None
