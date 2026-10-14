@@ -50,14 +50,18 @@ def private(rel):
 
 
 def leftover(rel):
-    """Temporary file abandoned by an interrupted atomic() write.
+    """Temporary file abandoned by an interrupted atomic() write, under .agent/.
 
     A SIGKILL or power loss skips the cleanup in atomic()'s finally block, so the
     file survives as non-Git content. It is never memory, and must not count as a
     repository change: otherwise the next commit-check rejects an approved batch
     that recovery cannot restore.
+
+    atomic() only ever writes inside .agent/, so the exemption stays there. A source
+    file that merely shares the prefix is real code: exempting it would drop it from
+    the snapshot and let its content and mode reach a commit without detection.
     """
-    return PurePosixPath(rel).name.startswith('.relay-')
+    return rel.startswith('.agent/') and PurePosixPath(rel).name.startswith('.relay-')
 
 
 def safe(root, rel):
@@ -167,7 +171,7 @@ def snapshot(root):
         if not (p.is_file() or p.is_symlink()):
             continue
         rel = p.relative_to(agent).as_posix()
-        if private(rel) or rel.startswith('archive/') or leftover(rel):
+        if private(rel) or rel.startswith('archive/') or leftover('.agent/' + rel):
             continue
         paths.add('.agent/' + rel)
     code, memory = {}, {}
@@ -358,6 +362,9 @@ def commit_check(root, agent):
     tracked = set(os.fsdecode(p) for p in git(root, 'ls-files', '-z').stdout.split(b'\0') if p)
     require(not any(p.startswith('.agent/') and private(p[len('.agent/'):]) for p in tracked),
             '隔离草稿、批准收据或聊天原文被纳入 Git；请先取消跟踪')
+    forced = sorted(p for p in tracked if leftover(p))
+    require(not forced,
+            '被中断残留的临时文件被强制纳入 Git；请先取消跟踪: ' + ', '.join(forced))
     for rel in receipt['documents']:
         require('.agent/' + rel in tracked, '获批文档尚未暂存: ' + rel)
     all_files = {**receipt['snapshot']['code'], **receipt['snapshot']['memory']}
