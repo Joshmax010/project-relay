@@ -1,13 +1,6 @@
 interface:
   display_name: "Project Relay（项目接力）"
-  short_description: 初始化并维护跨工具、跨会话的项目记忆、执行流程和交接记录
-  default_prompt: 使用 $project-relay 为当前项目初始化 .agent，并根据现有资料建立项目状态和接手说明。
-  icon_small: assets/icon.svg
-  icon_large: assets/icon.svg
-policy:
-  products:
-  - chatgpt
-  - codex
-  - api
-  - atlas
-  allow_implicit_invocation: true
+  short_description: "为 Git 代码项目维护跨工具记忆、人审文档与提交前同步检查"
+  default_prompt: "使用 $project-relay 初始化或接手这个 Git 代码项目，按人审流程起草文档并在提交前核对同步。"
+  icon_small: "./assets/icon.svg"
+  icon_large: "./assets/icon.svg"
