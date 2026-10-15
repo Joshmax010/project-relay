@@ -308,6 +308,34 @@ class Workflow(unittest.TestCase):
         self.assertIn('.agent/.gitignore', tracked)
         self.assertIn('.agent/tools/relayctl.py', tracked)
 
+    def test_source_file_sharing_temp_prefix_is_not_exempt(self):
+        # Only .agent/ holds atomic() destinations. A tracked source file that merely
+        # shares the prefix is real code: exempting it would drop it from the snapshot
+        # and let its content and mode reach a commit without stale-review detection.
+        source = self.root / 'src/.relay-config.py'
+        source.parent.mkdir()
+        source.write_text('value = 1\n')
+        self.git('add', '.')
+        self.git('commit', '-m', 'Track a source file sharing the temporary prefix')
+        snapshot = relay.snapshot(self.root)
+        self.assertIn('src/.relay-config.py', {**snapshot['code'], **snapshot['memory']})
+        self.prepare()
+        self.git('add', '.')
+        self.call(relay.commit_check)
+        source.write_text('value = 2\n')
+        self.git('add', '.')
+        with self.assertRaises(relay.RelayError):
+            self.call(relay.commit_check)
+
+    def test_force_staged_leftover_is_rejected(self):
+        self.prepare()
+        self.git('add', '.')
+        self.call(relay.commit_check)
+        (self.agent / '.relay-forced').write_text('partial bytes')
+        self.git('add', '-f', '.agent/.relay-forced')
+        with self.assertRaises(relay.RelayError):
+            self.call(relay.commit_check)
+
     def test_repeated_init_preserves_docs_runtime_and_pending(self):
         self.prepare()
         before = {p.relative_to(self.agent): p.read_bytes() for p in self.agent.rglob('*') if p.is_file()}
