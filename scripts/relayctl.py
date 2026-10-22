@@ -234,8 +234,13 @@ def draft(root, agent, mapping, title):
         require(isinstance(text, str) and text.strip(), '文档内容必须是非空字符串: ' + rel)
         data = text.encode('utf-8')
         old = p.read_bytes() if p.exists() else None
-        in_head = git(root, 'cat-file', '-e', 'HEAD:.agent/' + rel, check=False).returncode == 0
-        require(old != data or not in_head, '已提交文档没有变化: ' + rel)
+        head_result = git(root, 'cat-file', 'blob', 'HEAD:.agent/' + rel, check=False)
+        head = head_result.stdout if head_result.returncode == 0 else None
+        # Reject only a true no-op: the proposal matches both the working tree
+        # and the committed version. A proposal equal to the working tree but
+        # different from HEAD formalizes an existing unreviewed edit, and a
+        # proposal different from the working tree is a real change either way.
+        require(old != data or data != head, '已提交文档没有变化: ' + rel)
         items[rel] = {'base': digest(old) if old is not None else None,
                       'content': text, 'sha256': digest(data), 'status': 'pending'}
     value = {'version': 1, 'id': bid, 'created': utc(), 'title': title,
