@@ -234,13 +234,18 @@ def draft(root, agent, mapping, title):
         require(isinstance(text, str) and text.strip(), '文档内容必须是非空字符串: ' + rel)
         data = text.encode('utf-8')
         old = p.read_bytes() if p.exists() else None
-        head_result = git(root, 'cat-file', 'blob', 'HEAD:.agent/' + rel, check=False)
-        head = head_result.stdout if head_result.returncode == 0 else None
-        # Reject only a true no-op: the proposal matches both the working tree
-        # and the committed version. A proposal equal to the working tree but
-        # different from HEAD formalizes an existing unreviewed edit, and a
-        # proposal different from the working tree is a real change either way.
-        require(old != data or data != head, '已提交文档没有变化: ' + rel)
+        head_ref = git(root, 'rev-parse', '--verify', '-q', 'HEAD:.agent/' + rel, check=False)
+        head_sha = head_ref.stdout.strip() if head_ref.returncode == 0 else None
+        # Judge "no change" by Git's filtered representation, not raw bytes:
+        # with a .gitattributes eol rule or another clean filter, the working
+        # tree and a proposal can hold CRLF while the HEAD blob holds LF. A raw
+        # byte compare would admit that true no-op, and staging it would then
+        # produce no change, so commit-check could never pass for a required
+        # document. hash-object --path applies the path's clean filter without
+        # writing the object; equal hashes mean no committed change can result.
+        filtered_sha = git(root, 'hash-object', '--path=.agent/' + rel, '--stdin',
+                           input_data=data).stdout.strip()
+        require(head_sha is None or filtered_sha != head_sha, '已提交文档没有变化: ' + rel)
         items[rel] = {'base': digest(old) if old is not None else None,
                       'content': text, 'sha256': digest(data), 'status': 'pending'}
     value = {'version': 1, 'id': bid, 'created': utc(), 'title': title,

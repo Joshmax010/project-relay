@@ -117,6 +117,21 @@ class Workflow(unittest.TestCase):
         with self.assertRaises(relay.RelayError):
             self.call(relay.draft, {'state.md': current}, 'no-op')
 
+    def test_draft_rejects_noop_hidden_by_crlf_filter(self):
+        # With a .gitattributes eol rule, the working tree holds CRLF while the
+        # HEAD blob holds LF. A byte compare would admit this true no-op, and
+        # staging it later would produce no change, so commit-check could
+        # never see the required state.md in the cached diff.
+        (self.root / '.gitattributes').write_text('*.md text eol=crlf\n')
+        committed = (self.agent / 'state.md').read_bytes()
+        crlf = committed.replace(b'\n', b'\r\n')
+        (self.agent / 'state.md').write_bytes(crlf)
+        with self.assertRaises(relay.RelayError):
+            self.call(relay.draft, {'state.md': crlf.decode('utf-8')}, 'filtered no-op')
+        # A genuinely different proposal under the same filter is still allowed.
+        changed = crlf + '额外一行\r\n'.encode('utf-8')
+        self.call(relay.draft, {'state.md': changed.decode('utf-8')}, 'real change')
+
     def test_old_draft_cannot_overwrite_new_state(self):
         bid = self.call(relay.draft, self.mapping(), 'old')
         (self.agent / 'state.md').write_text('# New externally verified state\n')
