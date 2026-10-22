@@ -98,6 +98,40 @@ class Workflow(unittest.TestCase):
         with self.assertRaises(relay.RelayError):
             self.call(relay.review, bid, approve=list(self.mapping()))
 
+    def test_draft_can_formalize_existing_unreviewed_edit(self):
+        # The working tree already holds an unreviewed edit that differs from
+        # HEAD. Drafting that exact content must be allowed: it is the only
+        # reviewed path for the edit to reach a commit, while commit-check
+        # blocks smuggling it in through another batch.
+        content = '# Unreviewed decision\nMade directly in the working tree.\n'
+        (self.agent / 'decisions.md').write_text(content)
+        mapping = dict(self.mapping(), **{'decisions.md': content})
+        bid = self.call(relay.draft, mapping, 'formalize existing edit')
+        self.call(relay.review, bid, approve=list(mapping), reviewer='human fixture')
+        self.call(relay.apply, bid)
+        self.git('add', '.')
+        self.call(relay.commit_check)
+
+    def test_draft_rejects_content_identical_to_committed_version(self):
+        current = (self.agent / 'state.md').read_text(encoding='utf-8')
+        with self.assertRaises(relay.RelayError):
+            self.call(relay.draft, {'state.md': current}, 'no-op')
+
+    def test_draft_rejects_noop_hidden_by_crlf_filter(self):
+        # With a .gitattributes eol rule, the working tree holds CRLF while the
+        # HEAD blob holds LF. A byte compare would admit this true no-op, and
+        # staging it later would produce no change, so commit-check could
+        # never see the required state.md in the cached diff.
+        (self.root / '.gitattributes').write_text('*.md text eol=crlf\n')
+        committed = (self.agent / 'state.md').read_bytes()
+        crlf = committed.replace(b'\n', b'\r\n')
+        (self.agent / 'state.md').write_bytes(crlf)
+        with self.assertRaises(relay.RelayError):
+            self.call(relay.draft, {'state.md': crlf.decode('utf-8')}, 'filtered no-op')
+        # A genuinely different proposal under the same filter is still allowed.
+        changed = crlf + '额外一行\r\n'.encode('utf-8')
+        self.call(relay.draft, {'state.md': changed.decode('utf-8')}, 'real change')
+
     def test_old_draft_cannot_overwrite_new_state(self):
         bid = self.call(relay.draft, self.mapping(), 'old')
         (self.agent / 'state.md').write_text('# New externally verified state\n')
@@ -276,7 +310,10 @@ class Workflow(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'POSIX file modes are not portable to Windows')
     def test_apply_preserves_document_file_mode(self):
         mapping = dict(self.mapping(), **{'lessons.md': '# Reviewed lesson fixture\n'})
+        # Set both modes explicitly: files created by init inherit the process
+        # umask, so assuming a default 0o644 for state.md fails under e.g. 0007.
         (self.agent / 'lessons.md').chmod(0o644)
+        (self.agent / 'state.md').chmod(0o644)
         self.prepare(mapping)
         self.assertEqual(0o644, stat.S_IMODE((self.agent / 'lessons.md').stat().st_mode))
         self.assertEqual(0o644, stat.S_IMODE((self.agent / 'state.md').stat().st_mode))
