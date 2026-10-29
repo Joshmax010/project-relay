@@ -1353,6 +1353,10 @@ def resume(store, toplevel, tool=None):
     cfg = load_config(store_dir)
     # Section 1: archive summary.
     gstate, ginfo = relay.goal_status(store, toplevel)
+    # Volume-2 display mapping only (plan 2.5.6 decoupling): the raw state
+    # 'imported' is rendered with the goal vocabulary, never with sync or
+    # import wording; no sync state is checked or touched here.
+    gstate_display = '待本机确认' if gstate == 'imported' else gstate
     archive = store_dir / 'archive'
     state_text = (archive / 'state.md').read_text(encoding='utf-8')
     if STATE_BEGIN in state_text and STATE_END in state_text:
@@ -1362,7 +1366,7 @@ def resume(store, toplevel, tool=None):
     backlog_text = (archive / 'backlog.md').read_text(encoding='utf-8')
     open_count = len(re.findall(r'^## T-\d+', backlog_text, re.MULTILINE))
     sec1 = ('一段·档案摘要\n目标状态：%s\n%s\n未闭环待办：%d 条'
-            % (gstate, top, open_count))
+            % (gstate_display, top, open_count))
     # Section 2: reconcile against the live repo (status quo wins).
     snap = snapshot_v2(toplevel)
     base = load_baseline(store_dir)

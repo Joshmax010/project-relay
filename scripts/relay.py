@@ -402,6 +402,16 @@ def goal_status(store, toplevel):
     tentative = _tentative_record(store_dir)
     if tentative and digest(data) == tentative['content_hash']:
         return 'tentative', {'row': row, 'tentative': tentative}
+    # Volume-2 (plan part 03, S4 on the v1 layout): a goal imported from
+    # another device is usable only after a local one-click confirm.
+    imported_path = store_path(store_dir, 'state', 'goal-imported.json')
+    if imported_path.exists():
+        try:
+            imported = read_json(imported_path)
+        except ValueError:
+            imported = None
+        if imported and digest(data) == imported.get('source_goal_hash'):
+            return 'imported', {'row': row, 'imported': imported}
     if receipt:
         return 'tampered', {'row': row, 'receipt': receipt,
                             'stale': _receipt_snapshot(store_dir, receipt['seq']),
@@ -483,6 +493,7 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         store_path(store_dir, 'state', 'goal-draft.json').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-tentative.md').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-tentative.json').unlink(missing_ok=True)
+        store_path(store_dir, 'state', 'goal-imported.json').unlink(missing_ok=True)
         return {'already': False, 'receipt': new_receipt}
     text = draft.decode('utf-8')
     if not GOAL_STATUS_RE.search(text):
@@ -495,7 +506,38 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
           'revisit': ['下次里程碑到达时', '下次交接时', '用户主动提起时']})
     store_path(store_dir, 'state', 'goal-draft.md').unlink(missing_ok=True)
     store_path(store_dir, 'state', 'goal-draft.json').unlink(missing_ok=True)
+    store_path(store_dir, 'state', 'goal-imported.json').unlink(missing_ok=True)
     return {'tentative': True, 'hash': digest(draft)}
+
+
+def _confirm_imported(store, toplevel):
+    """One-click local confirmation of an imported goal (plan part 03, S4).
+
+    The local receipt chain keeps local continuity (seq = latest local
+    seq + 1, prev_receipt_hash chained to the local previous receipt);
+    cross-device version continuity is recorded, not forced, in the
+    imported_from block (v1 receipts have no goal_version field)."""
+    row, store_dir = resolve_store_dir(store, toplevel)
+    imported_path = store_path(store_dir, 'state', 'goal-imported.json')
+    require(imported_path.exists(), '没有待本机确认的导入目标')
+    imported = read_json(imported_path)
+    current = _goal_bytes(store_dir)
+    require(current is not None and digest(current) == imported.get('source_goal_hash'),
+            '目标已被改动，与导入记录不一致；请走正常草案确认流程')
+    receipt_path, receipt = _latest_receipt(store_dir)
+    seq = (receipt['seq'] + 1) if receipt else 1
+    prev_hash = digest(receipt_path.read_bytes()) if receipt_path else None
+    new_receipt = {'version': 1, 'seq': seq, 'goal_hash': digest(current),
+                   'confirmed_at': utc(), 'channel': 'import',
+                   'prev_receipt_hash': prev_hash,
+                   'imported_from': {'source_device': imported.get('source_device'),
+                                     'source_device_id': imported.get('source_device_id'),
+                                     'source_receipt_seq': imported.get('source_receipt_seq'),
+                                     'source_goal_hash': imported.get('source_goal_hash')}}
+    save(store_path(store_dir, 'receipts', 'goal-%04d.json' % seq), new_receipt)
+    atomic(store_path(store_dir, 'receipts', 'goal-%04d.md' % seq), current)
+    imported_path.unlink(missing_ok=True)
+    return {'receipt': new_receipt}
 
 
 def goal_decline(store, toplevel):
@@ -539,6 +581,9 @@ def goal_inject(store, toplevel):
         return text
     if state == 'tentative':
         return TENTATIVE_WATERMARK + '\n' + text
+    if state == 'imported':
+        return ('【目标待本机确认】以下目标未经本机确认，不可当作已确认目标执行；'
+                '请先运行 relay goal confirm --imported 一键确认：\n' + text)
     if state == 'none':
         return '本项目无目标档案。\n'
     if state == 'tampered':
@@ -579,6 +624,8 @@ def _parser():
     c = gsub.add_parser('confirm')
     c.add_argument('--channel', default='cli')
     c.add_argument('--tentative', action='store_true')
+    c.add_argument('--imported', action='store_true',
+                   help='一键确认已导入的目标（S4 跨设备确认）')
     gsub.add_parser('check')
     gsub.add_parser('inject')
     gsub.add_parser('decline')
@@ -632,6 +679,27 @@ def _parser():
     ac.add_argument('--log-root')
     ac.add_argument('--workdir')
     ac.add_argument('--keep-dir', action='store_true')
+    # --- volume-2 slice 1 (plan part 03, steps 2.1-2.2) --------------------
+    # Implemented in scripts/relay_sync.py; imported lazily in main() like
+    # relay_flow/relay_backfill. The sync branch wraps its own errors
+    # because relay_sync's RelayError class is not this module's.
+    pk = sub.add_parser('pack')
+    pk.add_argument('--remote')
+    pk.add_argument('--device-name')
+    un = sub.add_parser('unpack')
+    un.add_argument('--remote')
+    un.add_argument('--confirm', action='store_true')
+    un.add_argument('--project', action='append', dest='projects')
+    ss = sub.add_parser('sync-setup')
+    ss.add_argument('--remote', required=True)
+    ss.add_argument('--device-name')
+    sc = sub.add_parser('sync-claim')
+    sc.add_argument('--key', required=True)
+    sc.add_argument('--confirm', action='store_true')
+    rb = sub.add_parser('sync-rollback')
+    rb.add_argument('--to', required=True)
+    rb.add_argument('--reason', default='')
+    sub.add_parser('sync-status')
     return p
 
 
@@ -664,6 +732,31 @@ def _session_from_stdin():
         sid = data.get('session_id') or data.get('sessionId') or data.get('session')
         return sid if isinstance(sid, str) and sid.strip() else None
     return None
+
+
+def _print_sync_project(entry):
+    """One line per imported project plus its conflicts/discards."""
+    counts = entry.get('counts', {})
+    print('项目 %s：%s，新增条目 %d，跳过 %d，冲突 %d，目标动作 %s'
+          % (entry['slug'], entry['status'], counts.get('entries_added', 0),
+             counts.get('entries_skipped', 0), len(entry.get('conflicts', [])),
+             entry.get('goal_action')))
+    for c in entry.get('conflicts', []):
+        print('  冲突[%s] %s：%s'
+              % (c.get('rule'), c.get('file', c.get('key', '')),
+                 c.get('note', '双方保留，见合并日志')))
+    for d in entry.get('discarded', []):
+        print('  丢弃 %s：%s' % (d['file'], d['reason']))
+    for note in entry.get('notes', []):
+        print('  注：' + note)
+
+
+def _print_sync_report(rep):
+    if 'report' not in rep:
+        print('项目 %s：跳过（%s）' % (rep['key'], rep.get('note')))
+        return
+    for entry in rep['report']['projects']:
+        _print_sync_project(entry)
 
 
 def main(argv=None):
@@ -704,6 +797,10 @@ def main(argv=None):
             elif a.goal_command == 'show':
                 print(goal_show(store, root))
             elif a.goal_command == 'confirm':
+                if a.imported:
+                    info = _confirm_imported(store, root)
+                    print('导入目标已在本机确认，收据：goal-%04d.json' % info['receipt']['seq'])
+                    return 0
                 info = goal_confirm(store, root, channel=a.channel, tentative=a.tentative)
                 if info.get('already'):
                     print('目标已确认，无需重复确认')
@@ -770,6 +867,86 @@ def main(argv=None):
                 keep_dir=a.keep_dir)
             print(accept_mod.render_record(record))
             if record['verdict'] != 'PASS':
+                return 1
+        elif a.command in ('pack', 'unpack', 'sync-setup', 'sync-claim',
+                           'sync-rollback', 'sync-status'):
+            # relay_sync's RelayError is a different class from this
+            # module's (importlib double-load), so the sync branch wraps
+            # its own errors instead of relying on main()'s except.
+            try:
+                _sspec = importlib.util.spec_from_file_location(
+                    'relay_sync', Path(__file__).resolve().parent / 'relay_sync.py')
+                sync = importlib.util.module_from_spec(_sspec)
+                _sspec.loader.exec_module(sync)
+                if a.command == 'pack':
+                    result = sync.pack(store, a.root, remote=a.remote,
+                                       device_name=a.device_name)
+                    rec = result['receipt']
+                    print('pack 完成：序列号 %d，提交 %s' % (rec['seq'], rec['commit']))
+                    print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
+                          % (rec['entry_count'], rec['file_count'], rec['redacted_count']))
+                    print('回执：' + result['receipt_path'])
+                    for step in rec['steps']:
+                        print('步骤 %s：%s' % (step['step'], step['status']))
+                elif a.command == 'unpack':
+                    result = sync.unpack(store, remote=a.remote, confirm=a.confirm,
+                                         project_keys=a.projects)
+                    if not result.get('landed'):
+                        if result.get('note'):
+                            print(result['note'])
+                        else:
+                            print('干跑预览（未写入任何内容）：')
+                        for rep in result.get('reports', []):
+                            _print_sync_report(rep)
+                    else:
+                        print('unpack 已落盘并提交：%s' % result['commit'])
+                        for rep in result.get('reports', []):
+                            _print_sync_report(rep)
+                        for note in result.get('reconcile', []):
+                            print('对账 %s：目标状态 %s，pending %s，分支 %s'
+                                  % (note['slug'], note.get('goal_status'),
+                                     note.get('pending'), note.get('branch')))
+                        print('回执：' + result['receipt_path'])
+                elif a.command == 'sync-setup':
+                    result = sync.sync_setup(store, a.remote, device_name=a.device_name)
+                    print('同步配置已写入：设备 %s（%s），远端 %s'
+                          % (result['config']['device_name'],
+                             result['config']['device_id'], a.remote))
+                    for claim in result['claims']:
+                        if claim['status'] == 'matched':
+                            print('可认领：%s ↔ 本机项目 %s'
+                                  % (claim['slug'], claim['local_display']))
+                        else:
+                            print('待认领区：%s（本机无对应项目）' % claim['slug'])
+                    for note in result['notes']:
+                        print('注：' + note)
+                elif a.command == 'sync-claim':
+                    result = sync.sync_claim(store, a.key, a.root, confirm=a.confirm)
+                    if not result['landed']:
+                        print('干跑预览（未写入任何内容）：')
+                    _print_sync_project(result['report'])
+                    if result['landed']:
+                        print('认领完成，合并日志：' + result['report']['merge_log'])
+                elif a.command == 'sync-rollback':
+                    result = sync.sync_rollback(store, a.root, ref=a.to, reason=a.reason)
+                    print('已回退到 %s，恢复文件 %d 个，提交 %s'
+                          % (a.to, result['files_restored'], result['commit']))
+                    print('回退前内容备份于：' + result['backup_dir'])
+                elif a.command == 'sync-status':
+                    for row in sync.sync_status(store, a.root):
+                        if not row['packed']:
+                            print('%s：未 pack 过，当前原料 %d 条、汇总 %d 个'
+                                  % (row['slug'], row['current_entries'],
+                                     row['current_summaries']))
+                        else:
+                            print('%s：上次 pack %s（seq %d，提交 %s），'
+                                  '自 pack 后新增汇总 %s 个、新原料 %d 条'
+                                  % (row['slug'], row['last_pack_at'], row['last_pack_seq'],
+                                     row['last_pack_commit'],
+                                     row['new_summaries_since_pack'],
+                                     row['new_entries_since_pack']))
+            except Exception as exc:
+                print('ERROR: ' + str(exc), file=sys.stderr)
                 return 1
         elif a.command in ('capture', 'queue', 'enforce', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
