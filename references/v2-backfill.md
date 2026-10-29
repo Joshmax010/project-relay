@@ -49,7 +49,7 @@
   function_call_result、reasoning、session-meta cwd；traces 只取 span_end
   节点（`type == 'span_end'` 或含 span_end 键）的 assistant/text/output/
   content 文本；traces 归属先按记录内 session_id/session 显式匹配，
-  否则归属到同项目最新会话并标记 attribution='inferred'；changes-detail
+  否则先归到当前会话并标记 attribution='inferred'，再由 backfill 循环只保留最新已处理会话的 inferred 事件（Codex PR #5 修复：此前实现把无标识 traces 复制到每个会话）；changes-detail
   的 files[].path → file_edit 事件（格式不识别时只计数并记保真警告）；
   modify_backup 只计数；function_call 的文件字段取 params 的
   file/path/filepath/filePath。
@@ -138,6 +138,7 @@
 - P4（1.15）：WorkBuddy traces 无会话标识时归属同项目最新会话并标
   inferred；traces 缺失时 assistant 段标缺口。原因：实机验证只确认了
   显式 session_id 匹配路径，无标识归属只能推断，必须标注。
+  2026-10-29 Codex PR #5 修复：此前实现把无标识 traces 复制到每个会话，现由 backfill 循环 gating 到最新已处理会话。
 - P5（1.15）：保真度文档仅在 summarize_after 且新建条目时写入；纯
   metadata 或无新建条目的回溯运行，声明只留在
   `state/backfill-report.md`。原因：无新档案内容时没有可溯源的汇总。

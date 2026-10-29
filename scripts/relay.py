@@ -499,8 +499,30 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
 
 
 def goal_decline(store, toplevel):
-    """User declines to build a goal file (plan 1.5 no-goal exit)."""
+    """User declines to build a goal file (plan 1.5 no-goal exit).
+
+    Codex PR #5 finding 2: merely writing the 未建 text left a prior
+    confirmed receipt in place, so goal_status() then reported tampered
+    and goal_inject() kept surfacing the old confirmed goal. A decline
+    is an explicit user decision, not a tamper: retire the receipt chain
+    (archive the superseded goal text, delete receipts and tentative
+    state) so the project returns to a clean 'none' state.
+    """
     row, store_dir = resolve_store_dir(store, toplevel)
+    receipt_path, receipt = _latest_receipt(store_dir)
+    if receipt is not None:
+        current = _goal_bytes(store_dir)
+        if current is not None and current.strip():
+            history = store_path(store_dir, 'archive', 'goal-history')
+            atomic(history / ('%04d-declined.md' % receipt['seq']), current)
+        receipts = store_path(store_dir, 'receipts')
+        if receipts.exists():
+            for p in receipts.glob('goal-*.json'):
+                p.unlink(missing_ok=True)
+            for p in receipts.glob('goal-*.md'):
+                p.unlink(missing_ok=True)
+    store_path(store_dir, 'state', 'goal-tentative.md').unlink(missing_ok=True)
+    store_path(store_dir, 'state', 'goal-tentative.json').unlink(missing_ok=True)
     text = '状态：未建\n\n用户于 %s 决定不建目标档案。\n' % utc()
     atomic(_goal_file(store_dir), text.encode('utf-8'))
     store_path(store_dir, 'state', 'goal-draft.md').unlink(missing_ok=True)
@@ -615,6 +637,33 @@ def _parser():
 
 def _store_from_args(a):
     return Path(a.store_root).expanduser() if a.store_root else default_store()
+
+
+def _session_from_stdin():
+    """Session id from a hook payload on stdin (Codex PR #5 finding 4).
+
+    Claude Code hook commands receive the hook payload as JSON on stdin,
+    which carries session_id. The installed Stop hook previously passed
+    no --session, so every conversation shared the literal 'default' key
+    and five blocks across any conversations permanently disabled
+    enforcement. Returns None when stdin is a TTY, empty, or not JSON
+    with a session id, so manual runs keep the old behavior; the
+    installed hook command itself needs no change.
+    """
+    try:
+        if sys.stdin.isatty():
+            return None
+        raw = sys.stdin.read()
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        sid = data.get('session_id') or data.get('sessionId') or data.get('session')
+        return sid if isinstance(sid, str) and sid.strip() else None
+    return None
 
 
 def main(argv=None):
@@ -747,7 +796,8 @@ def main(argv=None):
                 print('超时 summarizing：%s  回退超 3 次：%s'
                       % (st['stale_summarizing'], st['over_retries']))
             elif a.command == 'enforce':
-                info = flow.enforce(store, root, tool=a.tool, session=a.session)
+                session = a.session or _session_from_stdin()
+                info = flow.enforce(store, root, tool=a.tool, session=session)
                 print(info.get('instruction') or ('PASS：' + info['note']))
                 if info['action'] == 'block':
                     return 2

@@ -312,6 +312,37 @@ class TestGoals(V2Base):
         relay.goal_confirm(self.store, root)
         self.assertEqual('confirmed', relay.goal_status(self.store, root)[0])
 
+    def test_decline_after_confirm_retires_receipt(self):
+        # Codex PR #5 finding 2: declining after a confirmed goal must
+        # return the project to 'none', not to 'tampered' with the old
+        # confirmed goal still surfacing on inject.
+        root = self._init()
+        relay.goal_draft(self.store, root, self.DRAFT)
+        relay.goal_confirm(self.store, root)
+        self.assertEqual('confirmed', relay.goal_status(self.store, root)[0])
+        relay.goal_decline(self.store, root)
+        self.assertEqual('none', relay.goal_status(self.store, root)[0])
+        self.assertIn('无目标档案', relay.goal_inject(self.store, root))
+        state, _info = relay.goal_check(self.store, root)
+        self.assertEqual('none', state)
+        store_dir = relay.where(self.store, path=root)['row']
+        store_path = self.store / 'projects' / (store_dir['key'] + '-' + store_dir['slug'])
+        self.assertFalse(list((store_path / 'receipts').glob('goal-*.json')))
+        self.assertTrue((store_path / 'archive' / 'goal-history' / '0001-declined.md').exists())
+        # Rebuild still works after a decline that retired a receipt.
+        relay.goal_draft(self.store, root, self.DRAFT)
+        relay.goal_confirm(self.store, root)
+        self.assertEqual('confirmed', relay.goal_status(self.store, root)[0])
+
+    def test_decline_after_tentative_clears_tentative(self):
+        root = self._init()
+        relay.goal_draft(self.store, root, self.DRAFT)
+        relay.goal_confirm(self.store, root, tentative=True)
+        self.assertEqual('tentative', relay.goal_status(self.store, root)[0])
+        relay.goal_decline(self.store, root)
+        self.assertEqual('none', relay.goal_status(self.store, root)[0])
+        self.assertIn('无目标档案', relay.goal_inject(self.store, root))
+
     def test_history_and_receipt_chain(self):
         root = self._init()
         relay.goal_draft(self.store, root, self.DRAFT)

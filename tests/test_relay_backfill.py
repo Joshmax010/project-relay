@@ -269,5 +269,37 @@ class TestAcceptance(BackfillBase):
         self.assertTrue(all(a['result'] == '通过' for a in record['acts']))
 
 
+class TestUntaggedTracesLatestOnly(BackfillBase):
+    """Codex PR #5 finding 1: untagged traces must be archived once,
+    under the latest session only."""
+
+    def test_untagged_traces_only_latest_session(self):
+        proj = self.make_repo('proj-g')
+        old_path = self.log_home / '.workbuddy' / 'projects' / ('c-' + proj.name) / 'wb-old.jsonl'
+        _write_jsonl(old_path, accept.workbuddy_session_lines(str(proj), [
+            ('user', '老会话只提需求'),
+            ('tool', 'Write', {'file': 'app.py'}),
+        ]))
+        new_path = self.log_home / '.workbuddy' / 'projects' / ('c-' + proj.name) / 'wb-new.jsonl'
+        _write_jsonl(new_path, accept.workbuddy_session_lines(str(proj), [
+            ('user', '新会话继续干'),
+        ]))
+        os.utime(old_path, (1000000000, 1000000000))
+        os.utime(new_path, (1000000100, 1000000100))
+        traces = self.log_home / '.workbuddy' / 'traces' / 't1'
+        _write_jsonl(traces / 'trace_untagged.jsonl',
+                     accept.workbuddy_trace_lines(None, ['决定：采用无标识方案']))
+        report = backfill_mod.backfill(self.store, proj, home=self.log_home,
+                                       tools=['workbuddy'], tier='excerpt')
+        self.assertEqual(len(report['entries_created']), 2)
+        entries = flow.list_entries(self.store_dir(proj))
+        by_session = {e['header']['session']: e['body'] for e in entries}
+        self.assertIn('采用无标识方案', by_session['wb-new'])
+        self.assertNotIn('采用无标识方案', by_session['wb-old'])
+        # The older session must still report its real assistant gap now
+        # that copied traces no longer mask it.
+        self.assertEqual(report['assistant_gap_sessions'], ['wb-old'])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -203,6 +203,54 @@ class TestRecipes(FlowBase):
         with self.assertRaises(FlowRelayError):
             flow.uninstall_claude(self.store, root, home_dir=home)
 
+    def test_recipe_state_keyed_by_project(self):
+        # Codex PR #5 finding 3: two projects sharing one home must not
+        # overwrite each other's recipe state, and uninstalling one must
+        # leave the other's hooks installed.
+        home = Path(self.temp.name) / 'fakehome3'
+        root_a = self.init('proj-a')
+        root_b = self.init('proj-b')
+        flow.install_claude(self.store, root_a, home_dir=home)
+        flow.install_claude(self.store, root_b, home_dir=home)
+        settings_path = home / '.claude' / 'settings.json'
+        text = settings_path.read_text(encoding='utf-8')
+        self.assertIn('proj-a', text)
+        self.assertIn('proj-b', text)
+        key_a = relay.where(self.store, path=root_a)['row']['key']
+        key_b = relay.where(self.store, path=root_b)['row']['key']
+        state_dir = self.store_dir(root_a) / '..' / 'global' / 'recipes'
+        self.assertTrue((state_dir / ('claude-code-%s.json' % key_a)).exists())
+        self.assertTrue((state_dir / ('claude-code-%s.json' % key_b)).exists())
+        flow.uninstall_claude(self.store, root_a, home_dir=home)
+        text = settings_path.read_text(encoding='utf-8')
+        self.assertNotIn('proj-a', text)
+        self.assertIn('proj-b', text)
+        self.assertFalse((state_dir / ('claude-code-%s.json' % key_a)).exists())
+        self.assertTrue((state_dir / ('claude-code-%s.json' % key_b)).exists())
+
+    def test_enforce_session_from_hook_stdin(self):
+        # Codex PR #5 finding 4: a hook payload on stdin must give enforce
+        # a real session key instead of the shared literal 'default'.
+        root = self.init()
+        flow.capture(self.store, root, session='s1')
+        script = str(SKILL / 'scripts/relay.py')
+        cmd = [sys.executable, script, '--store-root', str(self.store),
+               '--root', str(root), 'enforce', '--tool', 'claude-code']
+        out = subprocess.run(cmd, input=b'{"session_id": "hook-sess-1"}',
+                             capture_output=True)
+        self.assertIn('补填采集条目', out.stdout.decode('utf-8'))
+        state = json.loads((self.store_dir(root) / 'state' / 'enforce.json').read_text(encoding='utf-8'))
+        self.assertIn('hook-sess-1', state['session_counts'])
+        self.assertNotIn('default', state['session_counts'])
+
+    def test_session_from_stdin_fallbacks(self):
+        with mock.patch.object(sys, 'stdin', io.StringIO('not json')):
+            self.assertIsNone(relay._session_from_stdin())
+        with mock.patch.object(sys, 'stdin', io.StringIO('{"session_id": "abc"}')):
+            self.assertEqual('abc', relay._session_from_stdin())
+        with mock.patch.object(sys, 'stdin', io.StringIO('')):
+            self.assertIsNone(relay._session_from_stdin())
+
     def test_codebuddy_weak_recipe_and_codex_section(self):
         root = self.init()
         target = Path(self.temp.name) / 'targethome'

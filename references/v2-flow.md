@@ -7,7 +7,7 @@
 ## 命令一览
 
 `relay capture [--tool] [--session] [--message]`、`relay queue`、
-`relay enforce [--tool] [--session]`、
+`relay enforce [--tool] [--session]`（未传 --session 时，若 stdin 是钩子 JSON 则取其中 session_id；否则沿用 default）、
 `relay recipe install|uninstall --tool claude-code|codebuddy|workbuddy|codex [--target-root] [--home]`、
 `relay precompress`、`relay fingerprint`、`relay scales [--session]`、
 `relay summarize [--source] [--semantic-file] [--session]`、`relay recover`、
@@ -36,6 +36,7 @@
 - 游标双锚点：`state/cursor.json` = {entry_seq, anchor_message}；anchor_message
   来自 capture 的 --message 参数（触发本次采集的用户消息原文），缺省为 null。
   锚点缺失或不匹配时汇总中止，不猜位置续跑。
+- 配方状态按项目分键：`global/recipes/{tool}-{项目键}.json`（Codex PR #5 修复；此前所有项目共享同一文件，后装覆盖先装，卸载会拆错项目）。旧版无键文件孤儿化，旧安装重装即重建。
 - 脱敏：14 类正则（AWS key、GitHub/GitLab token、JWT、私钥块、数据库连接串、
   手机号、身份证号、Slack/OpenAI/Anthropic/Google key、密码赋值、Bearer），
   命中替换为 ``，计数记入条目头；只在采集端做一次。

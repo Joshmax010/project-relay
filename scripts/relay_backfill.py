@@ -435,8 +435,10 @@ class WorkBuddyParser(BaseParser):
 
     def _trace_events(self, home, session):
         """Assistant events from traces/, attributed by session id when
-        present; otherwise to the latest session of the same project (marked
-        inferred -- see scan() fidelity notes)."""
+        present; otherwise attributed to the calling session and marked
+        inferred. The backfill loop keeps inferred events only for the
+        latest processed WorkBuddy session (Codex PR #5 finding 1), so
+        untagged text is archived once instead of once per session."""
         events = []
         for path in self._trace_files(home):
             records, _ = _iter_jsonl(path)
@@ -718,6 +720,16 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
     aggregated = {'sessions': 0, 'events': 0, 'files': set(),
                   'decisions': [], 'lessons': [], 'todos': []}
     created = []
+    # Codex PR #5 finding 1: untagged WorkBuddy traces carry no session id,
+    # so _trace_events attributes them to whichever session is being
+    # processed. Keep inferred events only for the latest processed
+    # WorkBuddy session; otherwise the same assistant text would be
+    # archived once per session (and mask real assistant gaps elsewhere).
+    latest_wb_key = None
+    for s in reversed(work):
+        if s['tool'] == 'workbuddy':
+            latest_wb_key = '%s:%s' % (s['tool'], s['session_id'])
+            break
     for sess in work:
         key = '%s:%s' % (sess['tool'], sess['session_id'])
         if key in backfilled_keys:
@@ -725,6 +737,8 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
             continue
         parser = PARSERS[sess['tool']]()
         events = parser.events(sess)
+        if sess['tool'] == 'workbuddy' and key != latest_wb_key:
+            events = [e for e in events if e.get('attribution') != 'inferred']
         # WorkBuddy assistant gap: no assistant narrative at all. Narrative
         # means assistant-role text in ANY explicit-marker bucket (a trace
         # sentence classified as a decision is still assistant text); tool

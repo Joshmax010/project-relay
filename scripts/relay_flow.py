@@ -618,18 +618,24 @@ def managed_remove(path, marker):
     return True, '已移除受管小节 ' + marker
 
 
-def _recipe_state_path(store_dir, tool):
-    return store_dir / '..' / 'global' / 'recipes' / (tool + '.json')
+def _recipe_state_path(store_dir, tool, project_key):
+    # Codex PR #5 finding 3: the old global/recipes/{tool}.json was shared
+    # by every project, so a second project's install overwrote the first
+    # project's saved paths and uninstalling one project could remove
+    # another project's hooks. Key the state by project (16-hex key).
+    # Pre-fix unkeyed files are left orphaned: old installs report "not
+    # found" and can simply be reinstalled to recreate keyed state.
+    return store_dir / '..' / 'global' / 'recipes' / ('%s-%s.json' % (tool, project_key))
 
 
-def _save_recipe_state(store_dir, tool, state):
-    path = _recipe_state_path(store_dir, tool)
+def _save_recipe_state(store_dir, tool, project_key, state):
+    path = _recipe_state_path(store_dir, tool, project_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     save(path, state)
 
 
-def _load_recipe_state(store_dir, tool):
-    path = _recipe_state_path(store_dir, tool)
+def _load_recipe_state(store_dir, tool, project_key):
+    path = _recipe_state_path(store_dir, tool, project_key)
     return read_json(path) if path.exists() else None
 
 
@@ -663,7 +669,7 @@ def install_claude(store, toplevel, home_dir=None):
             '- 会话开始先跑 relay resume 对账；会话结束先跑 relay capture 采集。\n'
             '- 语义占位段未填不得声称已收尾；Stop 钩子会拦截补填。')
     sec_changed, sec_note = managed_insert(claude_md, 'relay', '1', body)
-    _save_recipe_state(store_dir, 'claude-code',
+    _save_recipe_state(store_dir, 'claude-code', _row['key'],
                        {'tool': 'claude-code', 'tier': 'strong',
                         'settings': str(settings_path), 'claude_md': str(claude_md),
                         'commands': [start_cmd] + stop_cmds, 'installed_at': utc()})
@@ -674,7 +680,7 @@ def install_claude(store, toplevel, home_dir=None):
 
 def uninstall_claude(store, toplevel, home_dir=None):
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
-    state = _load_recipe_state(store_dir, 'claude-code')
+    state = _load_recipe_state(store_dir, 'claude-code', _row['key'])
     require(state is not None, '未找到 Claude Code 配方安装记录')
     # Verify the managed section FIRST so a refusal leaves settings untouched.
     claude_md = Path(state['claude_md'])
@@ -696,7 +702,7 @@ def uninstall_claude(store, toplevel, home_dir=None):
         if changed:
             save(settings_path, settings)
             notes.append('Claude hooks 条目已移除')
-    _recipe_state_path(store_dir, 'claude-code').unlink(missing_ok=True)
+    _recipe_state_path(store_dir, 'claude-code', _row['key']).unlink(missing_ok=True)
     return {'notes': notes}
 
 
@@ -732,7 +738,7 @@ def install_codebuddy(store, toplevel, target_root, flavor='codebuddy'):
             if flavor == 'codebuddy'
             else '弱档配方（WorkBuddy 同理路线，待实机确认其 skill 发现目录）：无生命周期 hooks，靠自觉执行。')
     atomic(skill_dir / 'RELAY-RECIPE.md', (note + '\n').encode('utf-8'))
-    _save_recipe_state(store_dir, flavor,
+    _save_recipe_state(store_dir, flavor, _row['key'],
                        {'tool': flavor, 'tier': 'weak', 'skill_dir': str(skill_dir),
                         'hooks': [], 'installed_at': utc(), 'note': note})
     return {'skill_dir': str(skill_dir), 'note': note}
@@ -740,13 +746,13 @@ def install_codebuddy(store, toplevel, target_root, flavor='codebuddy'):
 
 def uninstall_codebuddy(store, toplevel, flavor='codebuddy'):
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
-    state = _load_recipe_state(store_dir, flavor)
+    state = _load_recipe_state(store_dir, flavor, _row['key'])
     require(state is not None, '未找到 %s 配方安装记录' % flavor)
     skill_dir = Path(state['skill_dir'])
     require((skill_dir / 'SKILL.md').exists(), 'skill 目录已被外部改动，拒绝卸载：' + str(skill_dir))
     import shutil
     shutil.rmtree(skill_dir)
-    _recipe_state_path(store_dir, flavor).unlink(missing_ok=True)
+    _recipe_state_path(store_dir, flavor, _row['key']).unlink(missing_ok=True)
     return {'removed': str(skill_dir)}
 
 
@@ -760,7 +766,7 @@ def install_codex(store, toplevel):
             '- 语义占位段未填不得声称已收尾。\n'
             '- 本路线无 hooks，采集可靠性为三家最低档；积压由接手兜底汇总补齐。')
     changed, note = managed_insert(toplevel / 'AGENTS.md', 'relay', '1', body)
-    _save_recipe_state(store_dir, 'codex',
+    _save_recipe_state(store_dir, 'codex', _row['key'],
                        {'tool': 'codex', 'tier': 'self', 'agents_md': str(toplevel / 'AGENTS.md'),
                         'hooks': [], 'installed_at': utc()})
     return {'changed': changed, 'note': note}
@@ -768,10 +774,10 @@ def install_codex(store, toplevel):
 
 def uninstall_codex(store, toplevel):
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
-    state = _load_recipe_state(store_dir, 'codex')
+    state = _load_recipe_state(store_dir, 'codex', _row['key'])
     require(state is not None, '未找到 Codex 配方安装记录')
     changed, note = managed_remove(Path(state['agents_md']), 'relay')
-    _recipe_state_path(store_dir, 'codex').unlink(missing_ok=True)
+    _recipe_state_path(store_dir, 'codex', _row['key']).unlink(missing_ok=True)
     return {'changed': changed, 'note': note}
 
 
