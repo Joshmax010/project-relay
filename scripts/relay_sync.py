@@ -496,7 +496,11 @@ def _parse_blocks(text, prefix):
     preamble = []
     cur = None
     for line in lines:
-        m = re.match(r'^## %s(\d+)\s*$' % prefix, line)
+        # Accept both the canonical hyphenated form (## D-001, what
+        # summarize writes and relay_flow counts) and legacy plain
+        # numbers (## D1). Without the hyphen, summarize's blocks were
+        # invisible to merge and silently dropped on unpack.
+        m = re.match(r'^## %s-?(\d+)\s*$' % prefix, line)
         if m:
             if cur is not None:
                 blocks.append(cur)
@@ -539,7 +543,10 @@ def _merge_id_blocks(local_text, incoming_text, prefix):
         return local_text, 0, skipped
     out = (local_text or '').rstrip('\n')
     for b in added:
-        out += '\n## %s%d\n%s\n' % (prefix, b['id'], '\n'.join(b['lines']).rstrip('\n'))
+        # Canonical hyphenated form, matching summarize's writer and
+        # relay_flow's ^## T-\d+ / D-001 readers (plain ## D1 would be
+        # uncounted by the home device's own tooling after unpack).
+        out += '\n## %s-%03d\n%s\n' % (prefix, b['id'], '\n'.join(b['lines']).rstrip('\n'))
     return out + '\n', len(added), skipped
 
 
@@ -585,7 +592,7 @@ def _merge_backlog(local_text, incoming_text):
         return local_text, 0, skipped, conflicts
     out = (local_text or '').rstrip('\n')
     for b in added:
-        out += '\n## T%d\n%s\n' % (b['id'], '\n'.join(b['lines']).rstrip('\n'))
+        out += '\n## T-%03d\n%s\n' % (b['id'], '\n'.join(b['lines']).rstrip('\n'))
     return out + '\n', len(added), skipped, conflicts
 
 
@@ -2218,11 +2225,17 @@ def _ready_gate(store, rows):
 
 
 # ---------------------------------------------------------------- pack
-def _pack_git(store, toplevel, remote=None, device_name=None):
+def _pack_git(store, toplevel, remote=None, device_name=None,
+              overwrite_unconsumed=False):
     """Fixed pack order (plan 2.5): pull-merge, summarize, health, audit,
     redact-rescan, bundle/commit/push, receipt. Any step failure stops
     the pack with an actionable message; the sequence number is consumed
-    only after a successful push."""
+    only after a successful push. Plan 2.6 rides on step 5: the WIP
+    snapshot commit is built BEFORE the bundle push (so an oversize
+    snapshot aborts the pack before anything is pushed) and its ref is
+    pushed only AFTER the bundle push succeeds (so a failed pack never
+    leaves a snapshot behind); overwrite_unconsumed is the explicit
+    confirmation for covering an unconsumed snapshot."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     key = row['key']
     slug = row['slug']
@@ -2276,6 +2289,9 @@ def _pack_git(store, toplevel, remote=None, device_name=None):
     # 5: bundle, commit, push
     seq_path = store_dir / 'state' / 'pack-seq.json'
     seq = read_json(seq_path)['next_seq'] if seq_path.exists() else 1
+    # 5a (plan 2.6): build the WIP snapshot BEFORE any push, so an
+    # oversize worktree aborts the pack before the bundle leaves.
+    snapshot = create_wip_snapshot(toplevel, device, device_id, seq)
     with tempfile.TemporaryDirectory(prefix='relay-pack-') as tmp:
         staging = Path(tmp) / 'bundle'
         manifest = export_bundle(store, [toplevel], staging, device, device_id,
@@ -2314,6 +2330,23 @@ def _pack_git(store, toplevel, remote=None, device_name=None):
         if result.returncode != 0:
             raise RelayError('pack 步骤⑤推送失败：%s；请检查远端地址与网络/凭证后重试'
                              % _text(result.stderr).strip()[:300])
+    # 5b (plan 2.6): push the snapshot ref only after the bundle push
+    # succeeded. A clean worktree yields no snapshot and no ref push.
+    wip = {'status': 'clean'}
+    if snapshot is not None:
+        if remote is None:
+            wip = {'status': 'skipped', 'reason': '未配置记忆仓远端，快照未推送'}
+        else:
+            pushed = push_wip_snapshot(toplevel, remote, snapshot,
+                                       overwrite_unconsumed=overwrite_unconsumed)
+            wip = {'status': 'created', 'sha': snapshot['sha'],
+                   'branch': snapshot['branch'],
+                   'changed_files': snapshot['changed_files'],
+                   'size_bytes': snapshot['size_bytes'],
+                   'ignored_recent': snapshot['ignored_recent'],
+                   'ref': pushed['ref'],
+                   'overwritten_unconsumed': pushed['overwritten_unconsumed'],
+                   'previous': pushed['previous']}
     save(seq_path, {'next_seq': seq + 1})
     receipt = {'at': utc(), 'kind': 'pack', 'carrier': 'git', 'remote': remote,
                'device_name': device, 'device_id': device_id,
@@ -2324,7 +2357,8 @@ def _pack_git(store, toplevel, remote=None, device_name=None):
                if (store_dir / 'state' / 'summaries').is_dir() else 0,
                'file_count': len(manifest['files']),
                'redacted_count': hits, 'summary_seq': summary_seq,
-               'pull_merge': steps[0], 'audit': audit, 'steps': steps}
+               'pull_merge': steps[0], 'audit': audit, 'steps': steps,
+               'wip': wip}
     receipt_path = _receipt_path(store, 'pack', key)
     save(receipt_path, receipt)
     return {'receipt': receipt, 'receipt_path': str(receipt_path), 'seq': seq,
@@ -2490,29 +2524,39 @@ def pack_server(store, toplevel, device_name=None, backend=None):
             'commit': None, 'manifest': manifest}
 
 
-def pack(store, toplevel, remote=None, device_name=None, carrier=None):
+def pack(store, toplevel, remote=None, device_name=None, carrier=None,
+         overwrite_unconsumed=False):
     """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior;
     folder and server packs share the 2.5 fixed order with carrier-
     specific step 0/5. The fixed order and fail-stop rule are identical
-    across carriers; only the transport step differs."""
+    across carriers; only the transport step differs. The WIP
+    overwrite flag is git-only: folder/server carriers have no snapshot
+    channel (plan 2.6), so the flag is ignored there."""
     cfg = load_sync_config(store)
     c = _carrier_of(store, cfg, carrier)
     if c == 'folder':
         return pack_folder(store, toplevel, device_name=device_name)
     if c == 'server':
         return pack_server(store, toplevel, device_name=device_name)
-    return _pack_git(store, toplevel, remote=remote, device_name=device_name)
+    return _pack_git(store, toplevel, remote=remote, device_name=device_name,
+                     overwrite_unconsumed=overwrite_unconsumed)
 
 
 # ---------------------------------------------------------------- unpack
-def _unpack_git(store, remote=None, confirm=False, project_keys=None):
+def _unpack_git(store, remote=None, confirm=False, project_keys=None,
+                toplevel=None):
     """Pull from the git carrier and merge via the import pipeline.
 
     Dry-run (no --confirm) prints a preview and writes NOTHING. On confirm,
     merge results are committed in the local store but NOT pushed (push is
     the next pack's job, plan 2.2.4); a read-only reconcile summary follows
     (branch/HEAD vs baseline, goal status, pending count — no resume call:
-    resume's section 4 may write, so it is never invoked here)."""
+    resume's section 4 may write, so it is never invoked here). Plan 2.6:
+    when `toplevel` is given (the code checkout on this device), an
+    unconsumed WIP snapshot for its branch is restored into that
+    worktree AFTER the archive merge; a refused/failed restore never
+    bricks the already-landed archive merge (it is reported, not raised).
+    Folder/server unpacks have no snapshot channel and never restore."""
     cfg = load_sync_config(store)
     remote = remote or cfg.get('remote')
     with tempfile.TemporaryDirectory(prefix='relay-unpack-') as tmp:
@@ -2589,17 +2633,29 @@ def _unpack_git(store, remote=None, confirm=False, project_keys=None):
                 matched_rows.append(row)
                 reconcile.append(_reconcile_note(store, row))
         ready, ready_problems = _ready_gate(store, matched_rows)
+        # Plan 2.6 restore: only with an explicit code checkout, only
+        # after the archive merge landed, never raising.
+        wip_restores = []
+        if toplevel is not None:
+            try:
+                _row_u, store_dir_u = relay.resolve_store_dir(store, toplevel)
+                wip_restores.append(restore_wip_snapshot(
+                    store, toplevel, store_dir_u, remote))
+            except RelayError as exc:
+                wip_restores.append({'status': 'skipped', 'note': str(exc)})
         receipt = {'at': utc(), 'kind': 'unpack', 'carrier': 'git', 'remote': remote,
                    'device_name': cfg.get('device_name'),
                    'device_id': cfg.get('device_id'), 'commit': commit,
                    'history_merge': history_merge,
                    'reports': reports, 'reconcile': reconcile,
-                   'ready': ready, 'ready_problems': ready_problems}
+                   'ready': ready, 'ready_problems': ready_problems,
+                   'wip_restores': wip_restores}
         receipt_path = _receipt_path(store, 'unpack', '')
         save(receipt_path, receipt)
         return {'landed': True, 'commit': commit, 'reports': reports,
                 'reconcile': reconcile, 'ready': ready,
                 'ready_problems': ready_problems,
+                'wip_restores': wip_restores,
                 'receipt_path': str(receipt_path)}
 
 
@@ -2705,11 +2761,14 @@ def unpack_server(store, confirm=False, project_keys=None, backend=None):
             'receipt_path': str(receipt_path)}
 
 
-def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None):
+def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None,
+           toplevel=None):
     """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior
     (clone -> import -> commit, no push); folder verifies + reconciles
     the synced tree; server downloads -> import pipeline -> reconcile.
-    All three end with the same 2.5.4 readiness gate."""
+    All three end with the same 2.5.4 readiness gate. `toplevel` is the
+    code checkout to restore a WIP snapshot into; it is git-only and
+    ignored by the folder/server carriers (no snapshot channel)."""
     cfg = load_sync_config(store)
     c = _carrier_of(store, cfg, carrier)
     if c == 'folder':
@@ -2717,7 +2776,7 @@ def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None):
     if c == 'server':
         return unpack_server(store, confirm=confirm, project_keys=project_keys)
     return _unpack_git(store, remote=remote, confirm=confirm,
-                       project_keys=project_keys)
+                       project_keys=project_keys, toplevel=toplevel)
 
 
 # ---------------------------------------------------------------- claim / rollback / status
@@ -3018,3 +3077,935 @@ def sync_status(store, toplevel=None):
             row_out['conflicts_report'] = scan['report_path']
         out.append(row_out)
     return out
+
+
+# ---------------------------------------------------------------- WIP snapshot (2.6)
+# Specweave-style private git snapshot for uncommitted work. The snapshot
+# commit lives only on the memory store's remote, under the reserved ref
+# refs/relay/wip/<code-branch>. It is NEVER pushed to the code repo's
+# remote: snapshot content is uncommitted code, more private than the
+# archive. Folder/server carriers have no snapshot channel by design
+# (their only fallback is sync-rollback --bundle); they must not fake one.
+
+WIP_REF_PREFIX = 'refs/relay/wip/'
+WIP_CONSUMED_PREFIX = 'refs/relay/wip-consumed/'
+WIP_SIZE_LIMIT = 100 * 1024 * 1024
+WIP_IGNORED_RECENT_DAYS = 7
+WIP_IGNORED_LIST_CAP = 100
+
+
+def _wip_ref(branch):
+    return WIP_REF_PREFIX + branch
+
+
+def _wip_consumed_ref(branch):
+    return WIP_CONSUMED_PREFIX + branch
+
+
+def _code_branch(toplevel):
+    """Current code branch name; detached HEAD is refused (a WIP ref
+    named 'HEAD' would be meaningless on the other device)."""
+    result = relay.git(toplevel, 'rev-parse', '--abbrev-ref', 'HEAD',
+                       check=False)
+    branch = _text(result.stdout).strip() if result.returncode == 0 else ''
+    if not branch or branch == 'HEAD':
+        raise RelayError('无法确定当前代码分支（detached HEAD 或非 Git 仓），'
+                         '请先检出分支再 pack/unpack')
+    return branch
+
+
+def _ls_remote_refs(cwd, remote, patterns):
+    """{refname: sha} for the given remote ref patterns (ls-remote)."""
+    result = relay.git(cwd, 'ls-remote', remote, *patterns, check=False)
+    refs = {}
+    if result.returncode == 0:
+        for line in _text(result.stdout).splitlines():
+            parts = line.split('\t')
+            if len(parts) == 2:
+                refs[parts[1].strip()] = parts[0].strip()
+    return refs
+
+
+def _git_env(cwd, env, *args, input_data=None):
+    """git with an explicit environment (for GIT_INDEX_FILE snapshots);
+    relay.git takes no env argument, so this uses subprocess directly."""
+    return subprocess.run(['git', '-C', str(cwd), *args],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          input=input_data, env=env, timeout=120)
+
+
+def _recent_ignored_files(toplevel, days=WIP_IGNORED_RECENT_DAYS):
+    """Ignored files modified within the last `days` days (plan 2.6.4).
+
+    .gitignore hits never enter the snapshot, but silently skipping a
+    recently-touched local config would be a future handover accident,
+    so the pack receipt must list them. Returns (listed, truncated)."""
+    import time
+    result = relay.git(toplevel, 'ls-files', '--others', '--ignored',
+                       '--exclude-standard', '-z', check=False)
+    cutoff = time.time() - days * 86400
+    recent = []
+    if result.returncode == 0:
+        for rel in result.stdout.split(b'\0'):
+            if not rel:
+                continue
+            path = Path(toplevel) / os.fsdecode(rel)
+            try:
+                if path.is_file() and path.stat().st_mtime >= cutoff:
+                    recent.append(os.fsdecode(rel))
+            except OSError:
+                continue
+    recent.sort()
+    if len(recent) > WIP_IGNORED_LIST_CAP:
+        return recent[:WIP_IGNORED_LIST_CAP], len(recent) - WIP_IGNORED_LIST_CAP
+    return recent, 0
+
+
+def create_wip_snapshot(toplevel, device, device_id, pack_seq,
+                        size_limit=WIP_SIZE_LIMIT):
+    """Build a snapshot commit from the current worktree (plan 2.6.2).
+
+    A private temp GIT_INDEX_FILE is seeded from HEAD (when HEAD exists)
+    and updated with `git add -A` (tracked modifications + untracked
+    files, .gitignore respected), so the user's real index, worktree and
+    branch are never touched. Returns None when the worktree is clean,
+    else a dict with sha/tree/branch/changed_files/size/ignored info.
+    Raises RelayError when the new content exceeds size_limit, listing
+    the largest files."""
+    status = _text(relay.git(toplevel, 'status', '--porcelain',
+                             check=False).stdout).splitlines()
+    if not status:
+        return None
+    branch = _code_branch(toplevel)
+    head = relay.git(toplevel, 'rev-parse', 'HEAD', check=False)
+    head_sha = _text(head.stdout).strip() if head.returncode == 0 else None
+    with tempfile.TemporaryDirectory(prefix='relay-wip-') as tmp:
+        index = str(Path(tmp) / 'index')
+        env = dict(os.environ, GIT_INDEX_FILE=index)
+        if head_sha:
+            seeded = _git_env(toplevel, env, 'read-tree', 'HEAD')
+            if seeded.returncode != 0:
+                raise RelayError('WIP 快照：读取 HEAD 到临时 index 失败：'
+                                 + _text(seeded.stderr).strip()[:200])
+        added = _git_env(toplevel, env, 'add', '-A')
+        if added.returncode != 0:
+            raise RelayError('WIP 快照：暂存工作区失败：'
+                             + _text(added.stderr).strip()[:200])
+        if head_sha:
+            diff = _git_env(toplevel, env, 'diff', '--cached', '--name-only',
+                            '-z', 'HEAD')
+            changed = [os.fsdecode(p) for p in diff.stdout.split(b'\0') if p]
+        else:
+            listed = _git_env(toplevel, env, 'ls-files', '--cached', '-z')
+            changed = [os.fsdecode(p) for p in listed.stdout.split(b'\0')
+                       if p]
+        sizes = []
+        total = 0
+        for rel in changed:
+            path = Path(toplevel) / rel
+            try:
+                size = path.stat().st_size if path.is_file() else 0
+            except OSError:
+                size = 0
+            sizes.append((size, rel))
+            total += size
+        if total > size_limit:
+            sizes.sort(reverse=True)
+            biggest = '\n'.join('  %s (%d MB)' % (rel, size // (1024 * 1024))
+                                for size, rel in sizes[:20])
+            raise RelayError(
+                'WIP 快照体积 %d MB 超过阈值 %d MB，拒绝生成；'
+                '请先提交或拆分大文件，最大的文件：\n%s'
+                % (total // (1024 * 1024), size_limit // (1024 * 1024), biggest))
+        tree = _git_env(toplevel, env, 'write-tree')
+        if tree.returncode != 0:
+            raise RelayError('WIP 快照：写树失败：'
+                             + _text(tree.stderr).strip()[:200])
+        tree_sha = _text(tree.stdout).strip()
+        message = ('relay wip snapshot\n\n'
+                   'Relay-Snapshot: true\n'
+                   'Relay-Source-Device: %s\n'
+                   'Relay-Source-Device-Id: %s\n'
+                   'Relay-Pack-Seq: %d\n'
+                   'Relay-Snapshot-At: %s\n'
+                   % (device, device_id, pack_seq, utc()))
+        args = ['commit-tree', tree_sha]
+        if head_sha:
+            args += ['-p', head_sha]
+        args += ['-m', message]
+        made = _git_env(toplevel, env, *args)
+        if made.returncode != 0:
+            raise RelayError('WIP 快照：生成提交失败：'
+                             + _text(made.stderr).strip()[:200])
+        sha = _text(made.stdout).strip()
+    ignored, truncated = _recent_ignored_files(toplevel)
+    return {'sha': sha, 'tree': tree_sha, 'branch': branch, 'head': head_sha,
+            'changed_files': sorted(changed), 'size_bytes': total,
+            'ignored_recent': ignored, 'ignored_truncated': truncated,
+            'message': message}
+
+
+def push_wip_snapshot(toplevel, remote, snapshot, overwrite_unconsumed=False):
+    """Force-push a snapshot to the memory remote's reserved ref.
+
+    One unconsumed snapshot per branch: when the remote ref already
+    points at a snapshot no device has consumed, pack must warn and
+    require explicit confirmation (--overwrite-unconsumed); without the
+    flag it aborts. `remote` is always the memory remote from sync
+    config -- the code repo's own remotes are never used as a target."""
+    branch = snapshot['branch']
+    ref = _wip_ref(branch)
+    consumed_ref = _wip_consumed_ref(branch)
+    refs = _ls_remote_refs(toplevel, remote, [ref, consumed_ref])
+    old = refs.get(ref)
+    consumed = refs.get(consumed_ref)
+    overwritten = False
+    if old and old != consumed and not overwrite_unconsumed:
+        raise RelayError(
+            '上一份未提交改动快照尚未在任何设备还原，将被覆盖：分支 %s，'
+            '快照 %s。请先在另一台设备执行 unpack 还原，或 pack 时加 '
+            '--overwrite-unconsumed 显式确认覆盖。' % (branch, old[:12]))
+    if old and old != consumed:
+        overwritten = True
+    result = relay.git(toplevel, 'push', remote,
+                       '+%s:%s' % (snapshot['sha'], ref), check=False)
+    if result.returncode != 0:
+        raise RelayError('WIP 快照推送失败：%s；请检查记忆仓远端后重试'
+                         % _text(result.stderr).strip()[:300])
+    return {'ref': ref, 'sha': snapshot['sha'],
+            'overwritten_unconsumed': overwritten, 'previous': old}
+
+
+def mark_wip_consumed(toplevel, remote, branch, sha):
+    """Push the consumption marker for a restored snapshot. Best effort:
+    returns False instead of raising -- a failed marker push only means
+    the next pack warns (safe direction), it never undoes the restore."""
+    result = relay.git(toplevel, 'push', remote,
+                       '+%s:%s' % (sha, _wip_consumed_ref(branch)),
+                       check=False)
+    return result.returncode == 0
+
+
+def restore_wip_snapshot(store, toplevel, store_dir, remote):
+    """Restore an unconsumed snapshot into this device's worktree (plan
+    2.6.5). Only runs when the worktree is clean; a dirty worktree
+    refuses the restore and reports, never overwriting local changes.
+    Restored content lands as UNSTAGED uncommitted changes
+    (cherry-pick --no-commit + reset), matching the state the user left
+    on the old device. Returns a status dict; never raises for a
+    refused/failed restore (the archive unpack that already landed must
+    not be bricked by a code restore problem)."""
+    try:
+        branch = _code_branch(toplevel)
+    except RelayError as exc:
+        return {'status': 'skipped', 'note': str(exc)}
+    if not remote:
+        return {'status': 'skipped', 'note': '未配置记忆仓远端，无快照可还原'}
+    refs = _ls_remote_refs(toplevel, remote,
+                           [_wip_ref(branch), _wip_consumed_ref(branch)])
+    sha = refs.get(_wip_ref(branch))
+    if not sha:
+        return {'status': 'none', 'branch': branch}
+    if sha == refs.get(_wip_consumed_ref(branch)):
+        return {'status': 'already-consumed', 'branch': branch, 'sha': sha}
+    fetched = relay.git(toplevel, 'fetch', remote, _wip_ref(branch),
+                        check=False)
+    if fetched.returncode != 0:
+        return {'status': 'fetch-failed', 'branch': branch, 'sha': sha,
+                'note': _text(fetched.stderr).strip()[:200]}
+    message = relay.git(toplevel, 'log', '-1', '--format=%B', 'FETCH_HEAD',
+                        check=False)
+    if message.returncode != 0 or 'Relay-Snapshot: true' not in _text(message.stdout):
+        return {'status': 'not-a-snapshot', 'branch': branch, 'sha': sha,
+                'note': '远端保留 ref 上的提交缺少 Relay-Snapshot 标记，拒绝还原'}
+    dirty = _text(relay.git(toplevel, 'status', '--porcelain',
+                            check=False).stdout).splitlines()
+    if dirty:
+        return {'status': 'refused-dirty', 'branch': branch, 'sha': sha,
+                'dirty': dirty[:20],
+                'note': '本机工作区不干净，拒绝还原（你的改动无损）；'
+                        '请先提交或清理工作区后再 unpack'}
+    picked = relay.git(toplevel, 'cherry-pick', '--no-commit', 'FETCH_HEAD',
+                       check=False)
+    if picked.returncode != 0:
+        relay.git(toplevel, 'cherry-pick', '--abort', check=False)
+        return {'status': 'failed-conflict', 'branch': branch, 'sha': sha,
+                'note': '快照与本机 HEAD 冲突，已中止还原，工作区已恢复干净：'
+                        + _text(picked.stderr).strip()[:200]}
+    relay.git(toplevel, 'reset', check=False)
+    consumed_push = mark_wip_consumed(toplevel, remote, branch, sha)
+    save(store_dir / 'state' / 'wip-consumed.json',
+         {'branch': branch, 'sha': sha, 'at': utc(),
+          'consumed_push': consumed_push})
+    audit = _consistency_audit(store, toplevel, store_dir)
+    return {'status': 'restored', 'branch': branch, 'sha': sha,
+            'consumed_push': consumed_push, 'consistency': audit}
+
+
+# ---------------------------------------------------------------- conflict adjudication (2.6)
+# Slice 1/2 only recorded conflicts (merge-log + goal-conflict.json +
+# fork-note lines). This command writes the adjudication back into the
+# archive and clears the markers; it never picks a side by itself -- the
+# user decides at adjudication time. Evidence is preserved: resolutions
+# are appended to the latest merge-log's 'resolutions' array (or a
+# dedicated resolve receipt when no merge-log exists), never deleted.
+# NOTE (non-stickiness, by design): merge is deterministic, so
+# re-importing the same unchanged bundle re-flags a keep-local goal or
+# fork decision -- the underlying disagreement still exists. Adopt
+# decisions stick, because the adopted content then matches on re-import.
+
+FORK_NOTE_RE = re.compile(r'^- 分叉待裁：(.+?)（对方）：(.*)$')
+
+
+def _latest_merge_log(store, key):
+    """Latest merge-<key>-*.json by mtime, or None."""
+    receipts = Path(store) / 'sync-receipts'
+    if not receipts.is_dir():
+        return None, None
+    candidates = []
+    for path in receipts.glob('merge-%s-*.json' % key):
+        try:
+            candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if not candidates:
+        return None, None
+    candidates.sort()
+    path = candidates[-1][1]
+    try:
+        return path, json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        return path, None
+
+
+def _record_resolution(store, key, record):
+    """Append a resolution to the latest merge-log, or a resolve receipt
+    when no merge-log exists. Returns the path written."""
+    path, log = _latest_merge_log(store, key)
+    if path is not None and log is not None:
+        log.setdefault('resolutions', []).append(record)
+        save(path, log)
+        return str(path)
+    receipt = _receipt_path(store, 'resolve', key)
+    save(receipt, {'at': utc(), 'kind': 'resolve', 'project_key': key,
+                   'resolutions': [record]})
+    return str(receipt)
+
+
+def list_pending_resolutions(store, toplevel):
+    """Pending adjudications for one project: goal-conflict.json, fork
+    lines in state.md, and backlog conflicts in the latest merge-log
+    that no resolution covers yet."""
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    key = row['key']
+    pending = []
+    conflict_path = store_dir / 'state' / 'goal-conflict.json'
+    if conflict_path.exists():
+        try:
+            info = read_json(conflict_path)
+        except (ValueError, UnicodeDecodeError):
+            info = {}
+        pending.append({'kind': 'goal', 'source_device': info.get('source_device'),
+                        'source_seq': info.get('source_seq'),
+                        'note': '目标两边不同，本地版本被保留'})
+    state_path = store_dir / 'archive' / 'state.md'
+    if state_path.exists():
+        for line in state_path.read_text(encoding='utf-8').splitlines():
+            m = FORK_NOTE_RE.match(line)
+            if m:
+                pending.append({'kind': 'fork', 'key': m.group(1),
+                                'incoming': m.group(2)})
+    _path, log = _latest_merge_log(store, key)
+    if log is not None:
+        resolved_backlog = {r.get('item') for r in log.get('resolutions', [])
+                            if r.get('kind') == 'backlog'}
+        for conflict in log.get('conflicts', []):
+            if 'item' in conflict and conflict['item'] not in resolved_backlog:
+                pending.append({'kind': 'backlog', 'item': conflict['item'],
+                                'local': conflict.get('local'),
+                                'incoming': conflict.get('incoming')})
+    return {'key': key, 'slug': row['slug'], 'pending': pending}
+
+
+def sync_resolve(store, toplevel, list_only=False, goal=None, fork=None,
+                 backlog=None, decision=None, file=None):
+    """Adjudicate one pending conflict (plan 2.6 leftover).
+
+    --list prints pending items without writing. Actions write the
+    decision into the archive, clear the marker, refresh the checksum
+    manifest (any archive/ write must, or the next resume reports a
+    manifest mismatch), and record the resolution. Goal adopt-incoming
+    needs --file: incoming goal bytes are deliberately NOT retained in
+    the merge-log (goal is never auto-merged; only hashes are recorded),
+    so the user supplies the text to adopt (e.g. copied from the other
+    device); the adopted text is also staged as a draft so a normal
+    `relay goal confirm` completes local confirmation."""
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    key = row['key']
+    if list_only:
+        return list_pending_resolutions(store, toplevel)
+    require(decision in ('keep-local', 'adopt-incoming'),
+            '裁决须指定 --decision keep-local 或 adopt-incoming')
+    try:
+        device = load_sync_config(store).get('device_name')
+    except RelayError:
+        device = None
+    actions = []
+    touched_archive = False
+    if goal is not None:
+        conflict_path = store_dir / 'state' / 'goal-conflict.json'
+        require(conflict_path.exists(), '本项目无待裁目标冲突（无 goal-conflict.json）')
+        if decision == 'adopt-incoming':
+            require(file, '目标采纳对方版须用 --file 提供目标文本（合并日志只记哈希，不保留对方原文）')
+            raw = Path(file).expanduser().read_bytes()
+            require(raw.strip(), '采纳的目标文件为空')
+            try:
+                text = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                raise RelayError('采纳的目标文件不是 UTF-8 文本')
+            atomic(store_dir / 'archive' / 'goal.md', raw)
+            relay.goal_draft(store, toplevel, text)
+            touched_archive = True
+            actions.append('目标已更新为 --file 内容并暂存为草案，'
+                           '请运行 relay goal confirm 完成本机确认')
+        else:
+            actions.append('目标保留本地版本')
+        conflict_path.unlink(missing_ok=True)
+        record_path = _record_resolution(
+            store, key, {'at': utc(), 'kind': 'goal', 'decision': decision,
+                         'device': device})
+        actions.append('已清除 goal-conflict.json，裁决记入：' + record_path)
+    elif fork is not None:
+        state_path = store_dir / 'archive' / 'state.md'
+        require(state_path.exists(), '本项目无 state.md')
+        lines = state_path.read_text(encoding='utf-8').splitlines()
+        incoming_values = []
+        for line in lines:
+            m = FORK_NOTE_RE.match(line)
+            if m and m.group(1) == fork and m.group(2) not in incoming_values:
+                incoming_values.append(m.group(2))
+        require(incoming_values, '无待裁分叉：%s' % fork)
+        require(len(incoming_values) == 1,
+                '分叉 %s 有多个不同对方值，请先人工定夺：%s'
+                % (fork, '；'.join(incoming_values)))
+        kept = []
+        in_block = False
+        for line in lines:
+            if line == STATE_BEGIN:
+                in_block = True
+            elif line == STATE_END:
+                in_block = False
+            m = FORK_NOTE_RE.match(line)
+            if m and m.group(1) == fork:
+                continue
+            if (in_block and decision == 'adopt-incoming'
+                    and line.startswith('- %s：' % fork)):
+                kept.append('- %s：%s' % (fork, incoming_values[0]))
+                continue
+            kept.append(line)
+        atomic(state_path, ('\n'.join(kept) + '\n').encode('utf-8'))
+        touched_archive = True
+        record_path = _record_resolution(
+            store, key, {'at': utc(), 'kind': 'fork', 'key': fork,
+                         'decision': decision, 'device': device})
+        actions.append('分叉 %s 已裁决（%s），裁决记入：%s'
+                       % (fork, decision, record_path))
+    elif backlog is not None:
+        _path, log = _latest_merge_log(store, key)
+        require(log is not None, '本项目无合并日志，找不到待裁待办')
+        conflict = None
+        for candidate in log.get('conflicts', []):
+            if candidate.get('item') == backlog:
+                conflict = candidate
+                break
+        require(conflict is not None, '合并日志中无待裁待办：%s' % backlog)
+        if decision == 'adopt-incoming':
+            backlog_path = store_dir / 'archive' / 'backlog.md'
+            text = backlog_path.read_text(encoding='utf-8') if backlog_path.exists() else ''
+            blocks, _pre = _parse_blocks(text, 'T')
+            next_id = (max([b['id'] for b in blocks]) + 1) if blocks else 1
+            out = text.rstrip('\n')
+            out += '\n## T-%03d\n%s\n' % (next_id, (conflict.get('incoming') or '').rstrip('\n'))
+            atomic(backlog_path, out.encode('utf-8'))
+            touched_archive = True
+            actions.append('待办 %s 已采纳对方版，追加为 T%d' % (backlog, next_id))
+        else:
+            actions.append('待办 %s 保留本地版本' % backlog)
+        record_path = _record_resolution(
+            store, key, {'at': utc(), 'kind': 'backlog', 'item': backlog,
+                         'decision': decision, 'device': device})
+        actions.append('裁决记入：' + record_path)
+    else:
+        raise RelayError('须指定裁决对象：--goal、--fork <键> 或 --backlog <事项>'
+                         '（先用 --list 查看待裁项）')
+    if touched_archive:
+        relay.update_checksum_manifest(store_dir)
+    return {'key': key, 'slug': row['slug'], 'actions': actions}
+
+
+# ---------------------------------------------------------------- volume-2 acceptance (2.6-2.7 + full loop)
+# Mirrors the volume-1 five-act pattern (relay_accept): eleven acts on
+# two simulated devices (two stores + two code checkouts sharing one
+# fake remote URL, one bare memory remote; local dirs stand in for
+# servers). No network, no real ~/.project-relay/ (HOME and
+# PROJECT_RELAY_HOME are redirected for the run and restored after),
+# no real server. Each act asserts one plan acceptance clause.
+
+SYNC_ACCEPT_REMOTE = 'https://example.com/demo/sync-accept.git'
+SYNC_ACCEPT_REMOTE_WIP = 'https://example.com/demo/sync-accept-wip.git'
+
+
+def _accept_git_env(base):
+    env = dict(os.environ)
+    env['HOME'] = str(base / 'home')
+    env['PROJECT_RELAY_HOME'] = str(base / 'home')
+    env['GIT_AUTHOR_NAME'] = 'Tester'
+    env['GIT_AUTHOR_EMAIL'] = 'test@example.invalid'
+    env['GIT_COMMITTER_NAME'] = 'Tester'
+    env['GIT_COMMITTER_EMAIL'] = 'test@example.invalid'
+    return env
+
+
+class _SyncAcceptRunner:
+    def __init__(self, base):
+        self.base = Path(base)
+        self.env = _accept_git_env(self.base)
+        (self.base / 'home').mkdir(parents=True, exist_ok=True)
+
+    def git(self, root, *args):
+        return subprocess.run(['git', '-C', str(root), *args],
+                              check=True, capture_output=True, env=self.env)
+
+    def make_seed(self, name):
+        root = self.base / name
+        root.mkdir()
+        self.git(root, 'init', '-b', 'main')
+        (root / 'app.py').write_text('value = 1\n', encoding='utf-8')
+        self.git(root, 'add', '.')
+        self.git(root, 'commit', '-m', 'baseline')
+        return root
+
+    def clone_device(self, seed, name, remote):
+        dest = self.base / name
+        subprocess.run(['git', 'clone', '--quiet', str(seed), str(dest)],
+                       check=True, capture_output=True, env=self.env)
+        self.git(dest, 'remote', 'set-url', 'origin', remote)
+        return dest
+
+    def setup_store(self, name, mem, device):
+        store = self.base / name
+        # sync_setup runs `git -C <store>`, which needs the dir to exist
+        # (tests get this for free because relay.init runs first).
+        store.mkdir(parents=True, exist_ok=True)
+        sync_setup(store, str(mem), device_name=device)
+        return store
+
+    def init_project(self, store, repo):
+        relay.init(store, repo)
+
+    def goal(self, store, repo, text='做一个小工具'):
+        relay.goal_draft(store, repo, text)
+        relay.goal_confirm(store, repo)
+
+    def capture(self, store, repo, message, session):
+        return _flow().capture(store, repo, tool='codex', session=session,
+                               message=message)
+
+    def summarize(self, store, repo, semantic_text):
+        return _flow().summarize(store, repo, source='accept',
+                                 semantic_text=semantic_text)
+
+    def store_dir(self, store, repo):
+        return relay.resolve_store_dir(store, repo)[1]
+
+    def payload_minus_state(self, store, repo):
+        out = {}
+        for rel, data in _collect_payload(self.store_dir(store, repo)).items():
+            if rel.startswith('receipts/') or rel == 'archive/state.md':
+                continue
+            out[rel] = data
+        return out
+
+    def payloads_equal_semantic(self, store_a, repo_a, store_b, repo_b):
+        """Act-1 comparison: byte equality, except decisions/lessons/
+        backlog compare as parsed block sets + preamble. Merge appends
+        blocks with fresh local IDs and normalizes the blank line before
+        the header, so byte equality would fail on cosmetic placement
+        even when every item survived; item-by-item equality is the
+        plan's '逐条一致' clause."""
+        pa = self.payload_minus_state(store_a, repo_a)
+        pb = self.payload_minus_state(store_b, repo_b)
+        if set(pa) != set(pb):
+            return False, '文件集合不同：仅 A 有 %s，仅 B 有 %s' % (
+                sorted(set(pa) - set(pb)), sorted(set(pb) - set(pa)))
+        prefixes = {'archive/decisions.md': 'D', 'archive/lessons.md': 'L',
+                    'archive/backlog.md': 'T'}
+        for rel in sorted(pa):
+            if rel in prefixes:
+                ba, pre_a = _parse_blocks(pa[rel].decode('utf-8'), prefixes[rel])
+                bb, pre_b = _parse_blocks(pb[rel].decode('utf-8'), prefixes[rel])
+                if sorted(_block_body(x) for x in ba) != sorted(_block_body(x) for x in bb):
+                    return False, rel + ' 块集合不同'
+                if pre_a.strip() != pre_b.strip():
+                    return False, rel + ' 前言不同'
+            elif pa[rel] != pb[rel]:
+                return False, rel + ' 字节不同'
+        return True, '全部文件一致（块文件按条目比对）'
+
+    def entry_keys(self, store, repo):
+        entries = _parse_local_entries_all(self.store_dir(store, repo))
+        return {(e['header'].get('source'), e['header'].get('session'),
+                 e['header'].get('fact_hash')): e['body']
+                for e in entries}
+
+    def worktree_status(self, repo):
+        out = relay.git(repo, 'status', '--porcelain', check=False)
+        return _text(out.stdout).splitlines()
+
+
+def run_sync_acceptance():
+    """Run all eleven volume-2 acts. Returns the record dict (no
+    printing); render with render_sync_record()."""
+    acts = []
+
+    def check(act, scene, criterion, passed, evidence):
+        acts.append({'act': act, 'scene': scene, 'criterion': criterion,
+                     'result': '通过' if passed else '未通过',
+                     'evidence': evidence})
+        return passed
+
+    old_home = os.environ.get('HOME')
+    old_relay_home = os.environ.get('PROJECT_RELAY_HOME')
+    old_git_env = {k: os.environ.get(k) for k in
+                   ('GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
+                    'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL')}
+    with tempfile.TemporaryDirectory(prefix='relay-sync-accept-') as tmp:
+        base = Path(tmp)
+        runner = _SyncAcceptRunner(base)
+        os.environ['HOME'] = str(base / 'home')
+        os.environ['PROJECT_RELAY_HOME'] = str(base / 'home')
+        # Store commits go through relayctl.git, which inherits this
+        # process's env (not the runner's subprocess env).
+        os.environ['GIT_AUTHOR_NAME'] = 'Tester'
+        os.environ['GIT_AUTHOR_EMAIL'] = 'test@example.invalid'
+        os.environ['GIT_COMMITTER_NAME'] = 'Tester'
+        os.environ['GIT_COMMITTER_EMAIL'] = 'test@example.invalid'
+        try:
+            mem = base / 'mem.git'
+            subprocess.run(['git', 'init', '--bare', '--quiet', str(mem)],
+                           check=True, capture_output=True, env=runner.env)
+            seed = runner.make_seed('seed')
+            code_a = runner.clone_device(seed, 'code-a', SYNC_ACCEPT_REMOTE)
+            code_b = runner.clone_device(seed, 'code-b', SYNC_ACCEPT_REMOTE)
+            store_a = runner.setup_store('store-a', mem, 'device-A')
+            store_b = runner.setup_store('store-b', mem, 'device-B')
+            runner.init_project(store_a, code_a)
+            runner.init_project(store_b, code_b)
+            runner.goal(store_a, code_a)
+
+            # Act 1: two-device loop, archive identical bar state.md.
+            (code_a / 'app.py').write_text('value = 2\n', encoding='utf-8')
+            runner.git(code_a, 'add', '.')
+            runner.git(code_a, 'commit', '-m', 'bump to 2')
+            runner.capture(store_a, code_a, '把 app 改成 2', 's1')
+            runner.summarize(store_a, code_a,
+                             '## 决定\n- 采用单例模式管理全局配置\n'
+                             '## 待办\n- 上线检查：跑通冒烟测试\n')
+            pack_a = pack(store_a, code_a)
+            unpack_b = unpack(store_b, confirm=True)
+            same_payload, payload_note = runner.payloads_equal_semantic(
+                store_a, code_a, store_b, code_b)
+            same_entries = (runner.entry_keys(store_a, code_a)
+                            == runner.entry_keys(store_b, code_b))
+            goal_b = (runner.store_dir(store_b, code_b) / 'archive' / 'goal.md').read_bytes()
+            goal_a = (runner.store_dir(store_a, code_a) / 'archive' / 'goal.md').read_bytes()
+            check('一', '两台设备完整 loop', 'A 改→pack→B unpack 后档案逐条一致（除 state.md 基线行）',
+                  same_payload and same_entries and goal_a == goal_b,
+                  'pack seq=%s, entries A=%d B=%d, unpack ready=%s；%s'
+                  % (pack_a['seq'], len(runner.entry_keys(store_a, code_a)),
+                     len(runner.entry_keys(store_b, code_b)), unpack_b.get('ready'),
+                     payload_note))
+
+            # Act 2: both sides change the same backlog item.
+            sd_a = runner.store_dir(store_a, code_a)
+            sd_b = runner.store_dir(store_b, code_b)
+            backlog_a = sd_a / 'archive' / 'backlog.md'
+            backlog_b = sd_b / 'archive' / 'backlog.md'
+            text_a = backlog_a.read_text(encoding='utf-8')
+            text_b = backlog_b.read_text(encoding='utf-8')
+            next_a = (max([int(n) for n in re.findall(r'^## T(\d+)', text_a, re.MULTILINE)] or [0]) + 1)
+            next_b = (max([int(n) for n in re.findall(r'^## T(\d+)', text_b, re.MULTILINE)] or [0]) + 1)
+            backlog_a.write_text(text_a + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：甲\n- 来源：汇总 9\n- 状态：待启动\n' % next_a, encoding='utf-8')
+            backlog_b.write_text(text_b + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：乙\n- 来源：汇总 9\n- 状态：待启动\n' % next_b, encoding='utf-8')
+            relay.update_checksum_manifest(sd_a)
+            relay.update_checksum_manifest(sd_b)
+            pack(store_a, code_a)
+            unpack(store_b, confirm=True)
+            kept_b = '验证方式：乙' in backlog_b.read_text(encoding='utf-8')
+            _path, latest_log = _latest_merge_log(store_b, relay.resolve_store_dir(store_b, code_b)[0]['key'])
+            conflict_items = [c.get('item') for c in (latest_log or {}).get('conflicts', [])]
+            check('二', '双方改同一条', '同一待办不同体→冲突报告且双方保留',
+                  kept_b and '发布检查' in conflict_items
+                  and '验证方式：甲' in json.dumps(latest_log or {}, ensure_ascii=False),
+                  'B 保留乙，合并日志冲突项=%s' % conflict_items)
+
+            # Act 3: tampered bundle refused before landing, naming file.
+            bundle_dir = base / 'bundle-a'
+            export_bundle(store_a, [code_a], bundle_dir, 'device-A',
+                          load_sync_config(store_a).get('device_id'))
+            victim_rel = None
+            for rel in sorted(_collect_payload(sd_a)):
+                if rel.startswith('archive/') and rel.endswith('.md'):
+                    victim_rel = rel
+                    break
+            victim = bundle_dir / 'projects' / ('%s-%s' % (
+                relay.resolve_store_dir(store_a, code_a)[0]['key'],
+                relay.resolve_store_dir(store_a, code_a)[0]['slug'])) / victim_rel
+            victim.write_bytes(victim.read_bytes() + b'\n# evil\n')
+            tree_before = {str(p.relative_to(store_b)): p.read_bytes()
+                           for p in store_b.rglob('*') if p.is_file()}
+            try:
+                verify_bundle(bundle_dir)
+                tamper_ok, tamper_evidence = False, '篡改包未被拒绝'
+            except RelayError as exc:
+                tamper_ok = victim_rel in str(exc)
+                tamper_evidence = '拒绝：%s' % str(exc)[:120]
+            try:
+                import_bundle(bundle_dir, store_b, confirm=True)
+                tamper_ok = False
+                tamper_evidence += '；落盘未被拒绝'
+            except RelayError:
+                pass
+            tree_after = {str(p.relative_to(store_b)): p.read_bytes()
+                          for p in store_b.rglob('*') if p.is_file()}
+            check('三', '篡改包', '落盘前拒绝并指明文件，本地零写入',
+                  tamper_ok and tree_before == tree_after, tamper_evidence)
+
+            # Act 4: goal import lands as pending-local-confirm.
+            code_c = runner.clone_device(seed, 'code-c', SYNC_ACCEPT_REMOTE)
+            store_c = runner.setup_store('store-c', mem, 'device-C')
+            runner.init_project(store_c, code_c)
+            unpack(store_c, confirm=True)
+            status_c = relay.goal_status(store_c, code_c)[0]
+            injected = relay.goal_inject(store_c, code_c)
+            confirmed = relay._confirm_imported(store_c, code_c)
+            status_after = relay.goal_status(store_c, code_c)[0]
+            imported_marker = runner.store_dir(store_c, code_c) / 'state' / 'goal-imported.json'
+            check('四', '目标导入', '目标为待本机确认态，横幅提示，一键确认后转已确认',
+                  status_c == 'imported' and '未经本机确认' in injected
+                  and status_after == 'confirmed' and not imported_marker.exists(),
+                  '导入态=%s，确认后=%s，收据 goal-%04d.json'
+                  % (status_c, status_after, confirmed['receipt']['seq']))
+
+            # Act 5: git conflict markers -- health gate blocks pack;
+            # marker entries in an incoming bundle are discarded.
+            decisions_a = sd_a / 'archive' / 'decisions.md'
+            original_decisions = decisions_a.read_bytes()
+            decisions_a.write_bytes(original_decisions + b'\n<<<<<<< HEAD\n')
+            try:
+                pack(store_a, code_a)
+                marker_pack_ok = False
+            except RelayError as exc:
+                marker_pack_ok = '冲突标记' in str(exc)
+            decisions_a.write_bytes(original_decisions)
+            relay.update_checksum_manifest(sd_a)
+            bundle5 = base / 'bundle-5'
+            export_bundle(store_a, [code_a], bundle5, 'device-A',
+                          load_sync_config(store_a).get('device_id'))
+            manifest5 = json.loads((bundle5 / 'manifest.json').read_text(encoding='utf-8'))
+            entry_rel = None
+            for rel in manifest5['files']:
+                if rel.startswith('projects/') and '/raw/cap-' in rel and rel.endswith('.md'):
+                    entry_rel = rel
+                    break
+            entry_path = bundle5 / entry_rel
+            body = entry_path.read_bytes()
+            sep = b'---relay-body---'
+            entry_path.write_bytes(body + b'\n<<<<<<< HEAD\n' if sep not in body
+                                   else body.replace(sep, sep + b'\n<<<<<<< HEAD\n', 1))
+            manifest5['files'][entry_rel] = _sha256(entry_path.read_bytes())
+            (bundle5 / 'manifest.json').write_text(
+                json.dumps(manifest5, ensure_ascii=False, indent=2), encoding='utf-8')
+            code_d = runner.clone_device(seed, 'code-d', SYNC_ACCEPT_REMOTE)
+            store_d = runner.setup_store('store-d', mem, 'device-D')
+            runner.init_project(store_d, code_d)
+            report5 = import_bundle(bundle5, store_d, confirm=True)
+            discarded = report5['projects'][0].get('discarded', [])
+            marker_discarded = any(d.get('reason') == 'conflict-markers'
+                                   for d in discarded)
+            landed_keys = runner.entry_keys(store_d, code_d)
+            check('五', 'Git 冲突标记', '含标记档案 pack 被健康门拦截；含标记入包条目被丢弃，双方数据无损',
+                  marker_pack_ok and marker_discarded,
+                  'pack 拦截=%s，丢弃=%s，D 侧条目 %d 条'
+                  % (marker_pack_ok, discarded, len(landed_keys)))
+
+            # Act 6: folder carrier write/read + conflict-copy isolation.
+            folder = base / 'folder-store'
+            sync_setup_folder(folder, device_name='folder-A')
+            code_f = runner.make_seed('code-f')
+            relay.init(folder, code_f)
+            pack_folder(folder, code_f)
+            sd_f = relay.resolve_store_dir(folder, code_f)[1]
+            planted = sd_f / 'archive' / 'decisions (conflicted copy 2026).md'
+            planted.write_text('junk\n', encoding='utf-8')
+            legit = sd_f / 'state' / 'goal-conflict.json'
+            legit.write_text('{}', encoding='utf-8')
+            unpacked_f = unpack_folder(folder)
+            isolated = list((folder / 'trash' / 'conflicts').rglob('*')) if (folder / 'trash' / 'conflicts').is_dir() else []
+            check('六', '文件夹载体', '一写一读一致，冲突副本被隔离，合法标记文件不动',
+                  not planted.exists() and legit.exists() and len(isolated) >= 1
+                  and unpacked_f.get('ready'),
+                  '隔离 %d 个，ready=%s' % (len(isolated), unpacked_f.get('ready')))
+
+            # Act 7: server carrier interrupt + anti-overwrite.
+            srv = base / 'server'
+            backend = LocalDirBackend(srv)
+            key_a = relay.resolve_store_dir(store_a, code_a)[0]['key']
+            bundle1 = base / 'bundle-s1'
+            export_bundle(store_a, [code_a], bundle1, 'device-A',
+                          load_sync_config(store_a).get('device_id'), pack_seqs={key_a: 1})
+            upload_server_bundle(backend, key_a, bundle1, 1, 'devA')
+            before = _read_server_current(backend, key_a)
+            bundle2 = base / 'bundle-s2'
+            export_bundle(store_a, [code_a], bundle2, 'device-A',
+                          load_sync_config(store_a).get('device_id'), pack_seqs={key_a: 2})
+            faulty = FaultBackend(LocalDirBackend(srv), put_fail_after=5)
+            try:
+                upload_server_bundle(faulty, key_a, bundle2, 2, 'devA')
+                interrupt_ok = False
+            except RelayError:
+                after = _read_server_current(backend, key_a)
+                interrupt_ok = (after['seq'] == before['seq']
+                                and after['bundle_hash'] == before['bundle_hash'])
+            try:
+                upload_server_bundle(backend, key_a, bundle2, 1, 'devB')
+                overwrite_ok = False
+                overwrite_note = '旧序列号异设备未被拒绝'
+            except RelayError as exc:
+                overwrite_ok = '先在本机拉取最新包合并' in str(exc)
+                overwrite_note = '旧序列号异设备被拒绝并给指引'
+            # A strictly newer seq from another device IS the next pack
+            # (devices take turns); only stale-or-equal seqs are refused.
+            try:
+                upload_server_bundle(backend, key_a, bundle2, 2, 'devB')
+                newer = _read_server_current(backend, key_a)
+                newer_ok = newer['seq'] == 2
+                overwrite_note += '；更新序列号异设备被接受为新版（seq=2）'
+            except RelayError:
+                newer_ok = False
+                overwrite_note += '；更新序列号异设备被错误拒绝'
+            check('七', '服务器载体', '上传中断后正式版本不变；陈旧序列号拒绝覆盖并给指引，更新序列号接受为新版',
+                  interrupt_ok and overwrite_ok and newer_ok,
+                  '中断后 seq=%s 不变；%s' % (before['seq'], overwrite_note))
+
+            # Act 8: WIP snapshot round trip.
+            mem_wip = base / 'mem-wip.git'
+            subprocess.run(['git', 'init', '--bare', '--quiet', str(mem_wip)],
+                           check=True, capture_output=True, env=runner.env)
+            code_aw = runner.clone_device(seed, 'code-aw', SYNC_ACCEPT_REMOTE_WIP)
+            code_bw = runner.clone_device(seed, 'code-bw', SYNC_ACCEPT_REMOTE_WIP)
+            store_aw = runner.setup_store('store-aw', mem_wip, 'device-AW')
+            store_bw = runner.setup_store('store-bw', mem_wip, 'device-BW')
+            runner.init_project(store_aw, code_aw)
+            runner.init_project(store_bw, code_bw)
+            (code_aw / '.gitignore').write_text('local.conf\n', encoding='utf-8')
+            (code_aw / 'local.conf').write_text('token=local\n', encoding='utf-8')
+            (code_aw / 'app.py').write_text('value = 99\n', encoding='utf-8')
+            (code_aw / 'new_feature.py').write_text('x = 1\n', encoding='utf-8')
+            pack_aw = pack(store_aw, code_aw)
+            wip = pack_aw['receipt'].get('wip', {})
+            wip_created = wip.get('status') == 'created'
+            ignored_listed = 'local.conf' in (wip.get('ignored_recent') or [])
+            unpack_bw = unpack(store_bw, confirm=True, toplevel=code_bw)
+            restores = unpack_bw.get('wip_restores', [])
+            restored = any(r.get('status') == 'restored' for r in restores)
+            status_bw = runner.worktree_status(code_bw)
+            bw_app = (code_bw / 'app.py').read_text(encoding='utf-8')
+            bw_has_new = (code_bw / 'new_feature.py').exists()
+            bw_no_local = not (code_bw / 'local.conf').exists()
+            bw_unstaged = (any(line.startswith(' M ') for line in status_bw)
+                           and any(line.startswith('?? ') for line in status_bw))
+            # Dirty-refusal: BW dirties, AW packs again, BW unpack refuses.
+            (code_bw / 'app.py').write_text('value = bw-own\n', encoding='utf-8')
+            (code_aw / 'app.py').write_text('value = 100\n', encoding='utf-8')
+            pack(store_aw, code_aw)
+            unpack_bw2 = unpack(store_bw, confirm=True, toplevel=code_bw)
+            restores2 = unpack_bw2.get('wip_restores', [])
+            refused = any(r.get('status') == 'refused-dirty' for r in restores2)
+            bw_intact = (code_bw / 'app.py').read_text(encoding='utf-8') == 'value = bw-own\n'
+            # Overwrite guard: AW packs again without BW restoring.
+            (code_aw / 'app.py').write_text('value = 101\n', encoding='utf-8')
+            try:
+                pack(store_aw, code_aw)
+                guard_ok = False
+            except RelayError as exc:
+                guard_ok = '尚未在任何设备还原' in str(exc)
+            pack_forced = pack(store_aw, code_aw, overwrite_unconsumed=True)
+            guard_forced = pack_forced['receipt'].get('wip', {}).get('overwritten_unconsumed') is True
+            check('八', 'WIP 快照往返', '已改未提交+未跟踪文件以未提交形态出现，ignore 文件不出现但回执有清单；脏工作区拒绝还原且改动无损；未消费覆盖须显式确认',
+                  wip_created and ignored_listed and restored and bw_app == 'value = 99\n'
+                  and bw_has_new and bw_no_local and bw_unstaged
+                  and refused and bw_intact and guard_ok and guard_forced,
+                  '快照=%s，B 状态=%s，脏拒绝=%s，守卫=%s/强制=%s'
+                  % (wip.get('sha', '')[:12], status_bw, refused, guard_ok, guard_forced))
+
+            # Act 9: same-machine flows carry no sync wording.
+            rendered = _flow().render_resume(_flow().resume(store_a, code_a))
+            injected = _flow().inject(store_a, code_a)
+            check('九', '同机换工具', 'resume/inject 全程无同步字样',
+                  '同步' not in rendered and '同步' not in injected['text'],
+                  'resume %d 字，inject %d 字' % (len(rendered), len(injected['text'])))
+
+            # Act 10: pending entries summarize before pack.
+            runner.capture(store_a, code_a, '待汇总的一条', 's-pending')
+            pack_pending = pack(store_a, code_a)
+            step1 = [s for s in pack_pending['receipt']['steps'] if s.get('step') == 1][0]
+            unpack(store_b, confirm=True)
+            keys_b = runner.entry_keys(store_b, code_b)
+            keys_a = runner.entry_keys(store_a, code_a)
+            check('十', 'pack 前积压', 'pending 先汇总后打包，新设备档案含这批内容',
+                  step1.get('status') == 'summarized'
+                  and pack_pending['receipt'].get('summary_seq') is not None
+                  and set(keys_a) <= set(keys_b),
+                  '步骤①=%s，汇总序号=%s，B 条目 %d 条'
+                  % (step1.get('status'), pack_pending['receipt'].get('summary_seq'), len(keys_b)))
+
+            # Act 11: volume-1 acceptance still passes (regression gate).
+            spec = importlib.util.spec_from_file_location(
+                'relay_accept', _HERE / 'relay_accept.py')
+            accept_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(accept_mod)
+            record1 = accept_mod.run_acceptance()
+            check('十一', '卷一验收重演', 'relay accept 仍 PASS',
+                  record1['verdict'] == 'PASS',
+                  '卷一验收=%s' % record1['verdict'])
+        finally:
+            if old_home is None:
+                os.environ.pop('HOME', None)
+            else:
+                os.environ['HOME'] = old_home
+            if old_relay_home is None:
+                os.environ.pop('PROJECT_RELAY_HOME', None)
+            else:
+                os.environ['PROJECT_RELAY_HOME'] = old_relay_home
+            for k, v in old_git_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    verdict = 'PASS' if all(a['result'] == '通过' for a in acts) else 'FAIL'
+    return {'acts': acts, 'verdict': verdict}
+
+
+def render_sync_record(record):
+    lines = ['# 卷二验收记录（2.6–2.7 + 全 loop）', '',
+             '| 幕 | 场景 | 通过标准 | 实测结果 | 证据指针 |',
+             '|---|---|---|---|---|']
+    for a in record['acts']:
+        lines.append('| %s | %s | %s | %s | %s |'
+                     % (a['act'], a['scene'], a['criterion'], a['result'], a['evidence']))
+    lines += ['', '## 判定', '', '卷二验收：**%s**' % record['verdict']]
+    if record['verdict'] != 'PASS':
+        failed = [a for a in record['acts'] if a['result'] != '通过']
+        lines.append('未通过：' + '、'.join('%s·%s' % (a['act'], a['scene']) for a in failed))
+    return '\n'.join(lines) + '\n'

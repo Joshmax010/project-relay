@@ -787,6 +787,8 @@ def _parser():
     pk.add_argument('--remote')
     pk.add_argument('--device-name')
     pk.add_argument('--carrier', choices=['git', 'folder', 'server'])
+    pk.add_argument('--overwrite-unconsumed', action='store_true',
+                    help='覆盖上一份未在任何设备还原的 WIP 快照（2.6 显式确认）')
     un = sub.add_parser('unpack')
     un.add_argument('--remote')
     un.add_argument('--confirm', action='store_true')
@@ -809,6 +811,15 @@ def _parser():
     rb.add_argument('--bundle')
     rb.add_argument('--reason', default='')
     sub.add_parser('sync-status')
+    # --- volume-2 slice 3 (plan part 03, steps 2.6-2.7) -------------------
+    sr = sub.add_parser('sync-resolve')
+    sr.add_argument('--list', action='store_true')
+    sr.add_argument('--goal', action='store_true')
+    sr.add_argument('--fork')
+    sr.add_argument('--backlog')
+    sr.add_argument('--decision', choices=['keep-local', 'adopt-incoming'])
+    sr.add_argument('--file')
+    sub.add_parser('sync-accept')
     return p
 
 
@@ -978,7 +989,8 @@ def main(argv=None):
             if record['verdict'] != 'PASS':
                 return 1
         elif a.command in ('pack', 'unpack', 'sync-setup', 'sync-claim',
-                           'sync-rollback', 'sync-status'):
+                           'sync-rollback', 'sync-status', 'sync-resolve',
+                           'sync-accept'):
             # relay_sync's RelayError is a different class from this
             # module's (importlib double-load), so the sync branch wraps
             # its own errors instead of relying on main()'s except.
@@ -990,7 +1002,8 @@ def main(argv=None):
                 if a.command == 'pack':
                     result = sync.pack(store, a.root, remote=a.remote,
                                        device_name=a.device_name,
-                                       carrier=a.carrier)
+                                       carrier=a.carrier,
+                                       overwrite_unconsumed=a.overwrite_unconsumed)
                     rec = result['receipt']
                     if rec['carrier'] == 'folder':
                         print('pack 完成（文件夹载体，无包序列号）')
@@ -1004,10 +1017,25 @@ def main(argv=None):
                     print('回执：' + result['receipt_path'])
                     for step in rec['steps']:
                         print('步骤 %s：%s' % (step['step'], step['status']))
+                    wip = rec.get('wip') or {}
+                    if wip.get('status') == 'created':
+                        print('未提交改动快照已推送：%s，文件 %d 个'
+                              % (wip['sha'][:12], len(wip.get('changed_files') or [])))
+                        if wip.get('ignored_recent'):
+                            print('被忽略且近 7 天改过、未进快照：%s'
+                                  % '、'.join(wip['ignored_recent']))
+                        if wip.get('overwritten_unconsumed'):
+                            print('注：已覆盖上一份未还原的快照')
+                    elif wip.get('status') == 'skipped':
+                        print('快照未推送：' + wip.get('reason', ''))
                 elif a.command == 'unpack':
+                    try:
+                        _top = git_toplevel(a.root)
+                    except Exception:
+                        _top = None
                     result = sync.unpack(store, remote=a.remote, confirm=a.confirm,
                                          project_keys=a.projects,
-                                         carrier=a.carrier)
+                                         carrier=a.carrier, toplevel=_top)
                     if not result.get('landed'):
                         if result.get('note'):
                             print(result['note'])
@@ -1037,6 +1065,15 @@ def main(argv=None):
                         else:
                             for problem in result.get('ready_problems', []):
                                 print('对账差异：' + problem)
+                        for rest in result.get('wip_restores', []):
+                            if rest.get('status') == 'restored':
+                                print('未提交改动已还原为未暂存改动：快照 %s'
+                                      % rest['sha'][:12])
+                            elif rest.get('status') == 'refused-dirty':
+                                print('快照未还原：本机工作区不干净，你的改动无损；'
+                                      '请先提交或清理后再 unpack')
+                            elif rest.get('status') not in ('none', 'already-consumed'):
+                                print('快照还原：%s' % rest.get('status'))
                         print('回执：' + result['receipt_path'])
                 elif a.command == 'sync-setup':
                     carrier = a.carrier
@@ -1136,6 +1173,35 @@ def main(argv=None):
                                   % (row['slug'], row['last_pack_at'], seq,
                                      commit, row['new_summaries_since_pack'],
                                      row['new_entries_since_pack'], carrier))
+                elif a.command == 'sync-resolve':
+                    if a.list:
+                        result = sync.sync_resolve(store, a.root, list_only=True)
+                        if not result['pending']:
+                            print('无待裁项')
+                        for item in result['pending']:
+                            if item['kind'] == 'goal':
+                                print('目标冲突：来自 %s（seq %s），本地版本被保留'
+                                      % (item.get('source_device'),
+                                         item.get('source_seq')))
+                            elif item['kind'] == 'fork':
+                                print('分叉待裁：%s，对方值：%s'
+                                      % (item['key'], item['incoming']))
+                            else:
+                                print('待办冲突：%s，本地：%s，对方：%s'
+                                      % (item['item'], item.get('local'),
+                                         item.get('incoming')))
+                    else:
+                        result = sync.sync_resolve(
+                            store, a.root, goal=a.goal or None,
+                            fork=a.fork, backlog=a.backlog,
+                            decision=a.decision, file=a.file)
+                        for action in result['actions']:
+                            print(action)
+                elif a.command == 'sync-accept':
+                    record = sync.run_sync_acceptance()
+                    print(sync.render_sync_record(record))
+                    if record['verdict'] != 'PASS':
+                        return 1
             except Exception as exc:
                 print('ERROR: ' + str(exc), file=sys.stderr)
                 return 1
