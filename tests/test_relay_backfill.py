@@ -38,7 +38,7 @@ BackfillRelayError = backfill_mod.relay.RelayError
 
 def _write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as fh:
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
@@ -65,7 +65,7 @@ class BackfillBase(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:

@@ -82,7 +82,7 @@ class P0Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         for name_, data in (extra_files or {}).items():
             p = root / name_
             p.parent.mkdir(parents=True, exist_ok=True)

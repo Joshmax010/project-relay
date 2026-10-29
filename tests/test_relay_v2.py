@@ -44,7 +44,7 @@ class V2Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -85,7 +85,11 @@ class TestStoreLayout(V2Base):
         target.chmod(0o640)
         relay.atomic(target, b'v2\n')
         self.assertEqual(b'v2\n', target.read_bytes())
-        self.assertEqual(0o640, target.stat().st_mode & 0o777)
+        # Batch 3, A3: mode bits are not portable to Windows (see the
+        # skipIf on the sibling mode test); the byte-preservation half
+        # above still runs everywhere.
+        if os.name != 'nt':
+            self.assertEqual(0o640, target.stat().st_mode & 0o777)
         # save(): canonical JSON bytes (sort_keys, trailing newline).
         data = {'b': 1, 'a': [2]}
         relay.save(Path(self.temp.name) / 'x.json', data)
@@ -98,7 +102,7 @@ class TestStoreLayout(V2Base):
                 relay.safe(Path(self.temp.name), bad)
         if os.name != 'nt':
             outside = Path(self.temp.name) / 'outside.md'
-            outside.write_text('orig')
+            outside.write_bytes('orig'.encode('utf-8'))
             (Path(self.temp.name) / 'linked.md').symlink_to(outside)
             with self.assertRaises(relay.RelayError):
                 relay.safe(Path(self.temp.name), 'linked.md')
@@ -142,7 +146,7 @@ class TestStoreLayout(V2Base):
         self.git(inner, 'init', '-b', 'main')
         self.git(inner, 'config', 'user.name', 'Tester')
         self.git(inner, 'config', 'user.email', 'test@example.invalid')
-        (inner / 'x.py').write_text('x = 1\n')
+        (inner / 'x.py').write_bytes('x = 1\n'.encode('utf-8'))
         self.git(inner, 'add', '.')
         self.git(inner, 'commit', '-m', 'inner baseline')
         with self.assertRaises(relay.RelayError):
@@ -279,7 +283,7 @@ class TestGoals(V2Base):
         store_dir = relay.where(self.store, path=root)['row']
         store_path = self.store / 'projects' / (store_dir['key'] + '-' + store_dir['slug'])
         goal = store_path / 'archive' / 'goal.md'
-        goal.write_text(goal.read_text(encoding='utf-8') + '被篡改的一行\n', encoding='utf-8')
+        goal.write_bytes((goal.read_text(encoding='utf-8') + '被篡改的一行\n').encode('utf-8'))
         self.assertEqual('tampered', relay.goal_status(self.store, root)[0])
         with self.assertRaises(relay.RelayError):
             relay.goal_check(self.store, root)
@@ -356,7 +360,7 @@ class TestGoals(V2Base):
         first_receipt_bytes = (store_path / 'receipts' / 'goal-0001.json').read_bytes()
         self.assertEqual(relay.digest(first_receipt_bytes), second['prev_receipt_hash'])
         self.assertTrue((store_path / 'archive' / 'goal-history' / '0002.md').exists())
-        history_text = (store_path / 'archive' / 'goal-history' / '0002.md').read_text()
+        history_text = (store_path / 'archive' / 'goal-history' / '0002.md').read_text(encoding='utf-8')
         self.assertIn('做一个 MVP（来源：用户原话）', history_text)
         self.assertNotIn('MVP v2', history_text)
 
@@ -380,33 +384,34 @@ class TestCLI(V2Base):
     def test_cli_init_where_goal_roundtrip(self):
         root = self.make_repo('cli', remote='https://github.com/example/cli.git')
         runtime = str(SKILL / 'scripts/relay.py')
-        env = dict(os.environ, PROJECT_RELAY_HOME=str(Path(self.temp.name)))
+        env = dict(os.environ, PROJECT_RELAY_HOME=str(Path(self.temp.name)),
+                            PYTHONIOENCODING='utf-8')
         r = subprocess.run([sys.executable, runtime, '--root', str(root),
                             '--store-root', str(self.store), 'init'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertIn('记忆仓：', r.stdout)
         self.assertIn('项目键：', r.stdout)
         draft = Path(self.temp.name) / 'draft.md'
-        draft.write_text(TestGoals.DRAFT, encoding='utf-8')
+        draft.write_bytes(TestGoals.DRAFT.encode('utf-8'))
         r = subprocess.run([sys.executable, runtime, '--root', str(root),
                             '--store-root', str(self.store),
                             'goal', 'draft', '--file', str(draft)],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertEqual(0, r.returncode, r.stderr)
         r = subprocess.run([sys.executable, runtime, '--root', str(root),
                             '--store-root', str(self.store), 'goal', 'confirm'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertIn('已确认', r.stdout)
         r = subprocess.run([sys.executable, runtime, '--root', str(root),
                             '--store-root', str(self.store), 'where'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertIn('项目键：', r.stdout)
         r = subprocess.run([sys.executable, runtime, '--root', str(root),
                             '--store-root', str(self.store), 'goal', 'check'],
-                           capture_output=True, text=True, env=env)
+                           capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertEqual(0, r.returncode, r.stderr)
         self.assertIn('PASS', r.stdout)
 

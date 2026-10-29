@@ -38,9 +38,14 @@ accept = _load('relay_accept', SKILL / 'scripts/relay_accept.py')
 
 
 def _run_cli(env, *args):
+    # Batch 3, A2: pin both ends to UTF-8 -- the child prints Chinese
+    # copy, and the parent must not decode it with the locale default
+    # (cp936 on a Chinese Windows install turns UTF-8 bytes to mojibake).
+    env = dict(env)
+    env.setdefault('PYTHONIOENCODING', 'utf-8')
     return subprocess.run(
         [sys.executable, str(SKILL / 'scripts/relay.py'), *args],
-        capture_output=True, text=True, env=env, timeout=180)
+        capture_output=True, text=True, encoding='utf-8', env=env, timeout=180)
 
 
 class TestAcceptIsolation(unittest.TestCase):

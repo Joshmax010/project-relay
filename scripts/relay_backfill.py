@@ -846,6 +846,12 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
         fidelity_doc = render_fidelity(report)
         atomic(store_dir / 'archive' / 'backfill-fidelity.md',
                fidelity_doc.encode('utf-8'))
+        # Batch 3, C7: flow.summarize() refreshed the manifest BEFORE
+        # this write, so without a refresh here the fidelity file stays
+        # unlisted and later edits/truncation evade integrity checks
+        # (verify ignores unlisted files). Same omission, same fix, as
+        # make_handoff.
+        relay.update_checksum_manifest(store_dir)
         report['fidelity_doc'] = str(store_dir / 'archive' / 'backfill-fidelity.md')
     _save_report(store_dir, report)
     return report

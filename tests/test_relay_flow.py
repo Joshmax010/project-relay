@@ -56,7 +56,7 @@ class FlowBase(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -81,7 +81,7 @@ class FlowBase(unittest.TestCase):
         return self.store / 'projects' / (row['key'] + '-' + row['slug'])
 
     def edit(self, root, rel, text):
-        (root / rel).write_text(text, encoding='utf-8')
+        (root / rel).write_bytes(text.encode('utf-8'))
 
 
 class TestCapture(FlowBase):
@@ -162,7 +162,7 @@ class TestQueue(FlowBase):
 
     def test_relay_prefix_source_file_not_exempt(self):
         root = self.init()
-        (root / '.relay-temp.py').write_text('x = 1\n')
+        (root / '.relay-temp.py').write_bytes('x = 1\n'.encode('utf-8'))
         snap = flow.snapshot_v2(root)
         self.assertIn('.relay-temp.py', snap['code'])
 
@@ -173,7 +173,7 @@ class TestRecipes(FlowBase):
         home = Path(self.temp.name) / 'fakehome'
         settings = home / '.claude' / 'settings.json'
         settings.parent.mkdir(parents=True)
-        settings.write_text(json.dumps({'other': 'keep-me'}, indent=2), encoding='utf-8')
+        settings.write_bytes(json.dumps({'other': 'keep-me'}, indent=2).encode('utf-8'))
         flow.install_claude(self.store, root, home_dir=home)
         after_first_settings = settings.read_bytes()
         after_first_md = (home / '.claude' / 'CLAUDE.md').read_bytes()
@@ -184,7 +184,7 @@ class TestRecipes(FlowBase):
         # Repair: tamper one char inside the managed section, reinstall.
         md = home / '.claude' / 'CLAUDE.md'
         text = md.read_text(encoding='utf-8').replace('先跑 relay resume', '先跑 relay RESUME')
-        md.write_text(text, encoding='utf-8')
+        md.write_bytes(text.encode('utf-8'))
         flow.install_claude(self.store, root, home_dir=home)
         self.assertIn('先跑 relay resume', md.read_text(encoding='utf-8'))
         # Uninstall restores.
@@ -199,7 +199,7 @@ class TestRecipes(FlowBase):
         md = home / '.claude' / 'CLAUDE.md'
         text = md.read_text(encoding='utf-8')
         # Change body without updating the recorded hash.
-        md.write_text(text.replace('relay capture', 'relay CAPTURE'), encoding='utf-8')
+        md.write_bytes(text.replace('relay capture', 'relay CAPTURE').encode('utf-8'))
         with self.assertRaises(FlowRelayError):
             flow.uninstall_claude(self.store, root, home_dir=home)
 
@@ -260,7 +260,7 @@ class TestRecipes(FlowBase):
         self.assertIn('无生命周期 hooks', info['note'])
         flow.uninstall_codebuddy(self.store, root, flavor='codebuddy')
         self.assertFalse(Path(info['skill_dir']).exists())
-        (root / 'AGENTS.md').write_text('# My agents\n', encoding='utf-8')
+        (root / 'AGENTS.md').write_bytes('# My agents\n'.encode('utf-8'))
         flow.install_codex(self.store, root)
         agents = (root / 'AGENTS.md').read_text(encoding='utf-8')
         self.assertIn('# My agents', agents)
@@ -274,7 +274,7 @@ class TestPrecompress(FlowBase):
         root = self.init()
         flow.capture(self.store, root, session='a')
         self.edit(root, 'app.py', 'value = 2\n')
-        (root / 'new.py').write_text('n = 1\n')
+        (root / 'new.py').write_bytes('n = 1\n'.encode('utf-8'))
         flow.capture(self.store, root, session='b')
         sd = self.store_dir(root)
         # A crafted entry whose semantic text claims an un-evidenced file.
@@ -306,8 +306,8 @@ class TestFingerprint(FlowBase):
 
     def test_crlf_filtered_hash(self):
         root = self.init()
-        (root / '.gitattributes').write_text('*.txt text eol=crlf\n')
-        (root / 'note.txt').write_text('line one\nline two\n')
+        (root / '.gitattributes').write_bytes('*.txt text eol=crlf\n'.encode('utf-8'))
+        (root / 'note.txt').write_bytes('line one\nline two\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'crlf attrs')
         (root / 'note.txt').write_bytes(b'line one\r\nline two\r\n')
@@ -337,7 +337,7 @@ class TestScales(FlowBase):
     def test_milestone_from_new_receipt(self):
         root = self.init()
         draft = Path(self.temp.name) / 'draft.md'
-        draft.write_text('# 项目目标\n\n状态：待确认\n\n- 目标与交付物：做 MVP\n', encoding='utf-8')
+        draft.write_bytes('# 项目目标\n\n状态：待确认\n\n- 目标与交付物：做 MVP\n'.encode('utf-8'))
         relay.goal_draft(self.store, root, draft.read_text(encoding='utf-8'))
         relay.goal_confirm(self.store, root)
         rec = flow.scales(self.store, root)
@@ -346,7 +346,7 @@ class TestScales(FlowBase):
     def test_change_scale(self):
         root = self.init()
         for i in range(10):
-            (root / ('f%02d.py' % i)).write_text('x = %d\n' % i)
+            (root / ('f%02d.py' % i)).write_bytes(('x = %d\n' % i).encode('utf-8'))
         rec = flow.scales(self.store, root)
         self.assertEqual('change', rec['triggered'])
 
@@ -448,7 +448,7 @@ class TestSummarize(FlowBase):
         # Abort path: third-state content keeps the log.
         flow.capture(self.store, root, session='s3')
         flow.summarize(self.store, root, source='test')
-        state_path.write_text('被外部改写的第三态\n', encoding='utf-8')
+        state_path.write_bytes('被外部改写的第三态\n'.encode('utf-8'))
         with self.assertRaises(FlowRelayError):
             flow.recover(self.store, root)
         self.assertTrue((sd / 'tx' / '0002.json').exists())
@@ -472,8 +472,8 @@ class TestArchive(FlowBase):
         root = self.init()
         sd = self.store_dir(root)
         state_path = sd / 'archive' / 'state.md'
-        state_path.write_text(state_path.read_text(encoding='utf-8') + '\n'.join(
-            '填充行 %d' % i for i in range(200)) + '\n', encoding='utf-8')
+        state_path.write_bytes((state_path.read_text(encoding='utf-8') + '\n'.join(
+            '填充行 %d' % i for i in range(200)) + '\n').encode('utf-8'))
         moved = flow.enforce_budget(sd)
         self.assertIn('state.md', moved)
         self.assertTrue((sd / 'archive' / 'splits').exists())
@@ -553,14 +553,15 @@ class TestCLI(FlowBase):
     def test_cli_capture_queue_resume(self):
         root = self.init()
         runtime = str(SKILL / 'scripts/relay.py')
-        env = dict(os.environ, PROJECT_RELAY_HOME=str(Path(self.temp.name)))
+        env = dict(os.environ, PROJECT_RELAY_HOME=str(Path(self.temp.name)),
+                PYTHONIOENCODING='utf-8')
         base = [sys.executable, runtime, '--root', str(root),
                 '--store-root', str(self.store)]
         for args in (['capture', '--tool', 'codex'], ['queue'], ['resume']):
-            r = subprocess.run(base + args, capture_output=True, text=True, env=env)
+            r = subprocess.run(base + args, capture_output=True, text=True, encoding='utf-8', env=env)
             self.assertEqual(0, r.returncode, r.stderr)
         r = subprocess.run(base + ['capture', '--tool', 'codex'], capture_output=True,
-                           text=True, env=env)
+                           text=True, encoding='utf-8', env=env)
         self.assertIn('采集', r.stdout)
 
 

@@ -65,7 +65,7 @@ class Sync3Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         return root
@@ -95,10 +95,10 @@ class Sync3Base(unittest.TestCase):
         return out.stdout.decode('utf-8').splitlines()
 
     def dirty_repo(self, repo, value='value = 99\n'):
-        (repo / '.gitignore').write_text('local.conf\n')
-        (repo / 'local.conf').write_text('token=local\n')
-        (repo / 'app.py').write_text(value)
-        (repo / 'new_feature.py').write_text('x = 1\n')
+        (repo / '.gitignore').write_bytes('local.conf\n'.encode('utf-8'))
+        (repo / 'local.conf').write_bytes('token=local\n'.encode('utf-8'))
+        (repo / 'app.py').write_bytes(value.encode('utf-8'))
+        (repo / 'new_feature.py').write_bytes('x = 1\n'.encode('utf-8'))
 
 
 class WipSnapshotTests(Sync3Base):
@@ -135,7 +135,7 @@ class WipSnapshotTests(Sync3Base):
                                              self.store_dir(store_b, repo_b),
                                              str(self.bare))
         self.assertEqual(restored['status'], 'restored')
-        self.assertEqual((repo_b / 'app.py').read_text(), 'value = 99\n')
+        self.assertEqual((repo_b / 'app.py').read_text(encoding='utf-8'), 'value = 99\n')
         self.assertTrue((repo_b / 'new_feature.py').exists())
         self.assertFalse((repo_b / 'local.conf').exists())
         st = self.status(repo_b)
@@ -153,12 +153,12 @@ class WipSnapshotTests(Sync3Base):
         self.dirty_repo(repo_a)
         snap = sync.create_wip_snapshot(repo_a, 'devA', 'idA', 1)
         sync.push_wip_snapshot(repo_a, str(self.bare), snap)
-        (repo_b / 'app.py').write_text('value = bw-own\n')
+        (repo_b / 'app.py').write_bytes('value = bw-own\n'.encode('utf-8'))
         refused = sync.restore_wip_snapshot(store_b, repo_b,
                                             self.store_dir(store_b, repo_b),
                                             str(self.bare))
         self.assertEqual(refused['status'], 'refused-dirty')
-        self.assertEqual((repo_b / 'app.py').read_text(), 'value = bw-own\n')
+        self.assertEqual((repo_b / 'app.py').read_text(encoding='utf-8'), 'value = bw-own\n')
 
     def test_overwrite_guard_needs_flag(self):
         seed = self.make_seed('seed')
@@ -166,7 +166,7 @@ class WipSnapshotTests(Sync3Base):
         self.dirty_repo(repo_a)
         snap1 = sync.create_wip_snapshot(repo_a, 'devA', 'idA', 1)
         sync.push_wip_snapshot(repo_a, str(self.bare), snap1)
-        (repo_a / 'app.py').write_text('value = 100\n')
+        (repo_a / 'app.py').write_bytes('value = 100\n'.encode('utf-8'))
         snap2 = sync.create_wip_snapshot(repo_a, 'devA', 'idA', 2)
         with self.assertRaises(SyncError) as ctx:
             sync.push_wip_snapshot(repo_a, str(self.bare), snap2)
@@ -277,7 +277,7 @@ class ResolveTests(Sync3Base):
         text = text.replace('<!-- relay:state-end -->',
                             '- 分叉待裁：正在做什么（对方）：对方值\n'
                             '<!-- relay:state-end -->')
-        state_path.write_text(text, encoding='utf-8')
+        state_path.write_bytes(text.encode('utf-8'))
         relay.update_checksum_manifest(sd_b)
         result = sync.sync_resolve(store_b, repo_b, fork='正在做什么',
                                    decision='adopt-incoming')
@@ -295,10 +295,9 @@ class ResolveTests(Sync3Base):
             sd = self.store_dir(store, repo)
             backlog = sd / 'archive' / 'backlog.md'
             text = backlog.read_text(encoding='utf-8')
-            backlog.write_text(text + '\n## T-001\n- 事项：发布检查\n'
+            backlog.write_bytes((text + '\n## T-001\n- 事项：发布检查\n'
                                '- Owner：Agent\n- 验证方式：%s\n'
-                               '- 来源：汇总 9\n- 状态：待启动\n' % variant,
-                               encoding='utf-8')
+                               '- 来源：汇总 9\n- 状态：待启动\n' % variant).encode('utf-8'))
             relay.update_checksum_manifest(sd)
         sync.pack(store_a, repo_a)
         sync.unpack(store_b, confirm=True)

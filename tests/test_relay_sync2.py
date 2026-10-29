@@ -72,7 +72,7 @@ class Sync2Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -153,12 +153,12 @@ class TestFolderCarrier(Sync2Base):
         self.goal(store, repo)
         sd = self.store_dir(store, repo)
         formal_before = (sd / 'archive' / 'goal.md').read_bytes()
-        (sd / 'archive' / 'goal （冲突副本）.md').write_text('junk\n')
-        (store / 'x (conflicted copy 2026-01-01).md').write_text('junk\n')
-        (store / 'y.sync-conflict-20260101-120000-ABCDEF.md').write_text('junk\n')
-        (store / 'z (conflict 2026-01-01).md').write_text('junk\n')
+        (sd / 'archive' / 'goal （冲突副本）.md').write_bytes('junk\n'.encode('utf-8'))
+        (store / 'x (conflicted copy 2026-01-01).md').write_bytes('junk\n'.encode('utf-8'))
+        (store / 'y.sync-conflict-20260101-120000-ABCDEF.md').write_bytes('junk\n'.encode('utf-8'))
+        (store / 'z (conflict 2026-01-01).md').write_bytes('junk\n'.encode('utf-8'))
         legit = sd / 'state' / 'goal-conflict.json'
-        legit.write_text('{"at": "x"}\n')
+        legit.write_bytes('{"at": "x"}\n'.encode('utf-8'))
         result = sync.scan_folder_conflicts(store, isolate=True)
         self.assertEqual(len(result['found']), 4)
         self.assertEqual(len(result['isolated']), 4)
@@ -179,9 +179,9 @@ class TestFolderCarrier(Sync2Base):
         self.capture(store, repo, '实现了登录')
         sd = self.store_dir(store, repo)
         state_before = (sd / 'archive' / 'state.md').read_bytes()
-        (sd / 'heartbeat-otherdevice.json').write_text(json.dumps(
+        (sd / 'heartbeat-otherdevice.json').write_bytes(json.dumps(
             {'device_id': 'otherdevice', 'device_name': 'devB',
-             'at': 'now', 'at_epoch': time.time()}, ensure_ascii=False))
+             'at': 'now', 'at_epoch': time.time()}, ensure_ascii=False).encode('utf-8'))
         result = flow.summarize(store, repo, source='test')
         self.assertTrue(result.get('degraded'))
         self.assertEqual((sd / 'archive' / 'state.md').read_bytes(), state_before)
@@ -204,9 +204,9 @@ class TestFolderCarrier(Sync2Base):
         self.goal(store, repo)
         self.capture(store, repo, '实现了登录')
         sd = self.store_dir(store, repo)
-        (sd / 'heartbeat-otherdevice.json').write_text(json.dumps(
+        (sd / 'heartbeat-otherdevice.json').write_bytes(json.dumps(
             {'device_id': 'otherdevice', 'device_name': 'devB',
-             'at': 'old', 'at_epoch': time.time() - 700}, ensure_ascii=False))
+             'at': 'old', 'at_epoch': time.time() - 700}, ensure_ascii=False).encode('utf-8'))
         result = flow.summarize(store, repo, source='test')
         self.assertNotIn('degraded', result)
 
@@ -238,9 +238,9 @@ class TestFolderCarrier(Sync2Base):
         self.goal(store, repo)
         self.capture(store, repo, '实现了登录')
         sd = self.store_dir(store, repo)
-        (sd / 'heartbeat-otherdevice.json').write_text(json.dumps(
+        (sd / 'heartbeat-otherdevice.json').write_bytes(json.dumps(
             {'device_id': 'otherdevice', 'device_name': 'devB',
-             'at': 'now', 'at_epoch': time.time()}, ensure_ascii=False))
+             'at': 'now', 'at_epoch': time.time()}, ensure_ascii=False).encode('utf-8'))
         with self.assertRaises(SyncError) as ctx:
             sync.pack(store, repo)
         self.assertIn('另一台设备近期在写此项目', str(ctx.exception))
@@ -433,13 +433,13 @@ class TestServerCarrier(Sync2Base):
         packed1 = sync.pack_server(store_a, repo_a, backend=good)
         self.assertEqual(packed1['seq'], 1)
         seq_path = self.store_dir(store_a, repo_a) / 'state' / 'pack-seq.json'
-        self.assertEqual(json.loads(seq_path.read_text())['next_seq'], 2)
+        self.assertEqual(json.loads(seq_path.read_text(encoding='utf-8'))['next_seq'], 2)
         self.capture(store_a, repo_a, '又改了点')
         faulty = sync.FaultBackend(sync.LocalDirBackend(self.root / 'server'),
                                    put_fail_after=5)
         with self.assertRaises(SyncError):
             sync.pack_server(store_a, repo_a, backend=faulty)
-        self.assertEqual(json.loads(seq_path.read_text())['next_seq'], 2)
+        self.assertEqual(json.loads(seq_path.read_text(encoding='utf-8'))['next_seq'], 2)
         packed2 = sync.pack_server(store_a, repo_a, backend=good)
         self.assertEqual(packed2['seq'], 2)  # no skip after the failed pack
 
@@ -507,9 +507,9 @@ class TestSyncTiming(Sync2Base):
         bundle = self.root / 'bundle-old'
         sync.export_bundle(store_a, [repo_a], bundle, 'devA', 'devA')
         manifest_path = bundle / 'manifest.json'
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         manifest['format_minor'] = 0
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False))
+        manifest_path.write_bytes(json.dumps(manifest, ensure_ascii=False).encode('utf-8'))
         store_b, repo_b = self.device('b')
         report = sync.import_bundle(bundle, store_b, confirm=False)
         self.assertTrue(report['warnings'])

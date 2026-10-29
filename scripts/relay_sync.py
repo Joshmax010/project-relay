@@ -206,25 +206,38 @@ SYNC_KEY_FILENAME = '.project-relay-sync-key.json'
 SYNC_PINS_FILENAME = '.project-relay-sync-pins.json'
 
 
-def _sync_key_path():
-    """The signing private seed: home directory only, never in any store,
-    bundle, or synced tree (a key inside the synced tree would be readable
-    by exactly the pusher the signature is meant to stop)."""
+def _sync_key_path(store=None):
+    """The signing private seed: next to the store in use, never in any
+    store, bundle, or synced tree (a key inside the synced tree would be
+    readable by exactly the pusher the signature is meant to stop).
+
+    Batch 3, F4: the location is parent-of-store, not home. For the
+    production store ~/.project-relay the parent IS the home directory,
+    so the production path is unchanged; but a --store-root store (tests,
+    or a store deliberately placed elsewhere) no longer reads or writes
+    the user's real home key file -- the old behavior leaked test keys
+    into the real home and shared one key across test devices. store=None
+    keeps the legacy home path for callers without a store context."""
+    if store is not None:
+        return Path(store).expanduser().resolve().parent / SYNC_KEY_FILENAME
     return relay.home_dir() / SYNC_KEY_FILENAME
 
 
-def _sync_pins_path():
+def _sync_pins_path(store=None):
     """TOFU pins: source device_id -> pinned public key. Public keys
-    only, so no permission requirement beyond the default."""
+    only, so no permission requirement beyond the default. Same
+    parent-of-store rule as the key (batch 3, F4)."""
+    if store is not None:
+        return Path(store).expanduser().resolve().parent / SYNC_PINS_FILENAME
     return relay.home_dir() / SYNC_PINS_FILENAME
 
 
-def ensure_sync_key():
+def ensure_sync_key(store=None):
     """Generate the device signing key on first use (git sync-setup is
     the primary path; git pack lazily ensures it for pre-existing
     setups). Returns the key record. The file is chmod 0600 after every
     write (save() alone would leave 0644) and re-tightened on load."""
-    path = _sync_key_path()
+    path = _sync_key_path(store)
     try:
         data = read_json(path)
     except (ValueError, OSError):
@@ -256,30 +269,31 @@ def _signing_payload(device_id, exported_at, pack_seq, file_hashes):
                       separators=(',', ':')).encode('utf-8')
 
 
-def sign_bundle_manifest(device_id, exported_at, pack_seq, file_hashes):
+def sign_bundle_manifest(device_id, exported_at, pack_seq, file_hashes,
+                         store=None):
     """Sign one git pack's manifest. Returns the manifest 'signature'
     dict (public key included: first sight pins it, see TOFU below)."""
-    key = ensure_sync_key()
+    key = ensure_sync_key(store)
     sig = _ed_sign(bytes.fromhex(key['private_seed']),
                    _signing_payload(device_id, exported_at, pack_seq, file_hashes))
     return {'algorithm': 'ed25519', 'key_id': key['key_id'],
             'public_key': key['public_key'], 'signature': sig.hex()}
 
 
-def _load_pins():
+def _load_pins(store=None):
     try:
-        pins = read_json(_sync_pins_path())
+        pins = read_json(_sync_pins_path(store))
     except (ValueError, OSError):
         return {}
     return pins if isinstance(pins, dict) else {}
 
 
-def _save_pins(pins):
-    save(_sync_pins_path(), pins)
+def _save_pins(pins, store=None):
+    save(_sync_pins_path(store), pins)
 
 
 def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
-                            repin=False):
+                            repin=False, store=None):
     """Verify a git sync-manifest's signature against recomputed hashes.
 
     Returns a verification dict (status: verified / tofu-pinned /
@@ -319,13 +333,13 @@ def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
     if not device_id:
         return {'status': 'verified-no-pin', 'device_id': device_id,
                 'key_id': key_id, 'note': '签名有效，但包无设备 ID，无法钉死'}
-    pins = _load_pins()
+    pins = _load_pins(store)
     pinned = pins.get(device_id)
     if pinned is None:
         pins[device_id] = {'key_id': key_id, 'public_key': sig['public_key'],
                            'first_seen': utc(),
                            'source_device': manifest.get('source_device')}
-        _save_pins(pins)
+        _save_pins(pins, store)
         return {'status': 'tofu-pinned', 'device_id': device_id,
                 'key_id': key_id, 'note': '首次见该设备签名公钥，已钉死（TOFU）'}
     if pinned.get('public_key') != sig['public_key']:
@@ -335,7 +349,7 @@ def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
                                'first_seen': pinned.get('first_seen'),
                                'repinned_at': utc(), 'previous_key_id': prev,
                                'source_device': manifest.get('source_device')}
-            _save_pins(pins)
+            _save_pins(pins, store)
             return {'status': 'repinned', 'device_id': device_id,
                     'key_id': key_id, 'previous_key_id': prev,
                     'note': '签名公钥已变更，用户以 --repin 明示接受新公钥'}
@@ -393,6 +407,36 @@ def _jail_check(rel):
     require(not PurePosixPath(rel).is_absolute() and '..' not in parts,
             '包内路径越界：' + rel)
     require(PurePosixPath(rel).as_posix() == rel, '包内路径未规范化：' + rel)
+
+
+_PROJECT_KEY_RE = re.compile(r'^[0-9a-f]{16}$')
+_PROJECT_SLUG_RE = re.compile(r'^[a-z0-9._-]+$')
+
+
+def _validate_project_meta(key, slug):
+    """Batch 3, C1: manifest-controlled project identity. verify_bundle
+    jails listed file paths but never looked at these two fields, so a
+    crafted key like '../../../../escaped' sent the later _claim.json
+    write outside the store. Keys are digest[:16] hex and slugs are
+    slug_for() output; anything else is a crafted manifest, refused
+    before any write."""
+    require(isinstance(key, str) and _PROJECT_KEY_RE.match(key),
+            '包内项目键非法：%r' % (key,))
+    require(isinstance(slug, str) and _PROJECT_SLUG_RE.match(slug)
+            and slug not in ('.', '..'),
+            '包内项目名非法：%r' % (slug,))
+
+
+def _contained_unclaimed_dir(store, key, slug):
+    """Unclaimed landing dir, proven inside store/unclaimed (3.8-safe:
+    relative_to raises ValueError on escape; is_relative_to needs 3.9)."""
+    dest = (Path(store) / 'unclaimed' / ('%s-%s' % (key, slug))).resolve()
+    base = (Path(store) / 'unclaimed').resolve()
+    try:
+        dest.relative_to(base)
+    except ValueError:
+        raise RelayError('待认领目标越界：' + str(dest))
+    return dest
 
 
 def _no_symlink_components(base, rel):
@@ -1748,6 +1792,10 @@ def import_bundle(bundle_dir, store, confirm=False):
     receipt is written per matched project. The registry is never edited
     by import (claiming happens explicitly via sync-claim)."""
     manifest, files, warnings = verify_bundle(bundle_dir)
+    # Batch 3, C1: validate every manifest project identity before any
+    # landing (matched or unclaimed) uses it to build paths.
+    for _proj in manifest.get('projects', []):
+        _validate_project_meta(_proj.get('key'), _proj.get('slug'))
     registry = relay.load_registry(store)
     source_base = {'device': manifest['source_device'],
                    'device_id': manifest['source_device_id']}
@@ -1824,11 +1872,45 @@ def import_bundle(bundle_dir, store, confirm=False):
                 files_in.pop(rel, None)
             entry['discarded'].extend(scan_discarded)
             entry['quarantined'] = sorted(scan_quarantined)
+            # Batch 3, C6 (preview, read-only): a repeat import landing
+            # on an existing unclaimed dir must not overwrite the first
+            # device's payload -- two devices exporting the same project
+            # before this receiver registers it would otherwise lose the
+            # first device's entries/decisions to the second import.
+            # Conflicting rels are computed here so the dry-run preview
+            # is faithful; the confirm branch below preserves the
+            # incoming versions as evidence instead of overwriting.
+            dest_preview = store / 'unclaimed' / ('%s-%s' % (proj['key'], proj['slug']))
+            conflict_rels = [rel for rel, data in files_in.items()
+                             if (dest_preview / rel).is_file()
+                             and (dest_preview / rel).read_bytes() != data]
+            entry['unclaimed_conflicts'] = [{'file': rel, 'preserved': None}
+                                            for rel in conflict_rels]
             if confirm:
-                dest = store / 'unclaimed' / ('%s-%s' % (proj['key'], proj['slug']))
+                dest = _contained_unclaimed_dir(store, proj['key'], proj['slug'])
+                preserved = []
                 for rel, data in files_in.items():
                     p = dest / rel
                     p.parent.mkdir(parents=True, exist_ok=True)
+                    if rel in conflict_rels:
+                        cdir = dest / '_conflicts'
+                        cdir.mkdir(parents=True, exist_ok=True)
+                        base = '%s--%s-%s' % (rel.replace('/', '__'),
+                                              (manifest['source_device_id'] or 'unknown')[:8],
+                                              _compact_ts(utc()))
+                        cpath = cdir / base
+                        n = 2
+                        while cpath.exists():
+                            cpath = cdir / ('%s-%d' % (base, n))
+                            n += 1
+                        cpath.write_bytes(data)
+                        preserved.append({'file': rel,
+                                          'preserved': 'unclaimed/%s-%s/_conflicts/%s'
+                                                       % (proj['key'], proj['slug'],
+                                                          cpath.name)})
+                        continue
+                    if p.exists():
+                        continue  # identical bytes: idempotent re-import
                     p.write_bytes(data)
                 qdir = dest / '_quarantine'
                 for rel, data in scan_quarantined.items():
@@ -1844,6 +1926,13 @@ def import_bundle(bundle_dir, store, confirm=False):
                          'imported_at': utc(), 'files': sorted(files_in),
                          'marker_files': sorted(marker_files),
                          'quarantined': sorted(scan_quarantined)}
+                if preserved:
+                    # Batch 3, C6: the claim record names the preserved
+                    # conflicting versions (claim metadata itself still
+                    # follows the latest import; the payload files are
+                    # what must never be overwritten).
+                    claim['unclaimed_conflicts'] = preserved
+                    entry['unclaimed_conflicts'] = preserved
                 save(dest / '_claim.json', claim)
                 index_path = store / 'unclaimed' / '_index.json'
                 index = read_json(index_path) if index_path.exists() else {'claims': []}
@@ -2058,6 +2147,9 @@ def _read_remote_bundle(clone_dir, key):
     if best is None:
         return None
     slug = best.get('slug') or ''
+    # Batch 3, C1: the slug builds a directory name below; validate
+    # before it touches any path.
+    _validate_project_meta(key, slug)
     return best, '%s-%s' % (key, slug)
 
 
@@ -2096,6 +2188,10 @@ def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
         if not listed_rel.startswith('projects/%s/' % dirname):
             continue
         rel = listed_rel[len('projects/%s/' % dirname):]
+        # Batch 3, C1: the copy below runs before verify_bundle, so a
+        # listed path with '..' would escape the rebuilt bundle dir
+        # before any jail sees it. Jail it here, at copy time.
+        _jail_check(rel)
         src_file = src / rel
         if not src_file.is_file():
             raise RelayError('远端清单文件缺失：' + listed_rel)
@@ -2113,7 +2209,7 @@ def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
     # verification never trusts that field, only disk bytes.
     verification = verify_bundle_signature(manifest, file_hashes,
                                            trust_unsigned=trust_unsigned,
-                                           repin=repin)
+                                           repin=repin, store=store)
     if verification.get('status') == 'repinned' and store is not None:
         receipt = {'at': utc(), 'kind': 'repin',
                    'source_device': manifest.get('source_device'),
@@ -2215,8 +2311,14 @@ def sync_setup_folder(store, device_name=None):
     ~/.project-relay-location pointer (via relay.home_dir(), so tests
     stay inside PROJECT_RELAY_HOME); device identity stays in the home
     file, never inside the synced tree (two devices must never fight
-    over one device_id). Runs one conflict scan immediately."""
-    store = Path(store)
+    over one device_id). Runs one conflict scan immediately.
+
+    Batch 3, C4: the store path is resolved to absolute before anything
+    (including the home pointer below) is derived from it. A relative
+    --folder stored verbatim would later resolve against each command's
+    cwd and point at a different store, making projects appear missing
+    or creating a second store."""
+    store = Path(store).expanduser().resolve()
     default = relay.default_store()
     if default != store:
         reg_path = default / 'registry.json'
@@ -2689,6 +2791,10 @@ def sync_setup(store, remote, device_name=None):
     job). An unreachable remote fails setup outright (the user must fix
     the address before any sync work)."""
     store = Path(store)
+    # Batch 3, A1-adjacent: setup on a fresh path must work -- `git -C`
+    # cannot chdir into a directory that does not exist yet, so the old
+    # code died with a bare "Git 操作失败: init" on any fresh store.
+    store.mkdir(parents=True, exist_ok=True)
     if not (store / '.git').is_dir():
         result = relay.git(store, 'init', '-b', 'main', check=False)
         if result.returncode != 0:
@@ -2700,6 +2806,17 @@ def sync_setup(store, remote, device_name=None):
     else:
         relay.git(store, 'remote', 'add', 'origin', remote)
     atomic(store / '.gitignore', GITIGNORE_TEXT.encode('utf-8'))
+    # Batch 3, A1: pin the store repo to byte-stable checkouts. The
+    # per-process -c flag covers relay's own git calls, but plain git
+    # run by the user inside the store (or any future call bypassing
+    # the wrapper) would still convert LF->CRLF on checkout under
+    # autocrlf=true and break bundle hashes and pack signatures.
+    # `* -text` in a committed .gitattributes closes that path without
+    # touching the user's global/system config. Written on every setup
+    # so pre-fix stores heal on their next setup.
+    atomic(store / '.gitattributes', b'* -text\n')
+    _commit_if_changes(store, ['.gitattributes'],
+                       'relay sync-setup: pin store to LF checkouts')
     config = None
     if (store / 'sync-config.json').exists():
         try:
@@ -2719,13 +2836,13 @@ def sync_setup(store, remote, device_name=None):
     # on a second device generates a DIFFERENT key -- that is the point:
     # each device signs with its own seed, and peers pin each device's
     # public key separately (TOFU, see verify_bundle_signature).
-    sync_key = ensure_sync_key()
+    sync_key = ensure_sync_key(store)
     registry = relay.load_registry(store)
     local_by_key = {r['key']: r for r in registry.get('projects', [])
                     if r.get('status', 'active') == 'active'}
     claims = []
     notes = ['同步签收密钥已生成（仅存本机 %s，0600 权限，私钥永不进包）：%s'
-             % (_sync_key_path(), sync_key['key_id'])]
+             % (_sync_key_path(store), sync_key['key_id'])]
     with tempfile.TemporaryDirectory(prefix='relay-setup-') as tmp:
         clone_dir = _clone(remote, tmp, checkout=_git_branch(store))
         if _clone_is_empty(clone_dir):
@@ -2780,7 +2897,8 @@ def _consistency_audit(store, toplevel, store_dir):
         m = re.search(r'^- 当前分支@基线：([^@]+)@', state_text, re.MULTILINE)
         if m and _normalize_branch(m.group(1)) != _normalize_branch(branch):
             audit['branch_mismatch'] = '档案基线分支 %s 与当前分支 %s 不一致' % (m.group(1), branch)
-        dirty = _text(relay.git(toplevel, 'status', '--porcelain', check=False).stdout).splitlines()
+        dirty = _text(relay.git(toplevel, 'status', '--porcelain', check=False,
+                                honor_autocrlf=True).stdout).splitlines()
         audit['dirty_files'] = dirty[:20]
         audit['dirty_truncated'] = len(dirty) > 20
         measure = flow.measure_change(store, toplevel)
@@ -2819,7 +2937,14 @@ def _ready_gate(store, rows):
     """Plan 2.5.4 readiness gate: ready iff every project passes health,
     has no tampered goal, and has no checksum-manifest mismatch. Branch
     drift and other normal differences are listed by reconcile, not
-    blockers (see v2-sync.md §9, D-sync-17)."""
+    blockers (see v2-sync.md §9, D-sync-17).
+
+    Batch 3, F3: an empty row set is NOT ready. Unclaimed-only unpacks
+    feed zero matched rows into the gate, and the old vacuous truth
+    printed "接力就绪" for a run that landed nothing."""
+    if not rows:
+        return False, ['本次未落盘任何已登记项目（仅待认领或无匹配项目），'
+                       '接力尚未就绪：请先认领待认领项目后再 unpack']
     problems = []
     for row in rows:
         store_dir = relay.project_store_dir(store, row)
@@ -2944,7 +3069,8 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
         # from disk and never trusts this stored copy.
         project_manifest['file_hashes'] = dict(manifest['files'])
         project_manifest['signature'] = sign_bundle_manifest(
-            device_id, manifest['exported_at'], seq, manifest['files'])
+            device_id, manifest['exported_at'], seq, manifest['files'],
+            store=store)
         save(manifest_path, project_manifest)
         stage = ['sync-manifests/' + manifest_path.name] + [
             f for f in manifest['files'] if f.startswith('projects/%s-%s/' % (key, slug))]
@@ -3428,13 +3554,14 @@ def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None,
 # ---------------------------------------------------------------- claim / rollback / status
 def sync_claim(store, key, toplevel, confirm=False):
     """Claim an unclaimed project: init the code repo if needed, then run
-    the same merge preview/land as import (dry-run without --confirm)."""
+    the same merge preview/land as import (dry-run without --confirm).
+
+    Batch 3, F2: the claim scan is read-only, so it runs first, and a
+    dry-run never inits the real store: when the project has no local
+    store yet, the preview merges against a throwaway store (relay.init
+    writes only to the store, never to the code repo) that is deleted
+    afterwards. Only --confirm creates the real local store."""
     store = Path(store)
-    try:
-        row, store_dir = relay.resolve_store_dir(store, toplevel)
-    except RelayError:
-        relay.init(store, toplevel)
-        row, store_dir = relay.resolve_store_dir(store, toplevel)
     found = None
     unclaimed = store / 'unclaimed'
     if unclaimed.is_dir():
@@ -3458,33 +3585,66 @@ def sync_claim(store, key, toplevel, confirm=False):
         # Batch 2, B2: the import-time quarantine subtree is evidence,
         # not payload -- claiming must never resurrect quarantined
         # entries into a merge (or report them as ignored files).
-        _dirs[:] = [d for d in _dirs if d != '_quarantine']
+        # Batch 3, C6: same for conflict-preserved versions.
+        _dirs[:] = [d for d in _dirs if d not in ('_quarantine', '_conflicts')]
         for f in files:
             if f == '_claim.json':
                 continue
             p = Path(root) / f
-            payload[str(p.relative_to(claim_dir))] = p.read_bytes()
+            # Batch 3, F1: payload keys are merge allowlist keys, which
+            # only match posix prefixes (raw/, archive/, ...). str() of
+            # a Windows relative path is backslash-joined, so every
+            # file was "ignored" and the claim merged nothing.
+            payload[p.relative_to(claim_dir).as_posix()] = p.read_bytes()
     files_in, _hits, marker_files, discarded, redacted_quarantined = \
         _redact_incoming(payload)
     source_info = {'device': claim.get('source_device'),
                    'device_id': claim.get('source_device_id'),
                    'seq': claim.get('pack_seq')}
-    merge_result = merge_project(store_dir, files_in, source_info)
-    merge_result['discarded'].extend(discarded)
-    merge_result['quarantined'].update(redacted_quarantined)
-    report = {'key': key, 'slug': claim.get('slug'), 'status': 'matched',
-              'counts': merge_result['counts'], 'conflicts': merge_result['conflicts'],
-              'goal_action': merge_result['goal_action'],
-              'discarded': merge_result['discarded'],
-              'quarantined': sorted(merge_result['quarantined']),
-              'notes': merge_result['notes'],
-              'changed_files': sorted(merge_result['merged_files']),
-              'marker_files': sorted(marker_files)}
-    if not confirm:
-        return {'landed': False, 'report': report}
-    landed = _land_project(store, store_dir, merge_result, source_info,
-                           marker_files=marker_files,
-                           quarantined=merge_result['quarantined'])
+    preview_tmp = None
+    try:
+        row, store_dir = relay.resolve_store_dir(store, toplevel)
+    except RelayError:
+        if confirm:
+            relay.init(store, toplevel)
+            row, store_dir = relay.resolve_store_dir(store, toplevel)
+        else:
+            preview_tmp = tempfile.TemporaryDirectory(prefix='relay-claim-preview-')
+            preview_store = Path(preview_tmp.name) / 'store'
+            relay.init(preview_store, toplevel)
+            row, store_dir = relay.resolve_store_dir(preview_store, toplevel)
+    try:
+        merge_result = merge_project(store_dir, files_in, source_info)
+        merge_result['discarded'].extend(discarded)
+        merge_result['quarantined'].update(redacted_quarantined)
+        report = {'key': key, 'slug': claim.get('slug'), 'status': 'matched',
+                  'counts': merge_result['counts'], 'conflicts': merge_result['conflicts'],
+                  'goal_action': merge_result['goal_action'],
+                  'discarded': merge_result['discarded'],
+                  'quarantined': sorted(merge_result['quarantined']),
+                  'notes': merge_result['notes'],
+                  'changed_files': sorted(merge_result['merged_files']),
+                  'marker_files': sorted(marker_files)}
+        if not confirm:
+            return {'landed': False, 'report': report}
+        # Batch 3, F5: an all-ignored merge must fail, not silently
+        # consume the claim: landing zero files while deleting the
+        # unclaimed copy destroys the only copy of content merge
+        # refused to take. Partial landings (some files merged, some
+        # ignored) are designed behavior and still land; only the
+        # zero-landing case refuses.
+        ignored = [n for n in merge_result['notes']
+                   if n.startswith('忽略未纳入合并的文件：')]
+        if ignored and not merge_result['merged_files']:
+            raise RelayError('认领合并 0 文件且有 %d 个文件被忽略未纳入合并，'
+                             '拒绝消费待认领副本（请先核对包内容）：%s'
+                             % (len(ignored), '；'.join(ignored[:5])))
+        landed = _land_project(store, store_dir, merge_result, source_info,
+                               marker_files=marker_files,
+                               quarantined=merge_result['quarantined'])
+    finally:
+        if preview_tmp is not None:
+            preview_tmp.cleanup()
     report['quarantined_files'] = landed['quarantined_files']
     report['merge_log'] = landed['merge_log']
     shutil.rmtree(claim_dir, ignore_errors=True)
@@ -3524,7 +3684,11 @@ def _rollback_git(store, toplevel, ref, reason=''):
         for root, _dirs, files in os.walk(tmp):
             for f in files:
                 p = Path(root) / f
-                rel = str(p.relative_to(tmp))
+                # Batch 3, A4/F1: os.walk yields OS-native separators, so
+                # str() gives backslashes on Windows and never matches
+                # the posix prefix -- every rollback on Windows died
+                # here with "该提交不含本项目负载". Normalize to posix.
+                rel = p.relative_to(tmp).as_posix()
                 if not rel.startswith(prefix):
                     continue
                 proj_rel = rel[len(prefix):]
@@ -3783,8 +3947,10 @@ def _ls_remote_refs(cwd, remote, patterns):
 
 def _git_env(cwd, env, *args, input_data=None):
     """git with an explicit environment (for GIT_INDEX_FILE snapshots);
-    relay.git takes no env argument, so this uses subprocess directly."""
-    return subprocess.run(['git', '-C', str(cwd), *args],
+    relay.git takes no env argument, so this uses subprocess directly.
+    Batch 3, A1: same per-process autocrlf=false pin as relayctl.git."""
+    return subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(cwd),
+                           *args],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           input=input_data, env=env, timeout=120)
 
@@ -3828,7 +3994,7 @@ def create_wip_snapshot(toplevel, device, device_id, pack_seq,
     Raises RelayError when the new content exceeds size_limit, listing
     the largest files."""
     status = _text(relay.git(toplevel, 'status', '--porcelain',
-                             check=False).stdout).splitlines()
+                             check=False, honor_autocrlf=True).stdout).splitlines()
     if not status:
         return None
     branch = _code_branch(toplevel)
@@ -3974,7 +4140,7 @@ def restore_wip_snapshot(store, toplevel, store_dir, remote):
         return {'status': 'not-a-snapshot', 'branch': branch, 'sha': sha,
                 'note': '远端保留 ref 上的提交缺少 Relay-Snapshot 标记，拒绝还原'}
     dirty = _text(relay.git(toplevel, 'status', '--porcelain',
-                            check=False).stdout).splitlines()
+                            check=False, honor_autocrlf=True).stdout).splitlines()
     if dirty:
         return {'status': 'refused-dirty', 'branch': branch, 'sha': sha,
                 'dirty': dirty[:20],
@@ -4228,21 +4394,23 @@ class _SyncAcceptRunner:
         (self.base / 'home').mkdir(parents=True, exist_ok=True)
 
     def git(self, root, *args):
-        return subprocess.run(['git', '-C', str(root), *args],
+        return subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(root),
+                               *args],
                               check=True, capture_output=True, env=self.env)
 
     def make_seed(self, name):
         root = self.base / name
         root.mkdir()
         self.git(root, 'init', '-b', 'main')
-        (root / 'app.py').write_text('value = 1\n', encoding='utf-8')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         return root
 
     def clone_device(self, seed, name, remote):
         dest = self.base / name
-        subprocess.run(['git', 'clone', '--quiet', str(seed), str(dest)],
+        subprocess.run(['git', '-c', 'core.autocrlf=false', 'clone', '--quiet',
+                        str(seed), str(dest)],
                        check=True, capture_output=True, env=self.env)
         self.git(dest, 'remote', 'set-url', 'origin', remote)
         return dest
@@ -4314,7 +4482,8 @@ class _SyncAcceptRunner:
                 for e in entries}
 
     def worktree_status(self, repo):
-        out = relay.git(repo, 'status', '--porcelain', check=False)
+        out = relay.git(repo, 'status', '--porcelain', check=False,
+                        honor_autocrlf=True)
         return _text(out.stdout).splitlines()
 
 
@@ -4347,7 +4516,7 @@ def run_sync_acceptance():
         os.environ['GIT_COMMITTER_EMAIL'] = 'test@example.invalid'
         try:
             mem = base / 'mem.git'
-            subprocess.run(['git', 'init', '--bare', '--quiet', str(mem)],
+            subprocess.run(['git', '-c', 'core.autocrlf=false', 'init', '--bare', '--quiet', str(mem)],
                            check=True, capture_output=True, env=runner.env)
             seed = runner.make_seed('seed')
             code_a = runner.clone_device(seed, 'code-a', SYNC_ACCEPT_REMOTE)
@@ -4359,7 +4528,7 @@ def run_sync_acceptance():
             runner.goal(store_a, code_a)
 
             # Act 1: two-device loop, archive identical bar state.md.
-            (code_a / 'app.py').write_text('value = 2\n', encoding='utf-8')
+            (code_a / 'app.py').write_bytes('value = 2\n'.encode('utf-8'))
             runner.git(code_a, 'add', '.')
             runner.git(code_a, 'commit', '-m', 'bump to 2')
             runner.capture(store_a, code_a, '把 app 改成 2', 's1')
@@ -4390,8 +4559,8 @@ def run_sync_acceptance():
             text_b = backlog_b.read_text(encoding='utf-8')
             next_a = (max([int(n) for n in re.findall(r'^## T(\d+)', text_a, re.MULTILINE)] or [0]) + 1)
             next_b = (max([int(n) for n in re.findall(r'^## T(\d+)', text_b, re.MULTILINE)] or [0]) + 1)
-            backlog_a.write_text(text_a + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：甲\n- 来源：汇总 9\n- 状态：待启动\n' % next_a, encoding='utf-8')
-            backlog_b.write_text(text_b + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：乙\n- 来源：汇总 9\n- 状态：待启动\n' % next_b, encoding='utf-8')
+            backlog_a.write_bytes((text_a + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：甲\n- 来源：汇总 9\n- 状态：待启动\n' % next_a).encode('utf-8'))
+            backlog_b.write_bytes((text_b + '\n## T-%03d\n- 事项：发布检查\n- Owner：Agent\n- 验证方式：乙\n- 来源：汇总 9\n- 状态：待启动\n' % next_b).encode('utf-8'))
             relay.update_checksum_manifest(sd_a)
             relay.update_checksum_manifest(sd_b)
             pack(store_a, code_a)
@@ -4417,7 +4586,7 @@ def run_sync_acceptance():
                 relay.resolve_store_dir(store_a, code_a)[0]['key'],
                 relay.resolve_store_dir(store_a, code_a)[0]['slug'])) / victim_rel
             victim.write_bytes(victim.read_bytes() + b'\n# evil\n')
-            tree_before = {str(p.relative_to(store_b)): p.read_bytes()
+            tree_before = {p.relative_to(store_b).as_posix(): p.read_bytes()
                            for p in store_b.rglob('*') if p.is_file()}
             try:
                 verify_bundle(bundle_dir)
@@ -4431,7 +4600,7 @@ def run_sync_acceptance():
                 tamper_evidence += '；落盘未被拒绝'
             except RelayError:
                 pass
-            tree_after = {str(p.relative_to(store_b)): p.read_bytes()
+            tree_after = {p.relative_to(store_b).as_posix(): p.read_bytes()
                           for p in store_b.rglob('*') if p.is_file()}
             check('三', '篡改包', '落盘前拒绝并指明文件，本地零写入',
                   tamper_ok and tree_before == tree_after, tamper_evidence)
@@ -4479,8 +4648,8 @@ def run_sync_acceptance():
             entry_path.write_bytes(body + b'\n<<<<<<< HEAD\n' if sep not in body
                                    else body.replace(sep, sep + b'\n<<<<<<< HEAD\n', 1))
             manifest5['files'][entry_rel] = _sha256(entry_path.read_bytes())
-            (bundle5 / 'manifest.json').write_text(
-                json.dumps(manifest5, ensure_ascii=False, indent=2), encoding='utf-8')
+            (bundle5 / 'manifest.json').write_bytes(
+                json.dumps(manifest5, ensure_ascii=False, indent=2).encode('utf-8'))
             code_d = runner.clone_device(seed, 'code-d', SYNC_ACCEPT_REMOTE)
             store_d = runner.setup_store('store-d', mem, 'device-D')
             runner.init_project(store_d, code_d)
@@ -4502,9 +4671,9 @@ def run_sync_acceptance():
             pack_folder(folder, code_f)
             sd_f = relay.resolve_store_dir(folder, code_f)[1]
             planted = sd_f / 'archive' / 'decisions (conflicted copy 2026).md'
-            planted.write_text('junk\n', encoding='utf-8')
+            planted.write_bytes('junk\n'.encode('utf-8'))
             legit = sd_f / 'state' / 'goal-conflict.json'
-            legit.write_text('{}', encoding='utf-8')
+            legit.write_bytes('{}'.encode('utf-8'))
             unpacked_f = unpack_folder(folder)
             isolated = list((folder / 'trash' / 'conflicts').rglob('*')) if (folder / 'trash' / 'conflicts').is_dir() else []
             check('六', '文件夹载体', '一写一读一致，冲突副本被隔离，合法标记文件不动',
@@ -4555,7 +4724,7 @@ def run_sync_acceptance():
 
             # Act 8: WIP snapshot round trip.
             mem_wip = base / 'mem-wip.git'
-            subprocess.run(['git', 'init', '--bare', '--quiet', str(mem_wip)],
+            subprocess.run(['git', '-c', 'core.autocrlf=false', 'init', '--bare', '--quiet', str(mem_wip)],
                            check=True, capture_output=True, env=runner.env)
             code_aw = runner.clone_device(seed, 'code-aw', SYNC_ACCEPT_REMOTE_WIP)
             code_bw = runner.clone_device(seed, 'code-bw', SYNC_ACCEPT_REMOTE_WIP)
@@ -4563,10 +4732,10 @@ def run_sync_acceptance():
             store_bw = runner.setup_store('store-bw', mem_wip, 'device-BW')
             runner.init_project(store_aw, code_aw)
             runner.init_project(store_bw, code_bw)
-            (code_aw / '.gitignore').write_text('local.conf\n', encoding='utf-8')
-            (code_aw / 'local.conf').write_text('token=local\n', encoding='utf-8')
-            (code_aw / 'app.py').write_text('value = 99\n', encoding='utf-8')
-            (code_aw / 'new_feature.py').write_text('x = 1\n', encoding='utf-8')
+            (code_aw / '.gitignore').write_bytes('local.conf\n'.encode('utf-8'))
+            (code_aw / 'local.conf').write_bytes('token=local\n'.encode('utf-8'))
+            (code_aw / 'app.py').write_bytes('value = 99\n'.encode('utf-8'))
+            (code_aw / 'new_feature.py').write_bytes('x = 1\n'.encode('utf-8'))
             pack_aw = pack(store_aw, code_aw)
             wip = pack_aw['receipt'].get('wip', {})
             wip_created = wip.get('status') == 'created'
@@ -4581,15 +4750,15 @@ def run_sync_acceptance():
             bw_unstaged = (any(line.startswith(' M ') for line in status_bw)
                            and any(line.startswith('?? ') for line in status_bw))
             # Dirty-refusal: BW dirties, AW packs again, BW unpack refuses.
-            (code_bw / 'app.py').write_text('value = bw-own\n', encoding='utf-8')
-            (code_aw / 'app.py').write_text('value = 100\n', encoding='utf-8')
+            (code_bw / 'app.py').write_bytes('value = bw-own\n'.encode('utf-8'))
+            (code_aw / 'app.py').write_bytes('value = 100\n'.encode('utf-8'))
             pack(store_aw, code_aw)
             unpack_bw2 = unpack(store_bw, confirm=True, toplevel=code_bw)
             restores2 = unpack_bw2.get('wip_restores', [])
             refused = any(r.get('status') == 'refused-dirty' for r in restores2)
             bw_intact = (code_bw / 'app.py').read_text(encoding='utf-8') == 'value = bw-own\n'
             # Overwrite guard: AW packs again without BW restoring.
-            (code_aw / 'app.py').write_text('value = 101\n', encoding='utf-8')
+            (code_aw / 'app.py').write_bytes('value = 101\n'.encode('utf-8'))
             try:
                 pack(store_aw, code_aw)
                 guard_ok = False

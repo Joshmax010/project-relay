@@ -36,7 +36,7 @@ FlowRelayError = flow.relay.RelayError
 
 def _write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as fh:
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
@@ -63,7 +63,7 @@ class Batch1Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -128,23 +128,30 @@ class TestA1HookCwdGate(Batch1Base):
         flow.install_claude(self.store, root_a, home_dir=home)
         settings = json.loads((home / '.claude' / 'settings.json').read_text(encoding='utf-8'))
         stop_cmds = [h['hooks'][0]['command'] for h in settings['hooks']['Stop']]
-        cap_cmd = [c for c in stop_cmds if 'hook_capture' in c][0]
-        enf_cmd = [c for c in stop_cmds if 'hook_enforce' in c][0]
+        # Batch 3, C2: exactly one Stop handler, sequencing capture then
+        # enforce in a single process.
+        self.assertEqual(1, len(stop_cmds))
+        stop_cmd = stop_cmds[0]
+        self.assertIn('hook_capture', stop_cmd)
+        self.assertIn('hook_enforce', stop_cmd)
+        if os.name == 'nt':
+            # The installed command is a POSIX-shell-quoted `python -c`
+            # line; cmd.exe cannot run it. Shell execution is covered on
+            # POSIX; the cwd gate itself is covered in-process above.
+            return
         # From project B: capture does nothing, enforce passes.
-        out = subprocess.run(cap_cmd, shell=True, cwd=str(root_b), capture_output=True)
+        out = subprocess.run(stop_cmd, shell=True, cwd=str(root_b), capture_output=True,
+                             input=b'{"session_id": "s-x"}')
         self.assertEqual(0, out.returncode)
         self.assertIn('不属于本项目', out.stdout.decode('utf-8'))
         self.assertEqual(0, len(self.entries(root_a)))
-        out = subprocess.run(enf_cmd, shell=True, cwd=str(root_b), capture_output=True,
-                             input=b'{"session_id": "s-x"}')
-        self.assertEqual(0, out.returncode)
-        # From project A (even a subdir): capture lands, enforce blocks.
-        out = subprocess.run(cap_cmd, shell=True, cwd=str(sub), capture_output=True)
-        self.assertEqual(0, out.returncode)
-        self.assertEqual(1, len(self.entries(root_a)))
-        out = subprocess.run(enf_cmd, shell=True, cwd=str(root_a), capture_output=True,
+        # From project A (even a subdir): capture lands first, then
+        # enforce blocks on the placeholder the capture just left --
+        # the ordering C2 guarantees (the old parallel handlers raced).
+        out = subprocess.run(stop_cmd, shell=True, cwd=str(sub), capture_output=True,
                              input=b'{"session_id": "s-x"}')
         self.assertEqual(2, out.returncode)
+        self.assertEqual(1, len(self.entries(root_a)))
         self.assertIn('补填采集条目', out.stdout.decode('utf-8'))
 
 
@@ -191,15 +198,28 @@ class TestA4HookQuoting(Batch1Base):
     def test_installed_hook_survives_metachar_path_without_execution(self):
         # Directory name carries space, $, backticks, quotes and $(...) --
         # under the old bare interpolation the shell would have run them.
-        name = 'a b $(touch pwn1) `touch pwn2` "q" $HOME'
+        # Batch 3, A3: `"` is illegal in a Windows directory name, so
+        # the Windows fixture drops it and keeps the other metacharacters.
+        name = ('a b $(touch pwn1) `touch pwn2` $HOME' if os.name == 'nt'
+                else 'a b $(touch pwn1) `touch pwn2` "q" $HOME')
         root = self.init(name)
         home = Path(self.temp.name) / 'fakehome4'
         flow.install_claude(self.store, root, home_dir=home)
         settings = json.loads((home / '.claude' / 'settings.json').read_text(encoding='utf-8'))
         stop_cmds = [h['hooks'][0]['command'] for h in settings['hooks']['Stop']]
-        cap_cmd = [c for c in stop_cmds if 'hook_capture' in c][0]
-        out = subprocess.run(cap_cmd, shell=True, cwd=str(root), capture_output=True)
-        self.assertEqual(0, out.returncode, out.stdout.decode('utf-8') + out.stderr.decode('utf-8'))
+        # Batch 3, C2: the Stop handler is now the single combined
+        # capture-then-enforce command; running it from the project
+        # captures one entry and then blocks on its placeholder.
+        self.assertEqual(1, len(stop_cmds))
+        stop_cmd = stop_cmds[0]
+        if os.name == 'nt':
+            # cmd.exe cannot run the POSIX-quoted command; the quoting
+            # logic itself is covered by the shlex round-trip test.
+            self.assertIn('hook_capture', stop_cmd)
+            return
+        out = subprocess.run(stop_cmd, shell=True, cwd=str(root), capture_output=True,
+                             input=b'{"session_id": "s-x"}')
+        self.assertEqual(2, out.returncode, out.stdout.decode('utf-8') + out.stderr.decode('utf-8'))
         self.assertEqual(1, len(self.entries(root)))
         self.assertFalse((root / 'pwn1').exists())
         self.assertFalse((root / 'pwn2').exists())
@@ -225,11 +245,11 @@ class TestA5CodebuddyUninstall(Batch1Base):
     def test_user_file_blocks_whole_dir_delete_and_stays_intact(self):
         root, skill_dir = self._install()
         user_file = skill_dir / 'notes.txt'
-        user_file.write_text('my notes\n', encoding='utf-8')
+        user_file.write_bytes('my notes\n'.encode('utf-8'))
         nested = skill_dir / 'extra'
         nested.mkdir()
         nested_file = nested / 'keep.md'
-        nested_file.write_text('keep me\n', encoding='utf-8')
+        nested_file.write_bytes('keep me\n'.encode('utf-8'))
         with self.assertRaises(FlowRelayError) as ctx:
             flow.uninstall_codebuddy(self.store, root, flavor='codebuddy')
         self.assertIn('notes.txt', str(ctx.exception))
@@ -243,7 +263,7 @@ class TestA5CodebuddyUninstall(Batch1Base):
         root, skill_dir = self._install()
         skill = skill_dir / 'SKILL.md'
         before = skill.read_bytes()
-        skill.write_text(skill.read_text(encoding='utf-8') + '\nmy edit\n', encoding='utf-8')
+        skill.write_bytes((skill.read_text(encoding='utf-8') + '\nmy edit\n').encode('utf-8'))
         with self.assertRaises(FlowRelayError):
             flow.uninstall_codebuddy(self.store, root, flavor='codebuddy')
         self.assertIn(b'my edit', skill.read_bytes())
@@ -334,7 +354,7 @@ class TestA7InitAtomic(Batch1Base):
         store_dir = self.store_dir(root)
         custom = '我自己的决策记录\n## D-001\n- 选择：手工写\n'
         dec_path = store_dir / 'archive' / 'decisions.md'
-        dec_path.write_text(custom, encoding='utf-8')
+        dec_path.write_bytes(custom.encode('utf-8'))
         result = relay.init(self.store, root)
         self.assertNotIn('decisions.md', result['repaired_skeletons'])
         self.assertEqual(custom, dec_path.read_text(encoding='utf-8'))

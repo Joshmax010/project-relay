@@ -94,7 +94,11 @@ def default_store():
     except OSError:
         target = ''
     if target:
-        return Path(target).expanduser()
+        # Batch 3, C4: a pointer written by a pre-fix version may be
+        # relative; resolve it against the home dir, never the
+        # caller's cwd, so commands run elsewhere still find the store.
+        p = Path(target).expanduser()
+        return p if p.is_absolute() else home_dir() / p
     return home_dir() / STORE_DIRNAME
 
 

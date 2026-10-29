@@ -117,8 +117,24 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def git(root, *args, check=True, input_data=None):
-    result = subprocess.run(['git', '-C', str(root), *args], stdout=subprocess.PIPE,
+def git(root, *args, check=True, input_data=None, honor_autocrlf=False):
+    # Batch 3, A1: every git invocation through this wrapper pins
+    # core.autocrlf=false for the process only. Relay hashes working-tree
+    # bytes itself, so a checkout-time LF->CRLF conversion (Windows with
+    # autocrlf=true) silently breaks bundle hashes, Ed25519 pack
+    # signatures and store checkouts. The flag is per-process: the user's
+    # global/system autocrlf is never read for writing and never changed.
+    # Carve-out (honor_autocrlf): commit_check and resume() compare
+    # content the USER staged with their own git against the worktree.
+    # The index blob was produced under the repo's own autocrlf setting,
+    # so those three comparisons must use the same semantics, or a
+    # Windows user with the default autocrlf=true gets a false
+    # 'worktree differs from index' on every CRLF file they staged
+    # correctly. Relay-operated repos (sync store) never take this path:
+    # relay stages there too, so forced-false stays self-consistent.
+    cmd = ['git'] + ([] if honor_autocrlf else ['-c', 'core.autocrlf=false'])
+    cmd += ['-C', str(root), *args]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, input=input_data, timeout=60)
     if check:
         require(result.returncode == 0, 'Git 操作失败: ' + ' '.join(args))
@@ -380,7 +396,8 @@ def commit_check(root, agent):
     all_files = {**receipt['snapshot']['code'], **receipt['snapshot']['memory']}
     require(all(p in tracked for p, val in all_files.items() if val is not None),
             '存在未暂存的新文件；只允许提交完整的已审核快照')
-    require(git(root, 'diff', '--quiet', '--', check=False).returncode == 0,
+    require(git(root, 'diff', '--quiet', '--', check=False,
+                honor_autocrlf=True).returncode == 0,
             '工作区与暂存区不同；请重新核对并暂存已批准内容')
     # Git diff can hide working edits behind assume-unchanged / skip-worktree.
     # Compare actual index blobs and modes, using Git's configured clean filters.
@@ -400,7 +417,8 @@ def commit_check(root, agent):
             data = p.read_bytes()
             mode = b'100755' if value['executable'] else b'100644'
             filters = ['--path=' + rel]
-        sha = git(root, 'hash-object', *filters, '--stdin', input_data=data).stdout.strip()
+        sha = git(root, 'hash-object', *filters, '--stdin', input_data=data,
+                  honor_autocrlf=True).stdout.strip()
         require(entries.get(rel) == (mode, sha), '实际暂存内容或模式与获批文件不同: ' + rel)
     staged = git(root, 'diff', '--cached', '--name-only', '-z',
                  *(['HEAD'] if receipt['snapshot']['anchor']['head'] else [])).stdout
@@ -424,7 +442,8 @@ def resume(root, agent):
         print(p.read_text(encoding='utf-8') if p.exists() else '缺失')
     print('\nGit 工作区（必须与正式记录核对）：')
     sys.stdout.flush()
-    print(os.fsdecode(git(root, 'status', '--short').stdout))
+    print(os.fsdecode(git(root, 'status', '--short',
+                            honor_autocrlf=True).stdout))
     print('隔离草稿：未经审核，只能作为核对线索。')
     for p in sorted(safe(agent, 'inbox').glob('*/batch.json')):
         safe(agent, p.relative_to(agent).as_posix())

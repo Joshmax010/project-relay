@@ -59,7 +59,7 @@ SECRET = 'AKIAIOSFODNN7EXAMPLE'  # AWS documentation example key, not real.
 
 def _write_jsonl(path, records):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as fh:
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
@@ -134,7 +134,7 @@ class Runner:
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -180,8 +180,8 @@ class Runner:
 
     def act2(self, proj):
         for i in range(10):
-            (proj / ('mod_%02d.py' % i)).write_text('# module %d\n' % i)
-        (proj / 'app.py').write_text('value = 2\n')
+            (proj / ('mod_%02d.py' % i)).write_bytes(('# module %d\n' % i).encode('utf-8'))
+        (proj / 'app.py').write_bytes('value = 2\n'.encode('utf-8'))
         flow.capture(self.store, proj, tool='claude-code', session='act2')
         enf = flow.enforce(self.store, proj, tool='claude-code', session='act2')
         ok_enforce = enf.get('action') == 'block'
@@ -239,10 +239,9 @@ class Runner:
             'wb-dead', ['已把 value 改成 3。决定：采用单例模式，因为全局只需一份配置。']))
         cd = wb / 'changes-detail' / 'wb-dead'
         cd.mkdir(parents=True, exist_ok=True)
-        (cd / 'cd_1.json').write_text(json.dumps(
-            {'files': [{'path': 'app.py', 'diff': '-value = 2\n+value = 3\n'}]}),
-            encoding='utf-8')
-        (proj / 'app.py').write_text('value = 3\n')
+        (cd / 'cd_1.json').write_bytes(json.dumps(
+            {'files': [{'path': 'app.py', 'diff': '-value = 2\n+value = 3\n'}]}).encode('utf-8'))
+        (proj / 'app.py').write_bytes('value = 3\n'.encode('utf-8'))
         notraces = wb / 'projects' / ('c-' + proj.name) / 'wb-notraces.jsonl'
         _write_jsonl(notraces, workbuddy_session_lines(proj_str, [
             ('user', '再改一个无关文件'),
@@ -284,7 +283,7 @@ class Runner:
         store_dir = self.store_dir(proj)
         goal_path = store_dir / 'archive' / 'goal.md'
         original = goal_path.read_text(encoding='utf-8')
-        goal_path.write_text(original + '被篡改的一行\n', encoding='utf-8')
+        goal_path.write_bytes((original + '被篡改的一行\n').encode('utf-8'))
         try:
             with contextlib.redirect_stdout(io.StringIO()):
                 relay.goal_check(self.store, proj)

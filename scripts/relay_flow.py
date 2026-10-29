@@ -690,11 +690,26 @@ def install_claude(store, toplevel, home_dir=None):
     # hook_cwd_allowed) and does nothing when the cwd belongs to another
     # project. A4: the wrapper command is fully shell-quoted.
     start_cmd = _hook_command(store, toplevel, 'resume')
-    stop_cmds = [_hook_command(store, toplevel, 'capture'),
-                 _hook_command(store, toplevel, 'enforce')]
+    # Batch 3, C2: a single Stop handler (capture-then-enforce in one
+    # process); the old two-handler registration raced.
+    stop_cmds = [_hook_command(store, toplevel, 'stop')]
     changed = False
     for event, cmds in (('SessionStart', [start_cmd]), ('Stop', stop_cmds)):
         entries = hooks.setdefault(event, [])
+        if event == 'Stop':
+            # Upgrade path: drop pre-C2 separate capture/enforce Stop
+            # entries (they contain hook_capture/hook_enforce but are
+            # not the combined command) so a reinstall does not leave
+            # the racing pair alongside the sequenced handler.
+            kept = [h for h in entries
+                    if not isinstance(h, dict)
+                    or not any(marker in (h.get('hooks') or [{}])[0].get('command', '')
+                               and stop_cmds[0] not in (h.get('hooks') or [{}])[0].get('command', '')
+                               for marker in ('hook_capture', 'hook_enforce'))]
+            if len(kept) != len(entries):
+                hooks[event] = kept
+                entries = kept
+                changed = True
         for cmd in cmds:
             if not any(cmd in (h.get('hooks') or [{}])[0].get('command', '')
                        for h in entries if isinstance(h, dict)):
@@ -830,9 +845,29 @@ def _hook_command(store, toplevel, kind):
                 'print(_r[\'note\'] if _r.get(\'skipped\') else '
                 '(_r[\'message\'] if _r.get(\'no_archive\') else '
                 '_hook_flow.render_resume(_r)))\n' % (store_lit, root_lit))
-    else:  # pragma: no cover - install_claude only passes the three kinds
+    elif kind == 'stop':
+        # Batch 3, C2: ONE Stop handler that captures first and enforces
+        # second, in a single process. Claude Code runs matching handlers
+        # for an event in parallel, so the old two-handler registration
+        # let enforce run before capture had written its entry: enforce
+        # took its no-entry pass path and never re-checked the
+        # placeholder the later capture left. Sequencing inside one
+        # handler is the guarantee; separate handlers cannot give it.
+        body = ('_r = _hook_flow.hook_capture(%s, %s, tool=\'claude-code\')\n'
+                'print(_r[\'note\'] if _r.get(\'skipped\') else '
+                '\'采集条目：cap-%%04d（%%s）\' %% (_r[\'seq\'], _r.get(\'path\', \'\')))\n'
+                '_sid = None\ntry:\n'
+                '    _raw = sys.stdin.read() if not sys.stdin.isatty() else \'\'\n'
+                '    _d = json.loads(_raw) if _raw.strip() else None\n'
+                '    _sid = _d.get(\'session_id\') if isinstance(_d, dict) else None\n'
+                'except Exception:\n    _sid = None\n'
+                '_r = _hook_flow.hook_enforce(%s, %s, tool=\'claude-code\', session=_sid)\n'
+                'print(_r.get(\'instruction\') or (\'PASS：\' + _r.get(\'note\', \'\')))\n'
+                'sys.exit(2 if _r.get(\'action\') == \'block\' else 0)\n'
+                % (store_lit, root_lit, store_lit, root_lit))
+    else:  # pragma: no cover - install_claude only passes the four kinds
         raise RelayError('未知钩子种类：' + kind)
-    code = head + 'import json\n' + body if kind == 'enforce' else head + body
+    code = head + 'import json\n' + body if kind in ('enforce', 'stop') else head + body
     return '%s -c %s' % (shlex.quote(sys.executable), shlex.quote(code))
 
 
@@ -1266,6 +1301,75 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
     return record
 
 
+def _recover_incomplete_tx(store, toplevel, store_dir):
+    """Batch 3, C3: roll back an incomplete summarize transaction before
+    the next summarize selects pending entries (called from
+    _summarize_impl; pack's automatic summarize funnels through it).
+
+    Detection uses the LATEST tx log only (mirroring health_check):
+    - all files at after-bytes + summary record for this seq present
+      => the transaction completed; nothing to do.
+    - all files at after-bytes + record missing => crashed mid-flight
+      (the record is written last) => recover() rolls archive, cursor,
+      baseline, last-summary and entry queues back to before-state.
+    - mixed before/after-or-evolved => partial application => recover()
+      (its preflight fails closed on externally-evolved files, aborting
+      this summarize with an actionable error instead of duplicating).
+    - all files at before-bytes => the log was written but the files
+      never applied; the retry recomputes from current bytes and its
+      own newer log supersedes this stale one, so leave it.
+    A malformed latest log is left alone: health_check already reports
+    it, and guessing here could destroy evidence. Returns a note when
+    a recovery ran, else None."""
+    import base64
+    tx_dir = store_dir / 'tx'
+    if not tx_dir.is_dir():
+        return None
+    logs = sorted(p for p in tx_dir.glob('*.json')
+                  if not p.name.endswith('.recovered.json'))
+    if not logs:
+        return None
+    try:
+        tx = read_json(logs[-1])
+        files = tx['files']
+        seq = tx['seq']
+    except (ValueError, KeyError, OSError):
+        return None
+    if not isinstance(files, dict) or not files:
+        return None
+    archive = store_dir / 'archive'
+    states = []
+    for name, rec in files.items():
+        try:
+            before = base64.b64decode(rec['before_b64'])
+            after_sha = rec['after_sha']
+        except (KeyError, ValueError):
+            return None
+        current = (archive / name).read_bytes() if (archive / name).exists() else b''
+        # Batch 3, C3 (ordering matters): check after FIRST. A file the
+        # transaction did not change has before == after bytes, and
+        # classifying it as 'before' would fake a partial application
+        # and roll back every completed summarize whose semantic added
+        # nothing to that file.
+        if digest(current) == after_sha:
+            states.append('after')
+        elif current == before:
+            states.append('before')
+        else:
+            states.append('other')
+    if all(s == 'after' for s in states):
+        record = store_dir / 'state' / 'summaries' / ('%04d.json' % seq) \
+            if isinstance(seq, int) else None
+        if record is not None and record.exists():
+            return None
+        info = recover(store, toplevel)
+        return '已回滚未完成汇总事务 %s（档案已写但游标/记录未落盘），本次汇总从事务前重新计算' % info.get('recovered')
+    if any(s == 'before' for s in states) and any(s != 'before' for s in states):
+        info = recover(store, toplevel)
+        return '已回滚部分应用的汇总事务 %s，本次汇总从事务前重新计算' % info.get('recovered')
+    return None
+
+
 def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False):
     """Incremental merge of pending raw entries into the archive (plan 1.12).
 
@@ -1278,6 +1382,13 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     toplevel = relay.git_toplevel(toplevel)
     queue_status(store_dir, repair=True)
+    # Batch 3, C3: recover an incomplete transaction BEFORE selecting
+    # pending entries. A summarize that crashed after writing archive
+    # files but before cursor/record/transitions leaves its effects in
+    # the archive with its entries still pending; reselecting them
+    # would append the same decisions/todos a second time (pack's
+    # automatic summarize funnels through here, so it is covered too).
+    _recover_incomplete_tx(store, toplevel, store_dir)
     digest_doc = precompress(store, toplevel)
     cursor = _cursor(store_dir)
     entries = [e for e in list_entries(store_dir)
@@ -1707,8 +1818,21 @@ def make_handoff(store, toplevel):
     if queue['over_retries']:
         gaps.append('队列异常：回退超 3 次条目 %s' % queue['over_retries'])
     stamp = utc()[:10]
-    seq = _next_summary_seq(store_dir)
+    # Batch 3, C5: handoffs have their own sequence, counted from
+    # existing handoff files for the date -- NOT _next_summary_seq().
+    # The old shared counter returned the same value for two handoffs
+    # on one day without an intervening summary, so the second
+    # atomically replaced the first.
+    seq = _next_handoff_seq(store_dir, stamp)
     name = '%s-%04d.md' % (stamp, seq)
+    dest = archive / 'handoffs' / name
+    while dest.exists():
+        # Belt and braces, resolved BEFORE the body is built so the
+        # title always matches the file: a hand-placed file with the
+        # computed name must never be overwritten either.
+        seq += 1
+        name = '%s-%04d.md' % (stamp, seq)
+        dest = archive / 'handoffs' / name
     body = ('# 交接包 %s\n\n## 状态卷顶部\n\n%s\n\n## 目标现状\n\n目标状态：%s\n\n'
             '## 待办未闭环\n\n%s\n\n## 最近汇总\n\n%s\n\n## 下一会话提示词\n\n'
             '项目在 %s。基线已验：%s。先跑 `relay resume` 对账，再按待办清单头三件事开工，'
@@ -1717,7 +1841,6 @@ def make_handoff(store, toplevel):
                (last or {}).get('source', '尚无汇总'),
                toplevel, '是' if last else '否',
                '\n'.join('- ' + g for g in gaps) or '- 无'))
-    dest = archive / 'handoffs' / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     atomic(dest, body.encode('utf-8'))
     index_path = store_dir / 'state' / 'handoff-index.md'
@@ -1725,7 +1848,25 @@ def make_handoff(store, toplevel):
     existing = index_path.read_text(encoding='utf-8') if index_path.exists() else ''
     if name not in existing:
         atomic(index_path, (existing + line).encode('utf-8'))
+    # Batch 3, C7: handoff files live under archive/, so the checksum
+    # manifest must list them or later edits/truncation evade checks.
+    relay.update_checksum_manifest(store_dir)
     return {'package': str(dest), 'name': name}
+
+
+def _next_handoff_seq(store_dir, stamp):
+    """Handoff sequence for one date: max existing suffix + 1 (1 when
+    none). Only files matching '<stamp>-<int>.md' count; anything else
+    in the directory is ignored, never parsed as a number."""
+    d = store_dir / 'archive' / 'handoffs'
+    seqs = []
+    if d.is_dir():
+        for p in d.glob('%s-*.md' % stamp):
+            try:
+                seqs.append(int(p.stem.rsplit('-', 1)[1]))
+            except (ValueError, IndexError):
+                continue
+    return (max(seqs) + 1) if seqs else 1
 
 
 def estimate_tokens(text):

@@ -883,3 +883,129 @@ slug 对应的那一个，不要直接读其他 slug 目录。
   未删未弱化；`_merge_state_md` 返回由二元组改为（合并文本、冲突、
   注记）三元组，`_redact_incoming` 返回由四元组改为五元组（含隔离
   字节），均为内部函数，调用点已同步改完。
+
+## 16. 第三批修复：Windows 环境批 + claim F1–F5 + Codex 新 7 条（C1–C7，2026-10-30，未提交）
+
+- **来源**：① Windows 实测（第一步 unittest 71 项失败、sync 模块
+  autocrlf 覆盖后残留 4 项、第二步 claim 反斜杠与就绪门原始输出）；
+  ② Codex 对 `feat/v2-foundation` 的新一轮 7 条行内评论（P1 1 条、
+  P2 6 条，见 `~/workspace/project-relay-codex-comments/pr5-comments.json`
+  第 12–18 条）。三批全部做完，新增 24 项（`tests/test_relay_batch3.py`）。
+- **D-sync-30 git 调用钉死 autocrlf=false，观测用户产物除外（A1）**：`relayctl.git`
+  与 `relay_sync._git_env`、sync-accept runner 的 git/clone/bare-init
+  调用全部加 `-c core.autocrlf=false`（仅当进程有效）。用户全局/系统
+  autocrlf 绝不读来写、绝不改。`sync_setup` 每次都在记忆仓写
+  `* -text` 的 `.gitattributes` 并提交（老仓下次 setup 即自愈），防
+  用户在仓内直接跑 git 绕过封装。附带：全新路径上 `sync_setup`
+  原先死于 `git -C <不存在的目录> init`，现先 mkdir。收口见
+  D-sync-42：观测用户自有 git 产物的调用（`commit_check` 的
+  diff/hash-object 对照、`resume()` status、sync 审计与 WIP 快照/
+  恢复、sync-accept worktree 观测）改走 `honor_autocrlf=True`，
+  不注入 `-c`；relay 自营 store 仓仍强制 false。
+- **D-sync-31 文本写路径字节稳定（A2）**：生产写路径本就走
+  `relayctl.atomic`（二进制），翻译出在测试/验收夹具的 `write_text`
+  与 `open('w')`：108 处 `write_text` 改为 `write_bytes(encode('utf-8'))`、
+  3 处 `open('w')` 加 `newline=''`、32 处裸 `read_text()` 补显式编码，
+  另有全部
+  CLI 子进程调用的 `encoding='utf-8'` + `PYTHONIOENCODING=utf-8`
+  （子进程中文输出曾被父进程按 cp936 解成乱码）。README 仍称
+  Python 3.8+，故不用 3.10 才有的 `write_text(newline=)`。两处同类
+  根因一次钉死：init 模板 CRLF（实为 git 检出转换，D-sync-30 治本）
+  与导出/导入 `verify_bundle` 哈希不符（夹具写盘 CRLF、哈希按 LF
+  算，非 git 问题）。
+- **D-sync-32 平台相关测试（A3）**：0o600/0o640 模式断言在 Windows
+  下只断言 POSIX（字节一半仍跑）；`"` 目录名夹具在 Windows 下改
+  用合法但同样刁钻的名字（空格/$/反引号/$(...) 保留）；POSIX
+  shell 执行的钩子测试在 Windows 下跳过执行、保留安装断言（引用
+  逻辑另有 shlex 往返测试覆盖）。
+- **D-sync-33 回滚“该提交不含本项目负载”（A4）**：根因与 F1 同类，
+  不是 slug 派生不一致：`_rollback_git` 对 tar 解包树用
+  `str(relative_to)` 比较 posix 前缀，Windows 下反斜杠永不匹配，
+  `ref_files` 为空即报该错。修法：比较前 `.as_posix()`。另审计
+  全部磁盘读包路径：文件夹载体（rglob + as_posix）、服务器载体
+  （清单键 posix + `_jail_check`）均干净；仅 claim（F1）、回滚
+  （A4）两处中招，accept runner 的树比较字典同步改 posix。
+- **D-sync-34 claim 五项（F1–F5）**：F1 payload 键统一正斜杠；
+  F2 干跑不再 init 真实仓（无本地仓时用临时仓预览，merge 是纯函数，
+  预览结果与真实 init 一致；未知 key 仍先报“无此项目”，不写仓）；
+  F3 `_ready_gate` 空行不再空真（git/folder/server 三载体共用，
+  unclaimed-only unpack 得 ready=False + 待认领指引；已落盘复验的
+  ready 语义不变）；F4 密钥与钉死文件改 parent-of-store 规则
+  （`Path(store).resolve().parent / 文件名`，生产仓 `~/.project-relay`
+  的父目录即 home、路径与旧版完全一致；`--store-root` 隔离仓不再
+  读写真实 home 的密钥文件；无 store 上下文的调用保留旧 home 路径
+  兜底）；F5 认领空合并 guard（有忽略文件且落盘 0 时按失败处理、
+  不消费待认领副本；部分落盘仍属设计行为，照常落盘并报告忽略项）。
+- **D-sync-35 导入前校验项目身份（C1，P1）**：`verify_bundle` 只管
+  清单文件路径，不管 manifest 的 key/slug， crafted key
+  `../../../../escaped` 会让后续 `_claim.json` 写出仓。修法：
+  `import_bundle` 在任何落盘前校验全部项目（key 须 16 位小写 hex、
+  slug 须 `[a-z0-9._-]+` 且非 `.`/`..`），待认领目录另做解析后
+  containment 断言（3.8 兼容写法，不用 3.9 的 `is_relative_to`）；
+  远端清单读取（`_read_remote_bundle`）与克隆拷贝循环（拷贝先于
+  verify，故拷贝时先 `_jail_check`）同补。`_claim.json` 本身由
+  import 写（已校验），claim 侧不再重复校验。
+- **D-sync-36 Stop 钩子单处理器串行（C2）**：Claude Code 对同一事件
+  的多个 handler 并行跑，旧的 capture/enforce 双 handler 会让
+  enforce 在 capture 写条目前走 no-entry 通过、再也不复查 capture
+  留下的占位。修法：Stop 只登记一个 `stop` 命令，同一进程内先
+  capture 后 enforce；重装时剪掉旧的分离式 Stop 条目（新命令本身
+  含两个函数名，剪枝谓词排除自身）；卸载仍按 recipe state 的命令
+  串匹配，新旧安装均可干净卸载。
+- **D-sync-37 汇总前恢复未完成事务（C3）**：`_summarize_impl` 选
+  pending 条目前先查最新 tx 日志：全 after + 汇总记录缺失（记录
+  写在最后，缺记录即中途崩溃）或混合 before/after（部分应用）
+  时调 `recover()` 整单回滚（档案、游标、基线、last-summary、
+  条目队列，记录标墓碑）；全 before（日志写了、文件未应用）
+  不动（重试自会以新日志 supersede）；全 after + 记录在场即已
+  完成，不动；日志损坏不动（health_check 已报，猜测会毁证据）。
+  recover 预检对外部演进文件 fail-closed，中止本次汇总并报错，
+  不静默复写。pack 的自动汇总走同一入口，同受益。状态判定
+  顺序须先判 after 再判 before（见 D-sync-42）：事务未改动的
+  文件 before==after，先判 before 会把已完成汇总误判为部分应用
+  而误回滚。
+- **D-sync-38 folder 路径绝对化（C4）**：`sync_setup_folder` 入口即
+  `expanduser().resolve()`，再写 home 指针与返回；`default_store`
+  对旧版写下的相对指针改按 home 解析（不按调用方 cwd），绝对
+  指针行为不变。
+- **D-sync-39 交接包独立序列（C5）**：`make_handoff` 不再偷汇总序号
+  （同日两次无新汇总时同名覆盖），改按当日已有交接文件取最大
+  后缀 +1，另对手工占位同名文件循环递增（bump 在 body 生成前，
+  标题与文件名一致）。
+- **D-sync-40 待认领重复导入保留冲突版（C6）**：同一项目两台设备
+  先后导入同一待认领目录时，字节相同的文件跳过（幂等重导），
+  字节不同的文件不再覆盖： incoming 版写入 `_conflicts/`（设备
+  + 时间戳命名，冲突再犯递增），首版保留；干跑预览如实报告
+  would-be 冲突（preserved 为 None），落盘后 claim 记录与报告均
+  列出保留路径；`sync_claim` 的 payload  walk 同步排除 `_conflicts`
+ （与 `_quarantine` 同理，只作证据、不作原料）。
+- **D-sync-41 档案写后刷新校验清单（C7）**：`backfill --summarize`
+  写 `backfill-fidelity.md` 与 `make_handoff` 写交接包/索引后均补
+  `update_checksum_manifest`（清单覆盖 archive/ 下全部文件，含
+  handoffs/；verify 本就忽略未列文件，故不刷新等于这些文件永不
+  受检）。其余档案写路径此前已全量刷新，本次只补这两处。
+- **Windows 实证缺口（未在沙箱证实，待真机重跑）**：F1/A4 的反斜
+  杠行为与 A1 的检出转换在 Linux 沙箱无法复现（POSIX 分隔符本
+  就是 `/`），沙箱测试钉死的是 posix 键、字节哈希、干跑零写等
+  契约；`test_relayctl` 全量失败的 knock-on 根因（`init_project`
+  子进程对含中文路径的 git 输出按 locale 解码）已按编码钉死
+  （`encoding='utf-8'`），同样待 Windows 重跑证实。修法批次的
+  Windows 重跑清单：unittest 全量、claim 路径、回滚、init 模板
+  换行四项。
+- **D-sync-42 全量回归逼出的三处修正（batch3 单测全过后，全量
+  240 项初跑 22 项失败，逐项定位修净）**：① C3 判定顺序：先判
+  after 再判 before——事务未改动文件 before==after，先判 before
+  会把已完成汇总误判为部分应用而误回滚（batch3 语义改动了全部
+  文件故未暴露，既有增量汇总测试暴露）；② A2 批量转换器的
+  运算符优先级 bug：`write_text(A + 'x')` 直转
+  `write_bytes(A + 'x'.encode())` 会把 str 与 bytes 相加，13 处
+  补括号为 `write_bytes((A + 'x').encode())`；③ F4 落地后 B1
+  旧测试布局（home 与 store 为兄弟目录）不再等于生产布局：
+  `_device_a_pack` 与往返测试的 store 改放进各自 home 内（生产
+  布局，parent-of-store == home，旧断言原样成立），隔离布局的
+  新规则另由 batch3 的 F4 测试覆盖。
+- **测试**：新增 24 项（`tests/test_relay_batch3.py`），全量 216 → 240
+  项；`relay accept` 与 `relay sync-accept` 各连续两遍 PASS（见本
+  批提交说明）。既有测试未删未弱化（A3 的模式/目录名/ shell
+  三处为平台守卫，非弱化断言；D-sync-42 的 B1 布局调整只改夹
+  具目录结构，断言本身未动）。

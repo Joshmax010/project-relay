@@ -69,7 +69,7 @@ class Batch2Base(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -85,7 +85,7 @@ class Batch2Base(unittest.TestCase):
         return relay.resolve_store_dir(store or self.store, root)[1]
 
     def change_code(self, repo, text):
-        (repo / 'app.py').write_text(text)
+        (repo / 'app.py').write_bytes(text.encode('utf-8'))
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-m', 'change')
 
@@ -126,21 +126,21 @@ class TestA2RecoverRollback(Batch2Base):
         flow.summarize(self.store, root, source='test', semantic_text=None)
         # Premise check (A2): the tx log is still there after success.
         self.assertTrue(list((sd / 'tx').glob('*.json')))
-        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text())['entry_seq'], 2)
+        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text(encoding='utf-8'))['entry_seq'], 2)
         self.assertTrue((sd / 'state' / 'summaries' / '0001.json').exists())
         info = flow.recover(self.store, root)
         # Archive, cursor, baseline, last-summary, summary record, queues
         # must all agree with the pre-transaction state -- no cursor-new /
         # archive-old mismatch left behind.
         self.assertEqual((sd / 'archive' / 'state.md').read_bytes(), before_state)
-        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text()),
+        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text(encoding='utf-8')),
                          {'entry_seq': 0, 'anchor_message': None})
         self.assertFalse((sd / 'state' / 'baseline.json').exists())
         self.assertFalse((sd / 'state' / 'last-summary.json').exists())
         # Tombstone: the record stays, annotated, so sequence numbers
         # stay monotonic (an older test pins that across recover).
         self.assertTrue(json.loads(
-            (sd / 'state' / 'summaries' / '0001.json').read_text())['rolled_back'])
+            (sd / 'state' / 'summaries' / '0001.json').read_text(encoding='utf-8'))['rolled_back'])
         self.assertEqual(sorted(info['entries_reverted_to_pending']), [1, 2])
         queue = flow.queue_status(sd, repair=False)
         self.assertEqual((queue['pending'], queue['summarized']), (2, 0))
@@ -163,12 +163,12 @@ class TestA2RecoverRollback(Batch2Base):
         info = flow.recover(self.store, root)
         self.assertEqual(info['baseline_summary_seq'], 1)
         self.assertEqual((sd / 'state' / 'baseline.json').read_bytes(), first_baseline)
-        self.assertEqual(json.loads((sd / 'state' / 'last-summary.json').read_text())['seq'], 1)
+        self.assertEqual(json.loads((sd / 'state' / 'last-summary.json').read_text(encoding='utf-8'))['seq'], 1)
         self.assertFalse(json.loads(
-            (sd / 'state' / 'summaries' / '0001.json').read_text()).get('rolled_back', False))
+            (sd / 'state' / 'summaries' / '0001.json').read_text(encoding='utf-8')).get('rolled_back', False))
         self.assertTrue(json.loads(
-            (sd / 'state' / 'summaries' / '0002.json').read_text())['rolled_back'])
-        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text())['entry_seq'], 2)
+            (sd / 'state' / 'summaries' / '0002.json').read_text(encoding='utf-8'))['rolled_back'])
+        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text(encoding='utf-8'))['entry_seq'], 2)
         queue = flow.queue_status(sd, repair=False)
         self.assertEqual((queue['pending'], queue['summarized']), (1, 1))
         # The first batch's oldest entry was archived by the second
@@ -184,14 +184,14 @@ class TestA2RecoverRollback(Batch2Base):
         root = self.init()
         sd, _first = self.summarize_two(self.store, root)
         tx_path = sd / 'tx' / '0002.json'
-        tx = json.loads(tx_path.read_text())
+        tx = json.loads(tx_path.read_text(encoding='utf-8'))
         tx.pop('before_state', None)
-        tx_path.write_text(json.dumps(tx, ensure_ascii=False, indent=2))
+        tx_path.write_bytes(json.dumps(tx, ensure_ascii=False, indent=2).encode('utf-8'))
         flow.recover(self.store, root)
-        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text())['entry_seq'], 2)
+        self.assertEqual(json.loads((sd / 'state' / 'cursor.json').read_text(encoding='utf-8'))['entry_seq'], 2)
         # Legacy baseline snapshot is unrecoverable: dropped, not faked.
         self.assertFalse((sd / 'state' / 'baseline.json').exists())
-        self.assertEqual(json.loads((sd / 'state' / 'last-summary.json').read_text())['seq'], 1)
+        self.assertEqual(json.loads((sd / 'state' / 'last-summary.json').read_text(encoding='utf-8'))['seq'], 1)
         queue = flow.queue_status(sd, repair=False)
         self.assertEqual((queue['pending'], queue['summarized']), (1, 1))
 
@@ -199,9 +199,9 @@ class TestA2RecoverRollback(Batch2Base):
         root = self.init()
         sd, _first = self.summarize_two(self.store, root)
         tx_path = sd / 'tx' / '0002.json'
-        tx = json.loads(tx_path.read_text())
+        tx = json.loads(tx_path.read_text(encoding='utf-8'))
         tx.pop('before_state', None)
-        tx_path.write_text(json.dumps(tx, ensure_ascii=False, indent=2))
+        tx_path.write_bytes(json.dumps(tx, ensure_ascii=False, indent=2).encode('utf-8'))
         (sd / 'state' / 'summaries' / '0002.json').unlink()
         before_state = (sd / 'archive' / 'state.md').read_bytes()
         with self.assertRaises(FlowError):
@@ -228,7 +228,10 @@ class TestB1Signing(Batch2Base):
     def _device_a_pack(self, home_name, store_name, repo_name):
         """Pack once from device A; returns (home, store, repo, manifest_path, seed_hex, manifest_files)."""
         with self.home(home_name) as home:
-            store = self.root / store_name
+            # Batch 3, F4: the store lives INSIDE the device home, the
+            # production layout, so parent-of-store == home and the
+            # signing key / pins land at the historic home paths.
+            store = home / store_name
             repo = self.make_repo(repo_name, str(self.bare))
             relay.init(store, repo)
             sync.sync_setup(store, str(self.bare), device_name='device-a')
@@ -244,7 +247,7 @@ class TestB1Signing(Batch2Base):
     def test_pack_unpack_roundtrip_tofu_then_verified(self):
         home_a, store_a, _repo_a, manifest_path, seed_hex, manifest_files = self._device_a_pack(
             'home-a', 'store-a', 'proj-a')
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         self.assertIn('signature', manifest)
         self.assertEqual(manifest['signature']['algorithm'], 'ed25519')
         self.assertEqual(manifest['file_hashes'], manifest_files)
@@ -253,17 +256,20 @@ class TestB1Signing(Batch2Base):
             if path.is_file() and '.git' not in path.parts:
                 self.assertNotIn(seed_hex, path.read_text(encoding='utf-8', errors='ignore'))
         key_path = home_a / '.project-relay-sync-key.json'
-        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        # Batch 3, A3: Windows chmod only toggles read-only; POSIX mode
+        # bits are meaningless there, so assert the mode on POSIX only.
+        if os.name != 'nt':
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
         with self.home('home-b') as home_b:
-            store_b = self.root / 'store-b'
+            store_b = home_b / 'store-b'
             repo_b = self.make_repo('proj-b', str(self.bare))
             relay.init(store_b, repo_b)
             sync.sync_setup(store_b, str(self.bare), device_name='device-b')
             report = sync.unpack(store_b, confirm=True)
             verification = report['reports'][0]['report']['signature_verification']
             self.assertEqual(verification['status'], 'tofu-pinned')
-            pins = json.loads((home_b / '.project-relay-sync-pins.json').read_text())
-            device_a_id = json.loads((store_a / 'sync-config.json').read_text())['device_id']
+            pins = json.loads((home_b / '.project-relay-sync-pins.json').read_text(encoding='utf-8'))
+            device_a_id = json.loads((store_a / 'sync-config.json').read_text(encoding='utf-8'))['device_id']
             self.assertEqual(pins[device_a_id]['public_key'],
                              manifest['signature']['public_key'])
             # Second pack/unpack round verifies against the pin.
@@ -289,14 +295,14 @@ class TestB1Signing(Batch2Base):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         (clone / 'sync-manifests').mkdir(parents=True)
-        (clone / 'sync-manifests' / ('%s-0001.json' % manifest_dict['key'])).write_text(
-            json.dumps(manifest_dict, ensure_ascii=False, indent=2))
+        (clone / 'sync-manifests' / ('%s-0001.json' % manifest_dict['key'])).write_bytes(
+            json.dumps(manifest_dict, ensure_ascii=False, indent=2).encode('utf-8'))
         return clone
 
     def test_tampered_git_bundle_refused_before_landing(self):
         home_a, store_a, _repo_a, manifest_path, _seed, _mf = self._device_a_pack(
             'home-a2', 'store-a2', 'proj-a2')
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         dirname = '%s-%s' % (manifest['key'], manifest['slug'])
         project_files = {}
         for rel in manifest['files']:
@@ -334,7 +340,7 @@ class TestB1Signing(Batch2Base):
             (home_a / '.project-relay-sync-key.json').unlink()
             new_key = sync.ensure_sync_key()
             self.assertNotEqual(new_key['key_id'],
-                                json.loads(manifest_path.read_text())['signature']['key_id'])
+                                json.loads(manifest_path.read_text(encoding='utf-8'))['signature']['key_id'])
             self.change_code(repo_a, 'value = 9\n')
             self.capture(store_a, repo_a, 'rotated')
             sync.pack(store_a, repo_a)
@@ -347,14 +353,14 @@ class TestB1Signing(Batch2Base):
             self.assertEqual(verification['status'], 'repinned')
             receipts = list((store_b / 'sync-receipts').glob('repin-*.json'))
             self.assertTrue(receipts)
-            receipt = json.loads(receipts[0].read_text())
+            receipt = json.loads(receipts[0].read_text(encoding='utf-8'))
             self.assertEqual(receipt['key_id'], verification['key_id'])
             self.assertEqual(receipt['previous_key_id'], verification['previous_key_id'])
 
     def test_unsigned_refused_then_trust_unsigned_accepted(self):
         home_a, store_a, _repo_a, manifest_path, _seed, _mf = self._device_a_pack(
             'home-a4', 'store-a4', 'proj-a4')
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         manifest.pop('signature', None)
         manifest.pop('file_hashes', None)
         dirname = '%s-%s' % (manifest['key'], manifest['slug'])
@@ -399,15 +405,15 @@ class TestB2Quarantine(Batch2Base):
         proj = manifest['projects'][0]
         cap = bundle / 'projects' / ('%s-%s' % (proj['key'], proj['slug'])) \
             / 'raw' / ('cap-%04d.md' % tamper_seq)
-        text = cap.read_text()
+        text = cap.read_text(encoding='utf-8')
         head, body = text.split('---relay-body---', 1)
         m = re.search(r'"sha256": "([0-9a-f]{64})"', head)
         self.assertIsNotNone(m, 'expected a sha in the entry header')
         head2 = head[:m.start(1)] + ('0' if m.group(1)[0] != '0' else '1') + head[m.start(1) + 1:]
-        cap.write_text(head2 + '---relay-body---' + body)
+        cap.write_bytes((head2 + '---relay-body---' + body).encode('utf-8'))
         rel = 'projects/%s-%s/raw/cap-%04d.md' % (proj['key'], proj['slug'], tamper_seq)
         manifest['files'][rel] = sync._sha256(cap.read_bytes())
-        (bundle / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+        (bundle / 'manifest.json').write_bytes(json.dumps(manifest, ensure_ascii=False, indent=2).encode('utf-8'))
         return bundle, proj, cap.read_bytes()
 
     def test_matched_id_mismatch_quarantined_not_landed_not_counted(self):
@@ -471,7 +477,7 @@ class TestB2Quarantine(Batch2Base):
 
 class TestB3TemplateState(Batch2Base):
     def _template_text(self):
-        return (SKILL / 'assets' / 'template-v2' / 'state.md').read_text()
+        return (SKILL / 'assets' / 'template-v2' / 'state.md').read_text(encoding='utf-8')
 
     def _incoming_text(self):
         return """# 当前状态
@@ -578,14 +584,14 @@ class TestB5GitIdentity(Batch2Base):
             self.assertEqual(result['seq'], 1)
             name = subprocess.run(['git', '-C', str(store), 'config', '--local',
                                    '--get', 'user.name'],
-                                  capture_output=True, text=True).stdout.strip()
+                                  capture_output=True, text=True, encoding='utf-8').stdout.strip()
             email = subprocess.run(['git', '-C', str(store), 'config', '--local',
                                     '--get', 'user.email'],
-                                   capture_output=True, text=True).stdout.strip()
+                                   capture_output=True, text=True, encoding='utf-8').stdout.strip()
             self.assertEqual((name, email), ('relay', 'relay@project-relay.invalid'))
             self.assertEqual(global_cfg.read_bytes(), b'')
             # Global config is untouched: nothing was written to it.
-            self.assertFalse(global_cfg.read_text())
+            self.assertFalse(global_cfg.read_text(encoding='utf-8'))
 
     def test_existing_local_identity_is_not_overwritten(self):
         store = self.root / 'store-alice'
@@ -597,7 +603,7 @@ class TestB5GitIdentity(Batch2Base):
         sync.pack(store, repo)
         name = subprocess.run(['git', '-C', str(store), 'config', '--local',
                                '--get', 'user.name'],
-                              capture_output=True, text=True).stdout.strip()
+                              capture_output=True, text=True, encoding='utf-8').stdout.strip()
         self.assertEqual(name, 'Alice')
 
 
@@ -608,18 +614,18 @@ class TestB6Noise(Batch2Base):
         self.assertEqual(sync._normalize_branch('refs/heads/feature/x'), 'feature/x')
         root = self.init()
         sd = self.store_dir(root)
-        state = (sd / 'archive' / 'state.md').read_text()
+        state = (sd / 'archive' / 'state.md').read_text(encoding='utf-8')
         state = state.replace('- 当前分支@基线：未知', '- 当前分支@基线：refs/heads/main@abc')
-        (sd / 'archive' / 'state.md').write_text(state)
+        (sd / 'archive' / 'state.md').write_bytes(state.encode('utf-8'))
         audit = sync._consistency_audit(self.store, root, sd)
         self.assertNotIn('branch_mismatch', audit)
         state = state.replace('refs/heads/main@abc', 'other@abc')
-        (sd / 'archive' / 'state.md').write_text(state)
+        (sd / 'archive' / 'state.md').write_bytes(state.encode('utf-8'))
         audit = sync._consistency_audit(self.store, root, sd)
         self.assertIn('branch_mismatch', audit)
 
     def test_fork_lines_each_name_their_section(self):
-        local = (SKILL / 'assets' / 'template-v2' / 'state.md').read_text()
+        local = (SKILL / 'assets' / 'template-v2' / 'state.md').read_text(encoding='utf-8')
         for key in ('当前分支@基线', '正在做什么', '下一动作', '已改动但尚未验证',
                     '阻塞待确认', '最近会话'):
             local = local.replace('- %s：未知' % key, '- %s：本地值-%s' % (key, key))

@@ -70,7 +70,7 @@ class SyncBase(unittest.TestCase):
         self.git(root, 'config', 'user.name', 'Tester')
         self.git(root, 'config', 'user.email', 'test@example.invalid')
         self.git(root, 'config', 'commit.gpgsign', 'false')
-        (root / 'app.py').write_text('value = 1\n')
+        (root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git(root, 'add', '.')
         self.git(root, 'commit', '-m', 'baseline')
         if remote:
@@ -78,7 +78,7 @@ class SyncBase(unittest.TestCase):
         return root
 
     def change_code(self, repo, text):
-        (repo / 'app.py').write_text(text)
+        (repo / 'app.py').write_bytes(text.encode('utf-8'))
         self.git(repo, 'add', '.')
         self.git(repo, 'commit', '-m', 'change')
 
@@ -184,13 +184,13 @@ class TestExportImport(SyncBase):
         manifest_path = bundle / 'manifest.json'
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         manifest['format_major'] = 2
-        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        manifest_path.write_bytes(json.dumps(manifest).encode('utf-8'))
         with self.assertRaises(SyncError) as ctx:
             sync.import_bundle(bundle, store_b, confirm=True)
         self.assertIn('主版本', str(ctx.exception))
         manifest['format_major'] = 1
         manifest['format_minor'] = 9
-        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        manifest_path.write_bytes(json.dumps(manifest).encode('utf-8'))
         report = sync.import_bundle(bundle, store_b, confirm=True)
         self.assertTrue(report['landed'])
         self.assertTrue(any('次版本' in w for w in report['warnings']))
@@ -213,8 +213,8 @@ class TestExportImport(SyncBase):
         self.goal(store_a, repo_a, '# 目标\n\n演示。\n')
         secret = 'sk-abcdefghij1234567890'
         decisions = self.store_dir(store_a, repo_a) / 'archive' / 'decisions.md'
-        decisions.write_text(decisions.read_text(encoding='utf-8')
-                             + '\n密钥在代码里：' + secret + '\n', encoding='utf-8')
+        decisions.write_bytes((decisions.read_text(encoding='utf-8')
+                             + '\n密钥在代码里：' + secret + '\n').encode('utf-8'))
         store_b, repo_b = self.device('proj-b')
         bundle = self.root / 'bundle'
         manifest = sync.export_bundle(store_a, [repo_a], bundle, 'device-a', 'id-a')
@@ -237,12 +237,12 @@ class TestExportImport(SyncBase):
         entry_path = proj_dir / 'raw' / 'cap-0001.md'
         text = entry_path.read_text(encoding='utf-8')
         edited = text + '\n<!-- 本地补充一行 -->\n'
-        entry_path.write_text(edited, encoding='utf-8')
+        entry_path.write_bytes(edited.encode('utf-8'))
         manifest_path = bundle / 'manifest.json'
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         rel = 'projects/%s-%s/raw/cap-0001.md' % (key, repo_a.name)
         manifest['files'][rel] = sync._sha256(edited.encode('utf-8'))
-        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        manifest_path.write_bytes(json.dumps(manifest).encode('utf-8'))
         report = sync.import_bundle(bundle, store_b, confirm=True)
         entry = report['projects'][0]
         self.assertEqual(entry['counts']['entries_conflicted'], 1)
@@ -268,12 +268,12 @@ class TestExportImport(SyncBase):
         proj_dir = bundle / 'projects' / (key + '-' + repo_a.name)
         decisions_path = proj_dir / 'archive' / 'decisions.md'
         marked = decisions_path.read_text(encoding='utf-8') + '\n<<<<<<< HEAD\n'
-        decisions_path.write_text(marked, encoding='utf-8')
+        decisions_path.write_bytes(marked.encode('utf-8'))
         manifest_path = bundle / 'manifest.json'
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         rel = 'projects/%s-%s/archive/decisions.md' % (key, repo_a.name)
         manifest['files'][rel] = sync._sha256(marked.encode('utf-8'))
-        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        manifest_path.write_bytes(json.dumps(manifest).encode('utf-8'))
         report = sync.import_bundle(bundle, store_b, confirm=True)
         entry = report['projects'][0]
         self.assertIn('archive/decisions.md', entry['marker_files'])
@@ -441,8 +441,8 @@ class TestGitCarrier(SyncBase):
         sync.unpack(store_b, confirm=True)
         state_path = self.store_dir(store_a, repo_a) / 'archive' / 'state.md'
         packed_state = state_path.read_bytes()
-        state_path.write_text(state_path.read_text(encoding='utf-8')
-                              + '\n<!-- 本地手改一行 -->\n', encoding='utf-8')
+        state_path.write_bytes((state_path.read_text(encoding='utf-8')
+                              + '\n<!-- 本地手改一行 -->\n').encode('utf-8'))
         rolled = sync.sync_rollback(store_a, repo_a, ref=pack_a['commit'],
                                     reason='手改验证回退')
         self.assertEqual(state_path.read_bytes(), packed_state)
@@ -474,7 +474,7 @@ class TestGitCarrier(SyncBase):
                          'after_sha': sync.digest(state_after)},
         }}
         (store_dir / 'tx').mkdir(parents=True, exist_ok=True)
-        (store_dir / 'tx' / '0001.json').write_text(json.dumps(tx), encoding='utf-8')
+        (store_dir / 'tx' / '0001.json').write_bytes(json.dumps(tx).encode('utf-8'))
         problems, _warnings = sync.health_check(store_dir)
         self.assertTrue(any('未恢复事务' in p for p in problems))
         with self.assertRaises(SyncError) as ctx:
@@ -505,28 +505,28 @@ class TestGitCarrier(SyncBase):
     def test_cli_pack_unpack(self):
         store_a, repo_a = self.device('proj-a')
         draft = self.root / 'goal-cli.md'
-        draft.write_text('# 目标\n\n演示。\n', encoding='utf-8')
+        draft.write_bytes('# 目标\n\n演示。\n'.encode('utf-8'))
         cli = [sys.executable, str(SKILL / 'scripts' / 'relay.py'),
                '--store-root', str(store_a), '--root', str(repo_a)]
-        env = dict(os.environ)
+        env = dict(os.environ, PYTHONIOENCODING='utf-8')
         subprocess.run(cli + ['goal', 'draft', '--file', str(draft)],
-                       check=True, capture_output=True, text=True, env=env)
+                       check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         subprocess.run(cli + ['goal', 'confirm'],
-                       check=True, capture_output=True, text=True, env=env)
+                       check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         subprocess.run(cli + ['sync-setup', '--remote', str(self.bare),
                               '--device-name', 'cli-a'],
-                       check=True, capture_output=True, text=True, env=env)
+                       check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         out = subprocess.run(cli + ['pack'],
-                             check=True, capture_output=True, text=True, env=env)
+                             check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertIn('pack 完成', out.stdout)
         store_b, repo_b = self.device('proj-b')
         cli_b = [sys.executable, str(SKILL / 'scripts' / 'relay.py'),
                  '--store-root', str(store_b), '--root', str(repo_b)]
         subprocess.run(cli_b + ['sync-setup', '--remote', str(self.bare),
                                 '--device-name', 'cli-b'],
-                       check=True, capture_output=True, text=True, env=env)
+                       check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         out = subprocess.run(cli_b + ['unpack', '--confirm'],
-                             check=True, capture_output=True, text=True, env=env)
+                             check=True, capture_output=True, text=True, encoding='utf-8', env=env)
         self.assertIn('unpack 已落盘', out.stdout)
         self.assertEqual(relay.goal_status(store_b, repo_b)[0], 'imported')
 
@@ -536,8 +536,8 @@ class TestGitCarrier(SyncBase):
         self.goal(store_a, repo_a, '# 目标\n\n演示。\n')
         self.setup(store_a, device_name='device-a')
         decisions = self.store_dir(store_a, repo_a) / 'archive' / 'decisions.md'
-        decisions.write_text(decisions.read_text(encoding='utf-8')
-                             + '\n<<<<<<< HEAD\n', encoding='utf-8')
+        decisions.write_bytes((decisions.read_text(encoding='utf-8')
+                             + '\n<<<<<<< HEAD\n').encode('utf-8'))
         with self.assertRaises(SyncError) as ctx:
             sync.pack(store_a, repo_a)
         self.assertIn('decisions.md', str(ctx.exception))
