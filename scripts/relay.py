@@ -427,19 +427,38 @@ def init(store, toplevel):
         (store_dir / zone).mkdir(parents=True, exist_ok=True)
     for top in ('projects', 'global', 'trash'):
         (store / top).mkdir(parents=True, exist_ok=True)
+    # Codex PR #5 batch 1, A7: skeleton writes used to be open('x') +
+    # write, so an interrupted init left a truncated file that the next
+    # init skipped (exists -> continue) forever. All skeleton writes now
+    # go through atomic() (temp file + fsync + rename). A re-run also
+    # repairs a truncated skeleton: an existing file whose bytes are a
+    # strict prefix of the template (including empty) can only be an
+    # interrupted write, never user content, so it is rewritten atomically.
+    # A file equal to the template is skipped; any other existing content
+    # is treated as the user's and left untouched; symlinks are never
+    # followed or replaced.
+    repaired = []
     for name in ARCHIVE_FILES:
         dest = store_path(store_dir, 'archive', name)
+        template = (TEMPLATES_DIR / name).read_bytes()
         if dest.exists():
+            if dest.is_symlink() or not dest.is_file():
+                continue
+            current = dest.read_bytes()
+            if current == template:
+                continue
+            if template.startswith(current):
+                atomic(dest, template)
+                repaired.append(name)
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with dest.open('x', encoding='utf-8') as out:
-                out.write((TEMPLATES_DIR / name).read_text(encoding='utf-8'))
-        except FileExistsError:
-            pass
+        atomic(dest, template)
+    if repaired:
+        notes.append('骨架截断已修复：' + '、'.join(repaired))
     preview = legacy_preview(toplevel)
     return {'store_dir': store_dir, 'key': row['key'], 'row': row,
-            'registered_changed': changed, 'notes': notes, 'preview': preview}
+            'registered_changed': changed, 'notes': notes, 'preview': preview,
+            'repaired_skeletons': repaired}
 
 
 # ---------------------------------------------------------------- 1.5 goals
@@ -789,11 +808,19 @@ def _parser():
     pk.add_argument('--carrier', choices=['git', 'folder', 'server'])
     pk.add_argument('--overwrite-unconsumed', action='store_true',
                     help='覆盖上一份未在任何设备还原的 WIP 快照（2.6 显式确认）')
+    pk.add_argument('--trust-unsigned', action='store_true',
+                    help='放行无签名的 Git 包（B1 兜底，需明示；收据留痕）')
+    pk.add_argument('--repin', action='store_true',
+                    help='接受 Git 包签名公钥变更并重新钉死（B1，需明示；收据留痕）')
     un = sub.add_parser('unpack')
     un.add_argument('--remote')
     un.add_argument('--confirm', action='store_true')
     un.add_argument('--project', action='append', dest='projects')
     un.add_argument('--carrier', choices=['git', 'folder', 'server'])
+    un.add_argument('--trust-unsigned', action='store_true',
+                    help='放行无签名的 Git 包（B1 兜底，需明示；收据留痕）')
+    un.add_argument('--repin', action='store_true',
+                    help='接受 Git 包签名公钥变更并重新钉死（B1，需明示；收据留痕）')
     ss = sub.add_parser('sync-setup')
     ss.add_argument('--remote')
     ss.add_argument('--device-name')
@@ -862,11 +889,26 @@ def _print_sync_project(entry):
              counts.get('entries_skipped', 0), len(entry.get('conflicts', [])),
              entry.get('goal_action')))
     for c in entry.get('conflicts', []):
-        print('  冲突[%s] %s：%s'
+        # Batch 2, B6: a fork conflict line must name its section --
+        # the old rendering printed rule + file + a generic note, so
+        # six fork conflicts printed six identical lines.
+        key_suffix = '（%s）' % c['key'] if c.get('key') else ''
+        detail = c.get('note')
+        if detail is None and c.get('incoming') is not None:
+            detail = '对方：%s' % c['incoming']
+        if detail is None:
+            detail = '双方保留，见合并日志'
+        print('  冲突[%s] %s%s：%s'
               % (c.get('rule'), c.get('file', c.get('key', '')),
-                 c.get('note', '双方保留，见合并日志')))
+                 key_suffix, detail))
     for d in entry.get('discarded', []):
-        print('  丢弃 %s：%s' % (d['file'], d['reason']))
+        # Batch 2, B2: nothing reported here is deleted -- discards are
+        # quarantined (merge-log quarantined/ or unclaimed _quarantine/),
+        # never in raw/ and never counted -- so the wording is 隔离,
+        # not 丢弃, to match what actually happened to the bytes.
+        print('  隔离 %s：%s（未进 raw/，未计汇总）' % (d['file'], d['reason']))
+    for q in entry.get('quarantined', []):
+        print('  隔离区：' + q)
     for note in entry.get('notes', []):
         print('  注：' + note)
 
@@ -877,6 +919,15 @@ def _print_sync_report(rep):
         return
     for entry in rep['report']['projects']:
         _print_sync_project(entry)
+    # Batch 2, B1: git signature verification travels in the report so
+    # a TOFU pin, a repin, or a --trust-unsigned acceptance is visible
+    # in the CLI output, not only in the receipt file.
+    verification = rep['report'].get('signature_verification')
+    if verification:
+        print('  签收：%s（设备 %s，密钥 %s）%s'
+              % (verification.get('status'), verification.get('device_id'),
+                 verification.get('key_id'),
+                 '：' + verification['note'] if verification.get('note') else ''))
 
 
 def main(argv=None):
@@ -1003,7 +1054,9 @@ def main(argv=None):
                     result = sync.pack(store, a.root, remote=a.remote,
                                        device_name=a.device_name,
                                        carrier=a.carrier,
-                                       overwrite_unconsumed=a.overwrite_unconsumed)
+                                       overwrite_unconsumed=a.overwrite_unconsumed,
+                                       trust_unsigned=a.trust_unsigned,
+                                       repin=a.repin)
                     rec = result['receipt']
                     if rec['carrier'] == 'folder':
                         print('pack 完成（文件夹载体，无包序列号）')
@@ -1017,6 +1070,18 @@ def main(argv=None):
                     print('回执：' + result['receipt_path'])
                     for step in rec['steps']:
                         print('步骤 %s：%s' % (step['step'], step['status']))
+                    # Batch 2, B1: surface the step-0 pull-merge signature
+                    # verification (TOFU pin / repin / trust-unsigned)
+                    # in pack output too, not only in the receipt.
+                    pull_report = None
+                    if rec['steps'] and isinstance(rec['steps'][0], dict):
+                        pull_report = rec['steps'][0].get('report')
+                    if isinstance(pull_report, dict):
+                        ver = pull_report.get('signature_verification')
+                        if ver:
+                            print('拉取合并签收：%s（设备 %s，密钥 %s）'
+                                  % (ver.get('status'), ver.get('device_id'),
+                                     ver.get('key_id')))
                     wip = rec.get('wip') or {}
                     if wip.get('status') == 'created':
                         print('未提交改动快照已推送：%s，文件 %d 个'
@@ -1035,7 +1100,9 @@ def main(argv=None):
                         _top = None
                     result = sync.unpack(store, remote=a.remote, confirm=a.confirm,
                                          project_keys=a.projects,
-                                         carrier=a.carrier, toplevel=_top)
+                                         carrier=a.carrier, toplevel=_top,
+                                         trust_unsigned=a.trust_unsigned,
+                                         repin=a.repin)
                     if not result.get('landed'):
                         if result.get('note'):
                             print(result['note'])
@@ -1217,7 +1284,16 @@ def main(argv=None):
                 info = flow.capture(store, root, tool=a.tool, session=a.session,
                                     message=a.message)
                 if info.get('deduped'):
-                    print('采集去重：事实未变，返回已有条目 cap-%04d' % info['seq'])
+                    if a.message is not None:
+                        # Batch 2, B4: the dedup key is the repo state
+                        # (plan 1.6, by design -- not changed here), but
+                        # a --message dropped by that dedup used to
+                        # vanish silently behind a "returned existing
+                        # entry" line. Say so, and say how to re-take it.
+                        print('新消息文本已被去重丢弃，未留存（已有条目 cap-%04d）；'
+                              '请换 session 或改变仓库状态后重采' % info['seq'])
+                    else:
+                        print('采集去重：事实未变，返回已有条目 cap-%04d' % info['seq'])
                 else:
                     print('采集条目：cap-%04d（%s）' % (info['seq'], info['path']))
             elif a.command == 'queue':
@@ -1292,6 +1368,16 @@ def main(argv=None):
             elif a.command == 'recover':
                 info = flow.recover(store, root)
                 print('已恢复事务：' + info['recovered'])
+                # Batch 2, A2: recover rolls the whole transaction back,
+                # not just the archive files -- print the rolled-back
+                # state so the operator can see cursor/baseline/summary
+                # moved with the archive instead of trusting it.
+                print('回滚后游标：cap-%04d，基线汇总序号：%s，最近汇总序号：%s，'
+                      '条目回 pending：%s'
+                      % (info.get('cursor', {}).get('entry_seq', 0),
+                         info.get('baseline_summary_seq'),
+                         info.get('last_summary_seq'),
+                         info.get('entries_reverted_to_pending')))
             elif a.command == 'handoff':
                 info = flow.make_handoff(store, root)
                 print('交接包：' + info['package'])

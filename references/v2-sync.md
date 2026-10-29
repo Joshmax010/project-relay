@@ -711,3 +711,175 @@ slug 对应的那一个，不要直接读其他 slug 目录。
   失：步骤 ④ 自身先失败。已污染的 scratch 仓自行废弃即可，无需
   修复工具；真实用户仓此前未被污染（v2 未合并发布，前置实测只
   污染了 /tmp 下的 scratch 仓）。
+
+## 14. 第一批 Codex 第二批评审修复（A1、A3–A7，2026-10-29，未提交）
+
+来源：Codex 对 PR #5 在 bbf2581 上的第二批评审（COMMENTED，不拦合并）
+7 条中的第 1、3、4、5、6、7 条。A2（recover 不回滚游标/基线）属第二批，
+本节不碰。本批只改 `scripts/relay_flow.py`、`scripts/relay_backfill.py`、
+`scripts/relay.py`（仅 init 骨架部分）、本文件新增本节，及新增测试文件
+`tests/test_relay_batch1.py`；`scripts/relay_sync.py` 未动。改动保持未提交，
+提交与推送由主聊复验后统一做。
+
+- **A1 钩子 cwd 门**：`relay_flow.hook_cwd_allowed()` 以注册表为准——
+  cwd 的 git 顶层经 `relay.where()` 查到的项目键须等于钩子所属项目键
+  （已登记路径，或同一 remote 键的重 clone/移位）；查不到、非仓库、
+  未登记一律 fail-closed 不动作。`hook_capture` / `hook_enforce` /
+  `hook_resume` 三路入口（resume 的 §4 会写，必须同 gate，不能只 gate
+   capture/enforce）。`install_claude` 装的不再是直跑 relay.py 的命令，
+  而是全引用的 `python -c` 包装，调上述入口，enforce 的会话 id 仍从钩子
+  stdin 取（finding 4 的修法不变）。
+  偏离与原因：① 包装命令把仓根路径钉死在安装时刻（旧命令只钉项目路径、
+  仓根每次运行时推导），移仓后须重装配方——为换取门内 store 与门外一致，
+  避免门查一个仓、命令写另一个仓；② 门以“键相等”为准，同一 remote
+  在另一路径的 clone 视为同一项目（plan 1.3 的 remote 身份模型），而非
+  “路径字符串相等”。
+- **A3 回填聚合脱敏**：`relay_backfill._build_semantic()` 成为回填产物进
+  正式档案前的最后一道脱敏关：decision/lesson/todo 逐行过
+  `flow.redact()`，脱敏成空的行丢弃不入档；`summarize_after=True` 路径
+  与非汇总路径共用此关。原料条目体与游标锚点此前已脱敏，本次未动。
+  边界：`flow.summarize()` 接受的调用方自带语义文本仍属可信输入，本批
+  不在汇总层另加脱敏——回填以外的调用方语义不由回填负责。
+- **A4 钩子命令引用**：`_relay_cmd()` 全部单词改 `shlex.quote`；新装的
+  钩子包装命令整体为 `python -c` + 引用后的代码串，路径内的空格、$、
+  反引号、引号均不再分裂或执行。边界：`resume` 的 `smoke_command`
+  仍是 `shell=True` 执行——那是用户在配置里写明的整条命令，不是程序
+  拼接的路径，本批不改其语义。
+- **A5 卸载 CodeBuddy**：`uninstall_codebuddy()` 先盘点再删：只删
+  `SKILL.md` 与 `RELAY-RECIPE.md` 两个 relay 管理文件；目录内任何其他
+  文件/子目录、或 `SKILL.md` 内容已偏离安装原文，均为“外来”，整目录
+  拒绝删除并在报错中列出全部外来路径，文件与配方状态原样保留。
+  偏离与原因：内容漂移的 `SKILL.md` 也算外来（比任务最低要求“有用户
+  文件才拒绝”更严），与 `managed_remove` 对受管小节哈希漂移拒绝的
+  纪律一致；纯 relay 目录仍可删，行为不变。
+- **A6 去重恒真**：根因是 `CodexParser.events()` 拿留存事件的 source
+  标签（`codex-event_msg`）去比新事件的流标记（`event_msg`），两个命名
+  空间永不等，去重条件恒真。改为标签对标签比：仅当相邻、同角色、
+  同文本、且来源标签不同时才折叠为双写副本；另加 paired 守卫——已吸收
+  过异流副本的留存事件不再吸收第二个异流副本（新消息首个副本流向
+  翻转时仍保留）。同流重复、双写后重复、流向翻转后重复三面均有测试。
+- **A7 init 原子写**：`relay.init()` 五个骨架文件改走 `atomic()`（临时文件
+  + fsync + 改名）；二次 init 时，现有文件字节等于模板跳过、是模板的
+  严格前缀（含空文件）判定为中断截断并原子修复、其他内容视为用户所有
+  不动、符号链接不跟随不替换。`init()` 返回值新增 `repaired_skeletons`
+  列表与一条修复注记，旧返回键不变。
+- **测试**：新增 17 项（`tests/test_relay_batch1.py`），全量 178 → 195 项
+  通过；`relay accept` 与 `relay sync-accept` 各连续两遍 PASS。既有测试
+  未删未弱化。
+
+## 15. 第二批 Codex 第二批评审修复（A2、B1–B6，2026-10-29，未提交）
+
+来源：与 §14 同一批评审中剩下的 1 条（A2 recover）+ 前置实测遗留
+6 项（Git 载体签收、丢弃条目隔离区、init 模板 state 让路、capture
+去重提示、内部活动仓 git 身份、审计噪音）。本批主攻
+`scripts/relay_sync.py`，另动 `scripts/relay_flow.py`（A2）、
+`scripts/relay.py`（B1 旗标、B4 提示、B6 报告行、recover 回显），及
+新增测试文件 `tests/test_relay_batch2.py`（21 项）；第一批改动原样
+保留、叠加其上。改动保持未提交，提交与推送由主聊复验后统一做。
+
+- **A2 recover 一致回滚**：前提核实为真，非误报。证据：`summarize`
+  先写 tx 日志再写档案、成功后不删日志（`_summarize_impl` 只
+  `save(tx)`，无删除；健康检查 D-sync-8 也明言“日志同时是回退
+  记录”），而旧 `recover` 只把档案文件还原为 before 字节，游标、
+  基线、last-summary、汇总记录、条目队列全部留在汇总后状态——
+  成功汇总后 recover 一次即得“游标新、档案旧”的错位。
+  修法：`summarize` 在 tx 内新增 `before_state`（事务前游标、基线、
+  last-summary 全量快照）；`recover` 按“档案 → 汇总记录墓碑标注 →
+  消费条目回 pending → 游标/基线/last-summary 还原 → 校验清单刷新”
+  的顺序整单回滚，并把回滚结果写进 `.recovered.json` 收据与返回
+  值；CLI 打印回滚后游标/基线/汇总序号。汇总记录不删除而是标注
+  `rolled_back` 墓碑并保留占位：删除会让下次汇总重用序号，而既有
+  测试钉死序号跨 recover 单调；墓碑使记录自述“曾汇总、已回滚”，
+  `last-summary.json` 仍是最新有效汇总的权威指针，glob 计数（含
+  pack 漂移比较）不受影响。旧日志无 `before_state`
+  时从汇总记录与条目表推导游标与 last-summary，基线快照无法从旧
+  数据重建故直接删掉（无基线是真话、下次汇总重建，留一个已推进
+  的旧基线才是假话）；汇总记录也缺失的旧日志 fail-closed 拒绝
+  回滚、日志保留。事务中 `archive_summarized` 对更老条目的归档
+  移动有意不逆转（归档不改变队列计数与游标语义，留档仍自洽）。
+  另修：`recover` 取日志时排除自身的 `.recovered.json` 收据，旧
+  代码 `glob('*.json')` 可能把收据当最新日志误取。
+- **B1 Git 载体签收**：包形态有 manifest 哈希门，Git 载体因从磁盘
+  重建清单而没有等价物，持推送权者改包后对端照单合并。修法：
+  git pack 时对“设备 ID + 导出时间 + 序列号 + 包清单（路径 →
+  SHA256 全量字典，与文件夹/服务器载体 manifest 同口径）”做签名，
+  随每项目清单存入 `sync-manifests/<key>-<seq>.json`；unpack 与
+  pack 步骤 ⓪ 拉取合并共用 `_bundle_dir_from_clone` 这一唯一验签
+  卡口，对磁盘重算的哈希验签（验签不信任清单内自带的哈希字段），
+  验不过拒绝落盘并指明原因（未签名 / 验签失败 / 公钥变更各有不同
+  文案），干跑预览同样拦截。密钥：设备首次 git `sync-setup` 时
+  生成（git pack 对旧配置惰性补生成），只存本机
+  `~/.project-relay-sync-key.json`（`PROJECT_RELAY_HOME` 重定向下
+  落在测试 home 内），写后 `chmod 0600`、读时再收紧，私钥永不进
+  导出包与同步内容；公钥随清单走，接收方按源设备 ID 在本机
+  `~/.project-relay-sync-pins.json` 里 TOFU 钉死。密钥变更无
+  `--repin` 时拒绝并提示核实，`--repin` 接受后更新钉死并写
+  `sync-receipts/repin-*.json` 收据、CLI 与 unpack/pack 回执同时留
+  痕；无签包默认拒绝，`--trust-unsigned` 明示放行且验签状态进
+  导入报告与回执。文件夹/服务器载体不重复造签收（其 manifest 哈
+  希门已等价），但 pack 清单口径与签名载荷一致。
+  偏离与原因：任务原文要的是 HMAC 签名，但 HMAC + TOFU 在逻辑上
+  不成立——对称密钥要么共享给对端（能读远端的篡改者同样能读密钥，
+  签名不证明任何事），要么不到达对端（对端根本无法验签）；只有
+  非对称签名能让“首次见公钥即钉死、变更须 --repin”成真。故改用
+  纯标准库 Ed25519（RFC 8032，`hashlib.sha512` 手写实现，无第三方
+  加密依赖，“标准库 only”约束仍成立；实现已用 RFC 8032 向量 1
+  逐字节验过，测试另含篡改/错钥拒绝）。TOFU 固有 caveat 与 SSH
+  主机密钥相同：首次 unpack 必须是用户自己的新鲜 pack，不是对
+  陌生来源的信任；旧无签包（本功能上线前已推的包）须重 pack 或
+  `--trust-unsigned` 才能导入，此为有意 fail-closed。
+- **B2 丢弃条目隔离区**：核实到的落盘口有二：① 匹配路径下被丢弃
+  条目的字节直接消失（报告只剩一条原因），无法检查与修复；
+  ② 未认领路径把负载原样写进 `unclaimed/`，含验签失败条目（且
+  其 `summarized` 队头原样保留），而报告的丢弃列表还是空的——
+  报告与落盘行为不一致。修法：丢弃语义收紧为“隔离”——
+  malformed / id-hash-mismatch / non-UTF-8 条目字节一律隔离存放，
+  永不进 `raw/`、永不计入新增/汇总计数：匹配路径下存到合并日志
+  旁的 `quarantined/` 目录（与已有的冲突标记 `conflicted/` 目录
+  并列），未认领路径下存到待认领目录内的 `_quarantine/` 子目录
+  （认领扫描显式跳过该子树，永不复活）；报告与 CLI 措辞同步由
+  “丢弃”改为“隔离”，并列出隔离区文件。另修导入侧脱敏：原
+  `_redact_incoming` 对原料条目全文脱敏，会在到达端复现 P0 的
+  指纹损伤（把合法条目制造成 id-hash-mismatch），现与导出侧一致
+  改走字段级脱敏（验算字段不动），解析失败的畸形条目才回退全文
+  脱敏且仍由合并丢弃隔离。选隔离区而非直接删除的理由：与全工具
+  “双方保留、证据不删”的纪律一致，误杀可人工检查修复。
+- **B3 state.md 模板让路**：新设备先 init 再 unpack 时，本地 7 行
+  受管行全是模板原文，旧规则对每行都报 fork-note-kept-local，
+  最终 state 仍是“未知”一片。修法：`_merge_state_md` 在模板原文
+  比对下让路——本地某行字节等于模板文件（`assets/template-v2/
+  state.md`，运行时读取，读不到则 fail-closed 不让路，绝不靠
+  “看起来像未知”启发式猜）且对方值非空、不同于模板值时，采纳
+  对方值并记一条注记，不产生分叉冲突；`已完成且有证据`的并集
+  规则同步过滤模板占位 token，避免“未知；实绩”式污染。任务说
+  “6 个 section”，模板实际有 7 行受管行：第 7 行是
+  `当前分支@基线`，它是本地度量（D-sync-3 基线永不合并），采纳
+  对方分支会 misdescribe 本机代码状态，故该行豁免让路、仍走旧
+  规则（本地汇总后自行填实）。用户改过的行（≠模板原文）仍按旧
+  规则保留本地 + 分叉待裁。
+- **B4 capture 去重提示**：去重键按计划 1.6 本就是仓库状态，不改
+  去重键；只修 CLI：`capture --message` 被去重丢弃时打印“新消息
+  文本已被去重丢弃，未留存”，并提示换 session 或改变仓库状态后
+  重采；无 `--message` 的去重仍打印旧的“事实未变，返回已有条目”
+  行（此时没有消息文本可丢，旧文案无误）。
+- **B5 内部活动仓 git 身份**：沙箱无全局 user.name/user.email 时
+  首个 pack 死在提交处。修法：记忆仓（relay 自身活动仓，非用户
+  代码仓）在缺身份时自动设本机 local 身份（`relay` /
+  `relay@project-relay.invalid`），`git config --local` 作用域，绝
+  不写全局配置；已有本地身份（哪怕是用户自己的名字）永不覆盖；
+  pack 在步骤 ② 健康门之后、任何提交之前显式预检身份（设不上的
+  话在该步就报清仓路径与手工 remedy，不等到步骤 ⑤ 的裸 git 报错），
+  `_commit_if_changes` 内也兜底确保（unpack/回退的提交同受益）。
+- **B6 噪音两处**：① pack 审计恒报 branch_mismatch：比较前规范化
+  分支名（剥 `refs/heads/` 前缀），`refs/heads/main` 与 `main` 视为
+  同一分支；真不同分支仍报。② fork-note 行：核查结论是 state.md
+  内的 fork-note 行本身已含 section 名，真正完全相同的 6 行出在
+  报告渲染层（`_print_sync_project` 只打规则 + 文件 + 通用注记，
+  6 条分叉冲突打出来一模一样）；修渲染行内标明 section 名与对方
+  值，state.md 行与报告行两侧均有测试钉死“行行互异且含 section
+  名”。
+- **测试**：新增 21 项（`tests/test_relay_batch2.py`），全量 195 → 216 项
+  通过；`relay accept` 与 `relay sync-accept` 各连续两遍 PASS。既有测试
+  未删未弱化；`_merge_state_md` 返回由二元组改为（合并文本、冲突、
+  注记）三元组，`_redact_incoming` 返回由四元组改为五元组（含隔离
+  字节），均为内部函数，调用点已同步改完。

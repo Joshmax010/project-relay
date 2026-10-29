@@ -358,10 +358,25 @@ class CodexParser(BaseParser):
                                                 'reasoning', payload.get('text', '') or payload.get('summary', ''),
                                                 source='codex-response_item')))
         # Collapse adjacent double-written user messages (verified pattern).
+        # Codex PR #5 batch 1, A6: the old test compared the KEPT event's
+        # source label ('codex-event_msg') against the NEW event's stream
+        # tag ('event_msg') -- two different namespaces, so the inequality
+        # was ALWAYS true and every adjacent same-text user message,
+        # including a genuine same-stream repeat, was dropped as a
+        # supposed double-write copy. Compare source labels to source
+        # labels: only a copy arriving on the OTHER stream collapses.
+        # Paired guard: once a kept event has already absorbed its
+        # other-stream copy, a later same-text copy on that other stream
+        # is a new message whose first copy arrived stream-flipped, not
+        # a third copy of the old one -- it is kept.
         events = []
-        for i, (src, ev) in enumerate(raw):
+        paired = set()
+        for _src, ev in raw:
             if events and ev['kind'] == 'user_message' and events[-1]['kind'] == 'user_message' \
-                    and events[-1]['text'] == ev['text'] and events[-1]['source'] != src:
+                    and events[-1]['text'] == ev['text'] \
+                    and events[-1]['source'] != ev['source'] \
+                    and id(events[-1]) not in paired:
+                paired.add(id(events[-1]))
                 continue
             events.append(ev)
         return events[:MAX_EVENTS_PER_SESSION]
@@ -657,21 +672,45 @@ def _entry_body(tool, session, events, files_changed):
 def _build_semantic(report, aggregated):
     """Deterministic semantic text for the summarize channel (plan 1.12,
     zero model calls, semantic_auto=True). Only explicit markers become
-    decisions/lessons/todos; everything else stays a coverage fact."""
+    decisions/lessons/todos; everything else stays a coverage fact.
+
+    Codex PR #5 batch 1, A3: aggregated decision/lesson/todo text is
+    RAW parser output -- the raw backfill entry body is redacted before
+    writing, but this semantic text used to flow straight into
+    flow.summarize() and land unredacted in the formal archive
+    (decisions/lessons/backlog) whenever summarize_after=True. Every
+    aggregated line is therefore redacted here, the last choke point
+    before the formal archive; a line that redacts to nothing is dropped
+    rather than filed as an empty entry."""
+    def _clean(text):
+        cleaned, _hits = flow.redact(text)
+        return cleaned.strip()
+
+    def _items(pairs):
+        out = []
+        for text, sid in pairs:
+            cleaned = _clean(text)
+            if cleaned:
+                out.append((cleaned, sid))
+        return out
+
+    decisions = _items(aggregated['decisions'])
+    lessons = _items(aggregated['lessons'])
+    todos = _items(aggregated['todos'])
     parts = ['## 已验证',
              '- 回溯覆盖 %d 个会话，事件 %d 条，改动文件 %d 个（证据：回溯报告 state/backfill-report.md）。'
              % (aggregated['sessions'], aggregated['events'], len(aggregated['files']))]
-    if aggregated['decisions']:
+    if decisions:
         parts.append('## 决定')
-        for text, sid in aggregated['decisions']:
+        for text, sid in decisions:
             parts.append('- %s（来源：回溯会话 %s）' % (text, sid))
-    if aggregated['lessons']:
+    if lessons:
         parts.append('## 教训')
-        for text, sid in aggregated['lessons']:
+        for text, sid in lessons:
             parts.append('- %s（原料：回溯会话 %s）' % (text, sid))
-    if aggregated['todos']:
+    if todos:
         parts.append('## 待办')
-        for text, sid in aggregated['todos']:
+        for text, sid in todos:
             parts.append('- %s（Owner：Agent；验证：未指定）' % text)
     return '\n'.join(parts) + '\n'
 

@@ -59,6 +59,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -577,9 +578,18 @@ def measure_change(store, toplevel):
 
 # ---------------------------------------------------------------- recipes + enforcement (1.8)
 def _relay_cmd(toplevel, *args):
-    """Hook command string: the real relay.py entry point."""
+    """Hook command string: the real relay.py entry point.
+
+    Codex PR #5 batch 1, A4: every word is shell-quoted (shlex.quote) --
+    the old '%s %s --root %s %s' interpolation split on spaces and let
+    backticks / $() in a project path execute. This builder is kept for
+    plain (non-hook) commands; the Claude hooks installed below go
+    through _hook_command, which adds the cwd gate (A1) on top of it."""
     script = str(_HERE / 'relay.py')
-    return '%s %s --root %s %s' % (sys.executable, script, toplevel, ' '.join(args))
+    parts = [shlex.quote(sys.executable), shlex.quote(script),
+             '--root', shlex.quote(str(toplevel))]
+    parts += [shlex.quote(a) for a in args]
+    return ' '.join(parts)
 
 
 def _managed_path_content(marker, version, body):
@@ -673,9 +683,15 @@ def install_claude(store, toplevel, home_dir=None):
     settings = read_json(settings_path) if settings_path.exists() else {}
     require(isinstance(settings, dict), 'Claude settings.json 不是 JSON 对象：' + str(settings_path))
     hooks = settings.setdefault('hooks', {})
-    start_cmd = _relay_cmd(toplevel, 'resume', '--tool', 'claude-code')
-    stop_cmds = [_relay_cmd(toplevel, 'capture', '--tool', 'claude-code'),
-                 _relay_cmd(toplevel, 'enforce', '--tool', 'claude-code')]
+    # Codex PR #5 batch 1, A1: the old commands ran relay.py directly, so
+    # a user-level hook fired in ANY project's session and captured into
+    # (or blocked) this project. The new commands go through _hook_command,
+    # which checks the session cwd against the registry first (see
+    # hook_cwd_allowed) and does nothing when the cwd belongs to another
+    # project. A4: the wrapper command is fully shell-quoted.
+    start_cmd = _hook_command(store, toplevel, 'resume')
+    stop_cmds = [_hook_command(store, toplevel, 'capture'),
+                 _hook_command(store, toplevel, 'enforce')]
     changed = False
     for event, cmds in (('SessionStart', [start_cmd]), ('Stop', stop_cmds)):
         entries = hooks.setdefault(event, [])
@@ -728,6 +744,98 @@ def uninstall_claude(store, toplevel, home_dir=None):
     return {'notes': notes}
 
 
+# ---------------------------------------------------------------- hook cwd gate (1.8, batch 1 A1)
+def _hook_store(store):
+    return relay.default_store() if store is None else store
+
+
+def hook_cwd_allowed(store, toplevel, cwd=None):
+    """Codex PR #5 batch 1, A1: is the hook session's cwd this project?
+
+    The registry is the authority: the cwd's git top level is looked up
+    with relay.where() and must resolve to the same project key as the
+    hook's own project (exact registered path, or the same remote key
+    for a re-cloned/moved copy -- remote identity is plan 1.3). Any
+    failure (cwd outside a repo, project unregistered, lookup error)
+    fails CLOSED: the hook must not act. Never raises.
+    """
+    try:
+        store = _hook_store(store)
+        row, _store_dir = relay.resolve_store_dir(store, toplevel)
+        cwd_path = Path(cwd).expanduser() if cwd is not None else Path.cwd()
+        found = relay.where(store, path=cwd_path)
+        return bool(found.get('found')) and found.get('row', {}).get('key') == row['key']
+    except Exception:
+        return False
+
+
+def hook_capture(store, toplevel, tool=None, session=None, message=None, cwd=None):
+    """Hook entry for capture (A1): no-op unless the cwd is this project."""
+    if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+        return {'action': 'skipped', 'skipped': True,
+                'note': '当前目录不属于本项目（注册表无此项目），钩子不捕获'}
+    return capture(store, toplevel, tool=tool, session=session, message=message)
+
+
+def hook_enforce(store, toplevel, tool=None, session=None, cwd=None):
+    """Hook entry for enforce (A1): never blocks another project's session."""
+    if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+        return {'action': 'pass',
+                'note': '当前目录不属于本项目（注册表无此项目），执法不拦截'}
+    return enforce(store, toplevel, tool=tool, session=session)
+
+
+def hook_resume(store, toplevel, tool=None, cwd=None):
+    """Hook entry for resume (A1): resume's section 4 writes, so a foreign
+    cwd must skip it just like capture/enforce, not merely read-only."""
+    if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+        return {'skipped': True, 'no_archive': False, 'sections': [],
+                'note': '当前目录不属于本项目（注册表无此项目），钩子不对账'}
+    return resume(store, toplevel, tool=tool)
+
+
+def _hook_command(store, toplevel, kind):
+    """Installed Claude hook command (A1 + A4): a fully shell-quoted
+    `python -c` wrapper that calls the hook_* gate above with the cwd the
+    hook actually runs in (os.getcwd() at hook time). The store root is
+    baked at install time, as the project path already was; reinstall
+    after moving the store. Session id for enforce comes from the hook
+    payload on stdin, mirroring relay._session_from_stdin (finding 4).
+    Returns a single shell word list string; every embedded path is a
+    JSON string literal inside the quoted -c argument, so spaces, $,
+    backticks and quotes in paths cannot split or execute (A4)."""
+    store_path = _hook_store(store)
+    scripts = json.dumps(str(_HERE))
+    store_lit = 'Path(%s)' % json.dumps(str(store_path))
+    root_lit = 'Path(%s)' % json.dumps(str(toplevel))
+    head = ('import sys\nfrom pathlib import Path\n'
+            'sys.path.insert(0, %s)\nimport relay_flow as _hook_flow\n' % scripts)
+    if kind == 'capture':
+        body = ('_r = _hook_flow.hook_capture(%s, %s, tool=\'claude-code\')\n'
+                'print(_r[\'note\'] if _r.get(\'skipped\') else '
+                '\'采集条目：cap-%%04d（%%s）\' %% (_r[\'seq\'], _r.get(\'path\', \'\')))\n'
+                % (store_lit, root_lit))
+    elif kind == 'enforce':
+        body = ('_sid = None\ntry:\n'
+                '    _raw = sys.stdin.read() if not sys.stdin.isatty() else \'\'\n'
+                '    _d = json.loads(_raw) if _raw.strip() else None\n'
+                '    _sid = _d.get(\'session_id\') if isinstance(_d, dict) else None\n'
+                'except Exception:\n    _sid = None\n'
+                '_r = _hook_flow.hook_enforce(%s, %s, tool=\'claude-code\', session=_sid)\n'
+                'print(_r.get(\'instruction\') or (\'PASS：\' + _r.get(\'note\', \'\')))\n'
+                'sys.exit(2 if _r.get(\'action\') == \'block\' else 0)\n'
+                % (store_lit, root_lit))
+    elif kind == 'resume':
+        body = ('_r = _hook_flow.hook_resume(%s, %s, tool=\'claude-code\')\n'
+                'print(_r[\'note\'] if _r.get(\'skipped\') else '
+                '(_r[\'message\'] if _r.get(\'no_archive\') else '
+                '_hook_flow.render_resume(_r)))\n' % (store_lit, root_lit))
+    else:  # pragma: no cover - install_claude only passes the three kinds
+        raise RelayError('未知钩子种类：' + kind)
+    code = head + 'import json\n' + body if kind == 'enforce' else head + body
+    return '%s -c %s' % (shlex.quote(sys.executable), shlex.quote(code))
+
+
 RELAY_SKILL_TEXT = '''---
 name: relay
 description: project-relay 无感自动接续：会话开始先对账、会话结束先采集
@@ -772,8 +880,34 @@ def uninstall_codebuddy(store, toplevel, flavor='codebuddy'):
     require(state is not None, '未找到 %s 配方安装记录' % flavor)
     skill_dir = Path(state['skill_dir'])
     require((skill_dir / 'SKILL.md').exists(), 'skill 目录已被外部改动，拒绝卸载：' + str(skill_dir))
-    import shutil
-    shutil.rmtree(skill_dir)
+    # Codex PR #5 batch 1, A5: the old code verified only SKILL.md and
+    # then rmtree'd the whole directory, deleting anything the user had
+    # dropped in afterwards. Now inventory first and delete ONLY the two
+    # files this recipe manages. A file the user added, or a relay file
+    # whose content drifted from what install wrote, is foreign: refuse
+    # the whole-directory delete, list every foreign path, and leave
+    # everything (including the recipe state, so a retry stays possible)
+    # untouched.
+    managed = {'SKILL.md', 'RELAY-RECIPE.md'}
+    foreign = []
+    if (skill_dir / 'SKILL.md').read_bytes() != RELAY_SKILL_TEXT.encode('utf-8'):
+        foreign.append('SKILL.md（内容已被外部改动）')
+    for path in sorted(skill_dir.rglob('*')):
+        rel = path.relative_to(skill_dir).as_posix()
+        if rel in managed:
+            continue
+        foreign.append(rel + ('/' if path.is_dir() else ''))
+    require(not foreign,
+            'skill 目录含非 relay 管理文件，拒绝删除整个目录（文件无损，'
+            '请先人工移走下列文件再卸载）：%s：%s'
+            % (skill_dir, '、'.join(foreign)))
+    for name in managed:
+        (skill_dir / name).unlink(missing_ok=True)
+    try:
+        skill_dir.rmdir()
+    except OSError as exc:
+        raise RelayError('skill 目录删除失败（内容已只剩 relay 文件，未动其他）：%s：%r'
+                         % (skill_dir, exc))
     _recipe_state_path(store_dir, flavor, _row['key']).unlink(missing_ok=True)
     return {'removed': str(skill_dir)}
 
@@ -1248,7 +1382,21 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
     new_contents = {'state.md': state_text, 'decisions.md': decisions_text,
                     'lessons.md': lessons_text, 'backlog.md': backlog_text}
     # Transaction log first, then atomic writes (old substrate pattern).
+    # Codex PR #5 batch 2, A2: the tx log doubles as the undo record, so
+    # it must also carry the pre-transaction cursor / baseline /
+    # last-summary -- recover() used to restore only the archive files,
+    # leaving a new cursor, an advanced baseline and a summary record
+    # pointing at entries whose archive effects had just been undone
+    # (cursor-new / archive-old mismatch). The before-state is captured
+    # here, before any write, so recover can roll the whole transaction
+    # back atomically instead of only its archive half.
     tx = {'version': 1, 'seq': seq, 'source': source, 'files': {}}
+    last_summary_path = store_dir / 'state' / 'last-summary.json'
+    tx['before_state'] = {
+        'cursor': cursor,
+        'baseline': load_baseline(store_dir),
+        'last_summary': read_json(last_summary_path) if last_summary_path.exists() else None,
+    }
     for name, content in new_contents.items():
         path = archive / name
         before = path.read_bytes() if path.exists() else b''
@@ -1311,10 +1459,40 @@ def _latest_goal_receipt_seq(store_dir):
 def recover(store, toplevel):
     """Two-phase preflight recovery (plan 1.12, old recover() pattern): every
     file in the latest tx log must currently equal its before or after bytes;
-    anything else aborts the whole recovery and keeps the log."""
+    anything else aborts the whole recovery and keeps the log.
+
+    Codex PR #5 batch 2, A2: a tx log is NOT deleted by a successful
+    summarize -- it doubles as the undo record (see health_check's
+    D-sync-8 note) -- so an unconditional recover after a successful
+    summarize used to restore only the archive files while the cursor,
+    baseline, last-summary and summary record stayed advanced: the
+    cursor pointed at entries whose archive effects had just been undone.
+    Recover now rolls the whole transaction back, in this order:
+    archive files to before-bytes (preflighted above), the summary
+    record for this seq is annotated as a rolled-back tombstone (kept in
+    place so sequence numbers stay monotonic), entries consumed by this transaction
+    go back to pending, and cursor / baseline / last-summary revert to
+    their pre-transaction values. New logs carry that before-state in
+    tx['before_state'] (written by _summarize_impl); legacy logs without
+    it are derived from the summary record and the entry list, except
+    the baseline snapshot, which cannot be reconstructed from legacy
+    data -- it is dropped (a missing baseline is truthful and is rebuilt
+    by the next summarize, while a stale advanced baseline would lie).
+    Entries the transaction archived (archive_summarized's lifecycle
+    move of older summarized entries) are deliberately NOT un-archived:
+    archiving does not change queue counts or cursor semantics, so
+    leaving them archived keeps the store self-consistent. The checksum
+    manifest refreshes last, so the next resume verifies post-recovery
+    bytes. Returns the recovered log name plus the rolled-back state
+    for callers/tests to assert on."""
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
     tx_dir = store_dir / 'tx'
-    logs = sorted(tx_dir.glob('*.json')) if tx_dir.exists() else []
+    # A previous recover leaves '<seq>.recovered.json' receipts in the
+    # same directory; they are not transaction logs and must never be
+    # picked up as the "latest" log (they carry no 'files' key).
+    logs = sorted(p for p in tx_dir.glob('*.json')
+                  if tx_dir.exists() and not p.name.endswith('.recovered.json')) \
+        if tx_dir.exists() else []
     require(logs, '无事务日志，无需恢复')
     path = logs[-1]
     tx = read_json(path)
@@ -1325,16 +1503,146 @@ def recover(store, toplevel):
         before = base64.b64decode(rec['before_b64'])
         if current != before and digest(current) != rec['after_sha']:
             raise RelayError('恢复中止：%s 当前内容既非事务前也非事务后，外部改动在场，日志保留' % name)
+    seq = tx.get('seq')
+    # Resolve the rollback targets BEFORE writing anything, so a missing
+    # derivation fails closed with the log (and the archive) untouched.
+    before_state = tx.get('before_state') or {}
+    summaries_dir = store_dir / 'state' / 'summaries'
+    summary_path = (summaries_dir / ('%04d.json' % seq)) if isinstance(seq, int) else None
+    summary_record = None
+    if summary_path is not None and summary_path.exists():
+        try:
+            summary_record = read_json(summary_path)
+        except ValueError:
+            summary_record = None
+    if 'cursor' in before_state and 'baseline' in before_state \
+            and 'last_summary' in before_state:
+        new_cursor = before_state['cursor']
+        new_baseline = before_state['baseline']
+        new_last_summary = before_state['last_summary']
+    else:
+        # Legacy log: derive the cursor from the entries this summary
+        # consumed (its entry_range) -- the previous cursor is the last
+        # entry before that range, or zero when this was the first
+        # summary. Without a summary record the range is unknowable,
+        # so fail closed rather than guess a cursor.
+        require(summary_record is not None
+                and isinstance(summary_record.get('entry_range'), list)
+                and len(summary_record['entry_range']) == 2,
+                '恢复中止：旧事务日志无事务前快照且汇总记录缺失，无法一致回滚游标，日志保留')
+        first_seq = summary_record['entry_range'][0]
+        earlier = [e for e in list_entries(store_dir, include_archived=True)
+                   if e['header']['seq'] < first_seq]
+        if earlier:
+            prev_entry = earlier[-1]
+            new_cursor = {'entry_seq': prev_entry['header']['seq'],
+                          'anchor_message': prev_entry['header'].get('user_message')}
+        else:
+            new_cursor = {'entry_seq': 0, 'anchor_message': None}
+        new_baseline = None  # unrecoverable from legacy data; see docstring
+        prev_summaries = []
+        if summaries_dir.is_dir():
+            for p in summaries_dir.glob('*.json'):
+                try:
+                    n = int(p.stem)
+                except ValueError:
+                    continue
+                if n < seq:
+                    try:
+                        prev_summaries.append((n, read_json(p)))
+                    except ValueError:
+                        continue
+        if prev_summaries:
+            _n, prev = max(prev_summaries, key=lambda t: t[0])
+            new_last_summary = {'seq': prev.get('seq'),
+                                'at': prev.get('at'),
+                                'source': prev.get('source'),
+                                'receipt_seq': prev.get('receipt_seq')}
+        else:
+            new_last_summary = None
+    # Entry range to un-summarize: prefer the summary record, fall back
+    # to the cursor window (pre-transaction cursor .. current cursor):
+    # in every recoverable state the current cursor still points at this
+    # transaction's last entry -- a later summarize would have moved the
+    # archive files and tripped the preflight above, and merges never
+    # touch the cursor (D-sync-2) -- so the window is exactly the batch
+    # this transaction consumed, even when its summary record is gone.
+    entry_range = None
+    if summary_record is not None and isinstance(summary_record.get('entry_range'), list):
+        entry_range = summary_record['entry_range']
+    if entry_range is None:
+        current_cursor = _cursor(store_dir)
+        if current_cursor.get('entry_seq'):
+            entry_range = [new_cursor.get('entry_seq', 0) + 1,
+                           current_cursor['entry_seq']]
+    # Apply: archive first, then the transaction's bookkeeping, then the
+    # manifest. Entry queue transitions go through _set_queue (which
+    # rewrites the entry file atomically with the rest of its header).
     for name, rec in tx['files'].items():
         atomic(archive / name, base64.b64decode(rec['before_b64']))
+    reverted_entries = []
+    if entry_range is not None:
+        lo, hi = entry_range
+        for entry in list_entries(store_dir, include_archived=True):
+            hdr = entry['header']
+            # Archived copies are lifecycle state, not this transaction's
+            # live entries (a later summarize archiving them would have
+            # moved the archive and tripped the preflight); reverting
+            # one through _set_queue would duplicate it into raw/.
+            if entry['path'].parent.name == 'archived':
+                continue
+            if lo <= hdr['seq'] <= hi and hdr.get('queue') == 'summarized':
+                _set_queue(store_dir, hdr['seq'], 'pending')
+                reverted_entries.append(hdr['seq'])
+    # A2 (batch 2): the summary record is NOT deleted. It is annotated as
+    # a rolled-back tombstone and kept in place: deleting it would let
+    # the next summarize reuse the sequence number (an existing test
+    # pins monotonic sequence numbers across recover), and a tombstone
+    # keeps the record honest -- it says a summary happened and was
+    # undone, while last-summary.json (restored above) stays the
+    # authority for the latest LIVE summary. Counters that glob
+    # summaries/*.json keep counting the tombstone, which keeps pack
+    # drift math stable across a recover.
+    if summary_path is not None and summary_path.exists():
+        try:
+            record = read_json(summary_path)
+        except (ValueError, UnicodeError):
+            record = {}
+        if isinstance(record, dict):
+            record['rolled_back'] = True
+            record['recovered_at'] = utc()
+            save(summary_path, record)
+    cursor_path = store_dir / 'state' / 'cursor.json'
+    save(cursor_path, new_cursor)
+    baseline_path = store_dir / 'state' / 'baseline.json'
+    if new_baseline is None:
+        baseline_path.unlink(missing_ok=True)
+    else:
+        save(baseline_path, new_baseline)
+    last_summary_path = store_dir / 'state' / 'last-summary.json'
+    if new_last_summary is None:
+        last_summary_path.unlink(missing_ok=True)
+    else:
+        save(last_summary_path, new_last_summary)
     # Archive writer invariant (plan 2.3.5): recovery rewrites archive
     # files, so the manifest must follow or the next resume will
     # (correctly) flag the restored bytes as corruption.
     relay.update_checksum_manifest(store_dir)
     save(store_dir / 'tx' / (path.stem + '.recovered.json'),
-         {'recovered_from': path.name, 'at': utc()})
+         {'recovered_from': path.name, 'at': utc(),
+          'rolled_back': {'cursor': new_cursor,
+                          'baseline_summary_seq': (new_baseline or {}).get('summary_seq')
+                          if isinstance(new_baseline, dict) else None,
+                          'last_summary_seq': (new_last_summary or {}).get('seq')
+                          if isinstance(new_last_summary, dict) else None,
+                          'entries_reverted_to_pending': reverted_entries}})
     path.unlink()
-    return {'recovered': path.name}
+    return {'recovered': path.name, 'cursor': new_cursor,
+            'baseline_summary_seq': (new_baseline or {}).get('summary_seq')
+            if isinstance(new_baseline, dict) else None,
+            'last_summary_seq': (new_last_summary or {}).get('seq')
+            if isinstance(new_last_summary, dict) else None,
+            'entries_reverted_to_pending': reverted_entries}
 
 
 # ---------------------------------------------------------------- archive (1.13)

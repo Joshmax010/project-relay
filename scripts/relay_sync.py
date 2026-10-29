@@ -25,10 +25,12 @@ the only sync-adjacent state visible there is the goal state, rendered as
 """
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -76,6 +78,271 @@ FORMAT_MAJOR = 1
 # minor mismatch, so minor-0 bundles still import.
 FORMAT_MINOR = 1
 TOOL_VERSION = 'project-relay-v2'
+
+# ---------------------------------------------------------------- sync signing (batch 2, B1)
+# Git-carrier "push is trust" fix: a holder of push rights could rewrite
+# a packed tree and the peer would merge it (the folder/server carriers
+# do not have this hole -- their bundles are hash-gated by manifest, see
+# verify_bundle -- but git rebuilds its bundle manifest from disk, so
+# content tampering there is invisible until merge). The fix is a
+# signature over the bundle manifest, travelling in the committed
+# sync-manifest, verified before any landing.
+#
+# DEVIATION (documented in references/v2-sync.md §15): the task brief
+# asked for an HMAC signature, but an HMAC cannot do what the brief
+# also requires -- TOFU pinning on first sight by a peer that has never
+# seen the key. A symmetric key is either shared with the peer (then a
+# pusher who can read the remote can also read it, and the signature
+# proves nothing) or never reaches the peer (then the peer cannot
+# verify at all). Only an asymmetric signature makes "first sight pins
+# the key, later change needs --repin" true: the private seed stays
+# home-only (0600), the public key travels in the manifest and is
+# pinned per source device_id on first sight. The implementation below
+# is pure-stdlib Ed25519 (RFC 8032, hashlib.sha512 only, no third-party
+# crypto), so the "standard library only" constraint still holds; the
+# signed payload canonical form is identical to the folder/server
+# manifest files dict (same _collect_payload + redaction pipeline), so
+# the pack manifest calibre is consistent across carriers.
+_ED_Q = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = (-121665 * pow(121666, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_I = pow(2, (_ED_Q - 1) // 4, _ED_Q)
+
+
+def _ed_xrecover(y, sign):
+    xx = (y * y - 1) * pow((_ED_D * y * y + 1) % _ED_Q, _ED_Q - 2, _ED_Q) % _ED_Q
+    x = pow(xx, (_ED_Q + 3) // 8, _ED_Q)
+    if (x * x - xx) % _ED_Q != 0:
+        x = x * _ED_I % _ED_Q
+    if (x * x - xx) % _ED_Q != 0:
+        raise ValueError('点不在曲线上')
+    if x % 2 != sign:
+        x = _ED_Q - x
+    return x
+
+
+_ED_BY = (4 * pow(5, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_B = (_ed_xrecover(_ED_BY, 0), _ED_BY)
+
+
+def _ed_add(P, Q):
+    x1, y1 = P
+    x2, y2 = Q
+    d = _ED_D
+    x3 = (x1 * y2 + x2 * y1) * pow((1 + d * x1 * x2 * y1 * y2) % _ED_Q,
+                                   _ED_Q - 2, _ED_Q) % _ED_Q
+    y3 = (y1 * y2 + x1 * x2) * pow((1 - d * x1 * x2 * y1 * y2) % _ED_Q,
+                                   _ED_Q - 2, _ED_Q) % _ED_Q
+    return (x3, y3)
+
+
+def _ed_mul(P, e):
+    Q = (0, 1)
+    while e:
+        if e & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        e >>= 1
+    return Q
+
+
+def _ed_encode_point(P):
+    x, y = P
+    return (y | ((x & 1) << 255)).to_bytes(32, 'little')
+
+
+def _ed_decode_point(data):
+    if len(data) != 32:
+        raise ValueError('公钥/签名点长度错误')
+    y = int.from_bytes(data, 'little') & ((1 << 255) - 1)
+    sign = data[31] >> 7
+    x = _ed_xrecover(y, sign)
+    if (-x * x + y * y - 1 - _ED_D * x * x * y * y) % _ED_Q != 0:
+        raise ValueError('点不在曲线上')
+    return (x, y)
+
+
+def _ed_clamp(h):
+    a = bytearray(h[:32])
+    a[0] &= 248
+    a[31] &= 127
+    a[31] |= 64
+    return int.from_bytes(a, 'little')
+
+
+def _ed_public_from_seed(seed):
+    h = hashlib.sha512(seed).digest()
+    return _ed_encode_point(_ed_mul(_ED_B, _ed_clamp(h)))
+
+
+def _ed_sign(seed, msg):
+    h = hashlib.sha512(seed).digest()
+    prefix = h[32:]
+    pub = _ed_public_from_seed(seed)
+    r = int.from_bytes(hashlib.sha512(prefix + msg).digest(), 'little') % _ED_L
+    r_enc = _ed_encode_point(_ed_mul(_ED_B, r))
+    k = int.from_bytes(hashlib.sha512(r_enc + pub + msg).digest(), 'little') % _ED_L
+    s = (r + k * _ed_clamp(h)) % _ED_L
+    return r_enc + s.to_bytes(32, 'little')
+
+
+def _ed_verify(pub, msg, sig):
+    if len(pub) != 32 or len(sig) != 64:
+        return False
+    try:
+        a_point = _ed_decode_point(pub)
+        r_point = _ed_decode_point(sig[:32])
+    except ValueError:
+        return False
+    s = int.from_bytes(sig[32:], 'little')
+    if s >= _ED_L:
+        return False
+    k = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(),
+                       'little') % _ED_L
+    return _ed_mul(_ED_B, s) == _ed_add(r_point, _ed_mul(a_point, k))
+
+
+SYNC_KEY_FILENAME = '.project-relay-sync-key.json'
+SYNC_PINS_FILENAME = '.project-relay-sync-pins.json'
+
+
+def _sync_key_path():
+    """The signing private seed: home directory only, never in any store,
+    bundle, or synced tree (a key inside the synced tree would be readable
+    by exactly the pusher the signature is meant to stop)."""
+    return relay.home_dir() / SYNC_KEY_FILENAME
+
+
+def _sync_pins_path():
+    """TOFU pins: source device_id -> pinned public key. Public keys
+    only, so no permission requirement beyond the default."""
+    return relay.home_dir() / SYNC_PINS_FILENAME
+
+
+def ensure_sync_key():
+    """Generate the device signing key on first use (git sync-setup is
+    the primary path; git pack lazily ensures it for pre-existing
+    setups). Returns the key record. The file is chmod 0600 after every
+    write (save() alone would leave 0644) and re-tightened on load."""
+    path = _sync_key_path()
+    try:
+        data = read_json(path)
+    except (ValueError, OSError):
+        data = None
+    if isinstance(data, dict) and data.get('private_seed') and data.get('public_key'):
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return data
+    seed = secrets.token_bytes(32)
+    pub = _ed_public_from_seed(seed)
+    data = {'key_id': digest(pub)[:16], 'private_seed': seed.hex(),
+            'public_key': pub.hex(), 'created_at': utc()}
+    save(path, data)
+    os.chmod(path, 0o600)
+    return data
+
+
+def _signing_payload(device_id, exported_at, pack_seq, file_hashes):
+    """Canonical signed bytes: device + time + sequence + the full
+    path->hash manifest (the same dict folder/server bundles hash-gate).
+    Signing paths alone would not detect content tampering; signing the
+    hashes does, because the verifier recomputes them from disk."""
+    return json.dumps({'device_id': device_id, 'exported_at': exported_at,
+                       'pack_seq': pack_seq,
+                       'files': {k: file_hashes[k] for k in sorted(file_hashes)}},
+                      ensure_ascii=False, sort_keys=True,
+                      separators=(',', ':')).encode('utf-8')
+
+
+def sign_bundle_manifest(device_id, exported_at, pack_seq, file_hashes):
+    """Sign one git pack's manifest. Returns the manifest 'signature'
+    dict (public key included: first sight pins it, see TOFU below)."""
+    key = ensure_sync_key()
+    sig = _ed_sign(bytes.fromhex(key['private_seed']),
+                   _signing_payload(device_id, exported_at, pack_seq, file_hashes))
+    return {'algorithm': 'ed25519', 'key_id': key['key_id'],
+            'public_key': key['public_key'], 'signature': sig.hex()}
+
+
+def _load_pins():
+    try:
+        pins = read_json(_sync_pins_path())
+    except (ValueError, OSError):
+        return {}
+    return pins if isinstance(pins, dict) else {}
+
+
+def _save_pins(pins):
+    save(_sync_pins_path(), pins)
+
+
+def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
+                            repin=False):
+    """Verify a git sync-manifest's signature against recomputed hashes.
+
+    Returns a verification dict (status: verified / tofu-pinned /
+    repinned / trusted-unsigned) or raises RelayError naming the cause,
+    so the caller refuses landing before any write. TOFU: a source
+    device_id with no pin gets its public key pinned on first sight --
+    that first sight is trusted by construction (same caveat as SSH
+    host keys: it must be the user's own fresh pack, not a stranger's).
+    A later public-key change is refused unless --repin explicitly
+    accepts it. An unsigned bundle is refused unless --trust-unsigned
+    explicitly allows it. A manifest without a device_id can still be
+    cryptographically verified, but there is nothing to pin it to, so
+    it verifies without pinning (status verified-no-pin)."""
+    sig = manifest.get('signature')
+    device_id = manifest.get('source_device_id')
+    if not isinstance(sig, dict) or sig.get('algorithm') != 'ed25519' \
+            or not sig.get('signature') or not sig.get('public_key'):
+        if trust_unsigned:
+            return {'status': 'trusted-unsigned', 'device_id': device_id,
+                    'key_id': None,
+                    'note': '包未签名，用户以 --trust-unsigned 明示放行'}
+        raise RelayError('Git 包未签名，拒绝落盘（源设备 %s）：请先在源设备重新 pack '
+                         '生成签名，或以 --trust-unsigned 明示放行无签包' % device_id)
+    try:
+        pub = bytes.fromhex(sig['public_key'])
+        sig_bytes = bytes.fromhex(sig['signature'])
+    except ValueError:
+        raise RelayError('Git 包签名格式损坏，拒绝落盘')
+    key_id = digest(pub)[:16]
+    if sig.get('key_id') and sig['key_id'] != key_id:
+        raise RelayError('Git 包签名 key_id 与公钥不符，拒绝落盘')
+    payload = _signing_payload(device_id, manifest.get('exported_at'),
+                               manifest.get('pack_seq'), file_hashes)
+    if not _ed_verify(pub, payload, sig_bytes):
+        raise RelayError('Git 包验签失败：包内容与签名不符（文件、时间或序列号'
+                         '可能被篡改），拒绝落盘')
+    if not device_id:
+        return {'status': 'verified-no-pin', 'device_id': device_id,
+                'key_id': key_id, 'note': '签名有效，但包无设备 ID，无法钉死'}
+    pins = _load_pins()
+    pinned = pins.get(device_id)
+    if pinned is None:
+        pins[device_id] = {'key_id': key_id, 'public_key': sig['public_key'],
+                           'first_seen': utc(),
+                           'source_device': manifest.get('source_device')}
+        _save_pins(pins)
+        return {'status': 'tofu-pinned', 'device_id': device_id,
+                'key_id': key_id, 'note': '首次见该设备签名公钥，已钉死（TOFU）'}
+    if pinned.get('public_key') != sig['public_key']:
+        if repin:
+            prev = pinned.get('key_id')
+            pins[device_id] = {'key_id': key_id, 'public_key': sig['public_key'],
+                               'first_seen': pinned.get('first_seen'),
+                               'repinned_at': utc(), 'previous_key_id': prev,
+                               'source_device': manifest.get('source_device')}
+            _save_pins(pins)
+            return {'status': 'repinned', 'device_id': device_id,
+                    'key_id': key_id, 'previous_key_id': prev,
+                    'note': '签名公钥已变更，用户以 --repin 明示接受新公钥'}
+        raise RelayError('Git 包签名公钥与钉死的公钥不符（设备 %s，钉死 %s，当前 %s），'
+                         '拒绝落盘：密钥可能被替换，请核实后以 --repin 明示接受'
+                         % (device_id, pinned.get('key_id'), key_id))
+    return {'status': 'verified', 'device_id': device_id, 'key_id': key_id}
 MARKER_PREFIXES = ('<<<<<<<', '=======', '>>>>>>>')
 
 # Files in the store root that never enter a git pack commit. sync-manifests/
@@ -712,6 +979,36 @@ def _merge_backlog(local_text, incoming_text):
 STATE_BEGIN = '<!-- relay:state-begin -->'
 STATE_END = '<!-- relay:state-end -->'
 
+_TEMPLATE_STATE_VALUES = None
+
+
+def _template_state_values():
+    """Managed-block values of the init template state.md, read from the
+    template itself (never guessed). Batch 2, B3: a local section is
+    'still template' iff its value byte-equals the template's value for
+    that key -- no heuristic ('未知'-looking text the user typed is NOT
+    template, because it is not the template's bytes for that key... in
+    practice the template values are all '未知', so the distinction only
+    bites if a template value ever changes, which is exactly when a
+    heuristic would go wrong). Unreadable template -> {} (fail-closed:
+    no template-wins without the template)."""
+    global _TEMPLATE_STATE_VALUES
+    if _TEMPLATE_STATE_VALUES is not None:
+        return _TEMPLATE_STATE_VALUES
+    values = {}
+    try:
+        text = (relay.TEMPLATES_DIR / 'state.md').read_text(encoding='utf-8')
+        if STATE_BEGIN in text and STATE_END in text:
+            block = text[text.index(STATE_BEGIN):text.index(STATE_END)]
+            for line in block.splitlines():
+                m = re.match(r'^- ([^：]+)：(.*)$', line)
+                if m:
+                    values[m.group(1)] = m.group(2)
+    except (OSError, ValueError):
+        values = {}
+    _TEMPLATE_STATE_VALUES = values
+    return values
+
 
 def _merge_state_md(local_text, incoming_text):
     """S6 state.md rule on the v1 managed block.
@@ -721,22 +1018,34 @@ def _merge_state_md(local_text, incoming_text):
     分叉待裁 note line after STATE_END (both values retained, the note
     survives later summarizes because only the block itself is rewritten).
     Outside-block text is kept local; a difference is reported, not
-    auto-appended. Returns (merged_text, conflicts)."""
+    auto-appended. Returns (merged_text, conflicts, notes).
+
+    Batch 2, B3: a local section that is still the init template
+    verbatim loses to substantive incoming content -- a fresh device
+    that init'd and then unpacked used to end with every section
+    '未知' plus six fork notes, i.e. the incoming knowledge was present
+    but unreachable. The branch line ('当前分支@基线') is exempt: it is
+    local measurement (D-sync-3), not content, so adopting the peer's
+    branch would misdescribe this device's code state; it keeps the old
+    keep-local rule until a local summarize fills it in. The union rule
+    for 已完成且有证据 also drops template placeholder tokens, so a
+    template '未知' never pollutes an adopted value list."""
     local_text = local_text or ''
     incoming_text = incoming_text or ''
     conflicts = []
+    notes = []
     if STATE_BEGIN not in local_text or STATE_END not in local_text:
         if local_text != incoming_text:
             conflicts.append({'file': 'archive/state.md',
                               'rule': 'unmanaged-state-kept-local',
                               'note': '本地 state.md 无受管块，保留本地全文'})
-        return local_text, conflicts
+        return local_text, conflicts, notes
     l_start = local_text.index(STATE_BEGIN)
     l_stop = local_text.index(STATE_END) + len(STATE_END)
     l_before, l_block, l_after = (local_text[:l_start], local_text[l_start:l_stop],
                                   local_text[l_stop:])
     if STATE_BEGIN not in incoming_text or STATE_END not in incoming_text:
-        return local_text, conflicts
+        return local_text, conflicts, notes
     i_start = incoming_text.index(STATE_BEGIN)
     i_stop = incoming_text.index(STATE_END) + len(STATE_END)
     i_block = incoming_text[i_start:i_stop]
@@ -758,6 +1067,7 @@ def _merge_state_md(local_text, incoming_text):
 
     order, l_values = parse_block(l_block)
     _i_order, i_values = parse_block(i_block)
+    template_values = _template_state_values()
     merged_values = dict(l_values)
     fork_notes = []
     for key in order:
@@ -765,11 +1075,23 @@ def _merge_state_md(local_text, incoming_text):
             continue
         if i_values[key] == l_values[key]:
             continue
+        # B3 template-wins: local still template-verbatim, incoming
+        # substantive (differs from the template value and non-empty).
+        # '无' counts as substantive here: known-none beats unknown.
+        if key != '当前分支@基线' \
+                and key in template_values \
+                and l_values[key] == template_values[key] \
+                and i_values[key].strip() \
+                and i_values[key] != template_values[key]:
+            merged_values[key] = i_values[key]
+            notes.append('state.md 的 %s 仍为模板原文，采纳对方内容' % key)
+            continue
         if key == '已完成且有证据':
             vals = []
             for v in (l_values[key] + '；' + i_values[key]).split('；'):
                 v = v.strip()
-                if v and v not in ('无',) and v not in vals:
+                if v and v not in ('无', template_values.get(key)) \
+                        and v not in vals:
                     vals.append(v)
             merged_values[key] = '；'.join(vals) if vals else '无'
         else:
@@ -789,7 +1111,7 @@ def _merge_state_md(local_text, incoming_text):
     if fork_notes:
         merged += '\n' + '\n'.join(fork_notes)
     merged += l_after
-    return merged, conflicts
+    return merged, conflicts, notes
 
 
 # ---------------------------------------------------------------- merge
@@ -859,6 +1181,7 @@ def merge_project(local_dir, incoming_files, source_info):
     conflicts = []
     notes = []
     discarded = []
+    quarantined = {}
     merged = {}
     counts = {'entries_added': 0, 'entries_skipped': 0, 'entries_conflicted': 0,
               'blocks_added': 0, 'blocks_skipped': 0, 'files_added': 0}
@@ -886,12 +1209,23 @@ def merge_project(local_dir, incoming_files, source_info):
             header, body = _parse_entry_text(text)
         except (RelayError, UnicodeDecodeError) as exc:
             discarded.append({'file': rel, 'reason': 'malformed', 'detail': str(exc)})
+            quarantined[rel] = incoming_files[rel]
             continue
         if _has_markers(body):
             discarded.append({'file': rel, 'reason': 'conflict-markers'})
+            quarantined[rel] = incoming_files[rel]
             continue
         if not _verify_entry_id(header):
             discarded.append({'file': rel, 'reason': 'id-hash-mismatch'})
+            # Batch 2, B2: a discarded entry's bytes are quarantined,
+            # never landed in raw/ and never counted -- the old code
+            # reported the discard but dropped the bytes entirely, so a
+            # mis-verified entry could neither be inspected nor
+            # repaired, and its 'summarized' queue claim lingered in
+            # summaries that did land. Quarantine lives next to the
+            # merge-log (see _land_project), outside raw/ and outside
+            # the payload, so queue counts can never include it.
+            quarantined[rel] = incoming_files[rel]
             continue
         incoming_entries.append((rel, header, body))
     # Source seq order, NOT fact-hash order: renumbering must preserve the
@@ -953,12 +1287,13 @@ def merge_project(local_dir, incoming_files, source_info):
             conflicts.append(c)
     # ---- state.md managed block
     if 'archive/state.md' in incoming_files:
-        new_text, st_conflicts = _merge_state_md(
+        new_text, st_conflicts, st_notes = _merge_state_md(
             local_text('archive/state.md'),
             incoming_files['archive/state.md'].decode('utf-8'))
         if new_text != local_text('archive/state.md'):
             merged['archive/state.md'] = new_text.encode('utf-8')
         conflicts.extend(st_conflicts)
+        notes.extend(st_notes)
     # ---- goal (never auto-merged) + incoming receipt info
     incoming_receipts = {}
     for rel in sorted(incoming_files):
@@ -1121,7 +1456,7 @@ def merge_project(local_dir, incoming_files, source_info):
             notes.append('忽略未纳入合并的文件：' + rel)
     return {'merged_files': merged, 'conflicts': conflicts, 'counts': counts,
             'goal_action': goal_action, 'pending_info': pending_info,
-            'discarded': discarded, 'notes': notes}
+            'discarded': discarded, 'quarantined': quarantined, 'notes': notes}
 
 
 # ---------------------------------------------------------------- health
@@ -1278,12 +1613,17 @@ def _land_files(local_dir, merged_files):
     return backup
 
 
-def _land_project(store, local_dir, merge_result, source_info, marker_files=None):
+def _land_project(store, local_dir, merge_result, source_info, marker_files=None,
+                  quarantined=None):
     """Shadow-check, land, then write flags + merge-log.
 
     marker_files: incoming files excluded for conflict markers are
     preserved under the merge-log's conflicted/ folder (both versions
-    retained, never silently dropped)."""
+    retained, never silently dropped). quarantined (batch 2, B2): bytes
+    of entries merge discarded (malformed / id-hash-mismatch / non-UTF-8)
+    are preserved under the merge-log's quarantined/ folder -- outside
+    raw/, outside the payload, never counted -- so a discard is
+    inspectable and repairable instead of silently gone."""
     local_dir = Path(local_dir)
     shadow = _shadow_copy(local_dir)
     for rel, data in merge_result['merged_files'].items():
@@ -1315,6 +1655,7 @@ def _land_project(store, local_dir, merge_result, source_info, marker_files=None
            'counts': merge_result['counts'],
            'conflicts': merge_result['conflicts'],
            'discarded': merge_result['discarded'],
+           'quarantined': sorted(quarantined) if quarantined else [],
            'notes': merge_result['notes'],
            'changed_files': sorted(merge_result['merged_files'])}
     rollback_note = local_dir / 'state' / 'rollback-note.json'
@@ -1330,12 +1671,21 @@ def _land_project(store, local_dir, merge_result, source_info, marker_files=None
         conflicted_dir.mkdir(parents=True, exist_ok=True)
         for rel, data in marker_files.items():
             (conflicted_dir / rel.replace('/', '__')).write_bytes(data)
+    quarantined_files = []
+    if quarantined:
+        quarantine_dir = Path(str(log_path)[:-5]) / 'quarantined'
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        for rel, data in sorted(quarantined.items()):
+            name = rel.replace('/', '__')
+            (quarantine_dir / name).write_bytes(data)
+            quarantined_files.append(name)
     shutil.rmtree(shadow, ignore_errors=True)
     return {'changed_files': sorted(merge_result['merged_files']),
             'conflicts': merge_result['conflicts'],
             'counts': merge_result['counts'],
             'goal_action': merge_result['goal_action'],
-            'merge_log': str(log_path)}
+            'merge_log': str(log_path),
+            'quarantined_files': quarantined_files}
 
 
 def _project_key(local_dir):
@@ -1347,29 +1697,46 @@ def _project_key(local_dir):
 def _redact_incoming(payload):
     """Redact + marker-scan an incoming payload (pure, no writes).
 
-    Returns (files, hits, marker_files, discarded): files is the redacted
-    payload for merging; marker files are excluded from merging (the
-    caller preserves them next to the merge-log); non-UTF-8 files are
-    discarded with a reason."""
+    Returns (files, hits, marker_files, discarded, quarantined): files
+    is the redacted payload for merging; marker files are excluded from
+    merging (the caller preserves them next to the merge-log); non-UTF-8
+    files are discarded with a reason and their bytes quarantined.
+
+    Batch 2, B2: raw entries get the same field-level redaction as the
+    export rescan (_redact_entry_text) instead of whole-text redaction
+    -- whole-text redaction on the import side could damage the very
+    fingerprint digits the peer then verifies (the P0 failure mode,
+    manufactured on arrival), turning valid entries into
+    id-hash-mismatch discards. A malformed entry that field redaction
+    cannot parse falls back to whole-text redaction; merge_project
+    still discards and quarantines it, so the fallback cannot land it."""
     flow = _flow()
     files = {}
     marker_files = {}
     discarded = []
+    quarantined = {}
     hits = 0
     for rel, data in sorted(payload.items()):
         try:
             text = data.decode('utf-8')
         except UnicodeDecodeError:
             discarded.append({'file': rel, 'reason': 'non-utf8'})
+            quarantined[rel] = data
             continue
         if _has_markers(text):
             marker_files[rel] = data
             discarded.append({'file': rel, 'reason': 'conflict-markers'})
             continue
-        cleaned, n = flow.redact(text)
+        if _is_raw_entry_rel(rel):
+            try:
+                cleaned, n = _redact_entry_text(text, flow)
+            except ValueError:
+                cleaned, n = flow.redact(text)
+        else:
+            cleaned, n = flow.redact(text)
         hits += n
         files[rel] = cleaned.encode('utf-8')
-    return files, hits, marker_files, discarded
+    return files, hits, marker_files, discarded, quarantined
 
 
 def import_bundle(bundle_dir, store, confirm=False):
@@ -1387,12 +1754,18 @@ def import_bundle(bundle_dir, store, confirm=False):
     report = {'landed': confirm, 'exported_at': manifest['exported_at'],
               'source_device': manifest['source_device'],
               'source_device_id': manifest['source_device_id'],
-              'warnings': warnings, 'projects': [], 'merge_logs': []}
+              'warnings': warnings, 'projects': [], 'merge_logs': [],
+              # Batch 2, B1: git bundles rebuilt by _bundle_dir_from_clone
+              # carry their signature verification here; direct
+              # folder/server bundles have none (their manifest hash
+              # gate is the verification), so this stays None there.
+              'signature_verification': manifest.get('signature_verification')}
     for proj in sorted(manifest.get('projects', []), key=lambda p: p['key']):
         prefix = 'projects/%s-%s/' % (proj['key'], proj['slug'])
         payload = {rel[len(prefix):]: data for rel, data in files.items()
                    if rel.startswith(prefix)}
-        files_in, hits, marker_files, redacted_discarded = _redact_incoming(payload)
+        files_in, hits, marker_files, redacted_discarded, redacted_quarantined = \
+            _redact_incoming(payload)
         matched = None
         for row in registry.get('projects', []):
             if row.get('status', 'active') != 'active':
@@ -1418,13 +1791,48 @@ def import_bundle(bundle_dir, store, confirm=False):
                  'pack_seq': proj.get('pack_seq'),
                  'redacted_count': hits,
                  'marker_files': sorted(marker_files),
-                 'discarded': redacted_discarded}
+                 'discarded': list(redacted_discarded),
+                 'quarantined': sorted(redacted_quarantined)}
         if matched is None:
             entry['status'] = 'unclaimed'
+            # Batch 2, B2: the unclaimed landing used to write the
+            # payload wholesale -- including entries merge would
+            # discard (id-hash-mismatch, malformed) -- with their
+            # original 'summarized' queue headers intact, and the
+            # report's discarded list stayed empty. Scan raw entries
+            # here with the same gate merge_project uses, quarantine
+            # the failures (never under raw/, never counted), and
+            # report them -- in dry-run too, so the preview is faithful.
+            scan_discarded = []
+            scan_quarantined = dict(redacted_quarantined)
+            for rel in sorted(files_in):
+                if not _is_raw_entry_rel(rel):
+                    continue
+                try:
+                    header, _body = _parse_entry_text(
+                        files_in[rel].decode('utf-8'))
+                except (RelayError, UnicodeDecodeError) as exc:
+                    scan_discarded.append({'file': rel, 'reason': 'malformed',
+                                           'detail': str(exc)})
+                    scan_quarantined[rel] = files_in[rel]
+                    continue
+                if not _verify_entry_id(header):
+                    scan_discarded.append({'file': rel,
+                                           'reason': 'id-hash-mismatch'})
+                    scan_quarantined[rel] = files_in[rel]
+            for rel in scan_quarantined:
+                files_in.pop(rel, None)
+            entry['discarded'].extend(scan_discarded)
+            entry['quarantined'] = sorted(scan_quarantined)
             if confirm:
                 dest = store / 'unclaimed' / ('%s-%s' % (proj['key'], proj['slug']))
                 for rel, data in files_in.items():
                     p = dest / rel
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(data)
+                qdir = dest / '_quarantine'
+                for rel, data in scan_quarantined.items():
+                    p = qdir / rel.replace('/', '__')
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_bytes(data)
                 claim = {'key': proj['key'], 'slug': proj['slug'],
@@ -1434,7 +1842,8 @@ def import_bundle(bundle_dir, store, confirm=False):
                          'source_device_id': manifest['source_device_id'],
                          'pack_seq': proj.get('pack_seq'),
                          'imported_at': utc(), 'files': sorted(files_in),
-                         'marker_files': sorted(marker_files)}
+                         'marker_files': sorted(marker_files),
+                         'quarantined': sorted(scan_quarantined)}
                 save(dest / '_claim.json', claim)
                 index_path = store / 'unclaimed' / '_index.json'
                 index = read_json(index_path) if index_path.exists() else {'claims': []}
@@ -1450,17 +1859,21 @@ def import_bundle(bundle_dir, store, confirm=False):
         source_info = dict(source_base, seq=proj.get('pack_seq'))
         merge_result = merge_project(local_dir, files_in, source_info)
         merge_result['discarded'].extend(redacted_discarded)
+        merge_result['quarantined'].update(redacted_quarantined)
         entry['status'] = 'matched'
         entry['counts'] = merge_result['counts']
         entry['conflicts'] = merge_result['conflicts']
         entry['goal_action'] = merge_result['goal_action']
         entry['discarded'] = merge_result['discarded']
+        entry['quarantined'] = sorted(merge_result['quarantined'])
         entry['notes'] = merge_result['notes']
         entry['changed_files'] = sorted(merge_result['merged_files'])
         if confirm:
             landed = _land_project(store, local_dir, merge_result, source_info,
-                                   marker_files=marker_files)
+                                   marker_files=marker_files,
+                                   quarantined=merge_result['quarantined'])
             entry['merge_log'] = landed['merge_log']
+            entry['quarantined_files'] = landed['quarantined_files']
             report['merge_logs'].append(landed['merge_log'])
         report['projects'].append(entry)
     return report
@@ -1485,6 +1898,49 @@ def _git_branch(store):
     return 'main'
 
 
+# ---------------------------------------------------------------- git identity (batch 2, B5)
+# The store repo is relay's own activity repo, not the user's code repo:
+# when it has no local user.name/user.email (e.g. a sandbox with no
+# global git identity), the first pack used to die at commit time. The
+# tool now sets a LOCAL identity on the store repo only -- never a
+# global config -- and pre-checks it before the commit step so the
+# failure, if setting it is impossible, names the store and the remedy
+# instead of surfacing as a bare git error at step 5.
+GIT_IDENTITY_NAME = 'relay'
+GIT_IDENTITY_EMAIL = 'relay@project-relay.invalid'
+
+
+def _ensure_git_identity(store):
+    """Set a local git identity on the store repo when it has none.
+
+    Returns (name, email, changed): changed is True only when this call
+    wrote a value. An existing local identity -- including a user's own
+    name -- is never overwritten. Global config is never read for
+    writing and never written: `git config --local` (the default for
+    `git -C <repo> config` without --global) scopes to this repo."""
+    def _get(key):
+        r = relay.git(store, 'config', '--local', '--get', key, check=False)
+        return _text(r.stdout).strip() if r.returncode == 0 else ''
+    name = _get('user.name')
+    email = _get('user.email')
+    changed = False
+    if not name:
+        r = relay.git(store, 'config', '--local', 'user.name',
+                      GIT_IDENTITY_NAME, check=False)
+        require(r.returncode == 0,
+                '无法为记忆仓设置本地 git 身份（%s）：请手工运行 git -C %s '
+                'config user.name ... 后重试；全局配置未被改动' % (store, store))
+        name, changed = GIT_IDENTITY_NAME, True
+    if not email:
+        r = relay.git(store, 'config', '--local', 'user.email',
+                      GIT_IDENTITY_EMAIL, check=False)
+        require(r.returncode == 0,
+                '无法为记忆仓设置本地 git 身份（%s）：请手工运行 git -C %s '
+                'config user.email ... 后重试；全局配置未被改动' % (store, store))
+        email, changed = GIT_IDENTITY_EMAIL, True
+    return name, email, changed
+
+
 def _commit_if_changes(store, paths, message):
     """Stage exactly the given paths; commit only when staged diff exists.
     Returns the new HEAD SHA or None. Identity errors surface with a hint."""
@@ -1496,6 +1952,9 @@ def _commit_if_changes(store, paths, message):
     result = relay.git(store, 'diff', '--cached', '--quiet', check=False)
     if result.returncode == 0:
         return None
+    # B5: a store repo without any identity must not die here -- the
+    # local identity is ensured (local scope only) before committing.
+    _ensure_git_identity(store)
     result = relay.git(store, 'commit', '-m', message, check=False)
     if result.returncode != 0:
         raise RelayError('git commit 失败（请先设置 git user.name / user.email）：'
@@ -1602,11 +2061,19 @@ def _read_remote_bundle(clone_dir, key):
     return best, '%s-%s' % (key, slug)
 
 
-def _bundle_dir_from_clone(clone_dir, key, workdir):
+def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
+                           repin=False, store=None):
     """Materialize a verifiable bundle dir from a remote clone.
 
     The import pipeline only ever reads bundles, never the clone itself,
-    so clone-only state (git history, branches) cannot leak into merges."""
+    so clone-only state (git history, branches) cannot leak into merges.
+    Batch 2, B1: this is the git carrier's signature choke point -- every
+    git read (pack step 0, unpack, claim scan bundles) funnels through
+    here, so a tampered or re-keyed bundle fails here, before the import
+    pipeline lands anything. The verification outcome travels in the
+    rebuilt bundle manifest ('signature_verification') so import reports
+    and receipts carry the trace; a --repin acceptance additionally
+    writes a dedicated repin receipt under the store when known."""
     manifest, dirname = _read_remote_bundle(clone_dir, key)
     if manifest is None:
         return None
@@ -1639,6 +2106,25 @@ def _bundle_dir_from_clone(clone_dir, key, workdir):
         file_hashes[listed_rel] = _sha256(data)
         if rel.startswith('raw/') and rel.endswith('.md'):
             entry_count += 1
+    # B1: verify the signature over the RECOMPUTED hashes -- a pusher
+    # who rewrites a file changes its hash, which breaks the signature
+    # (they hold no private seed to re-sign), and a pusher who rewrites
+    # the manifest's own file_hashes field cannot help either, because
+    # verification never trusts that field, only disk bytes.
+    verification = verify_bundle_signature(manifest, file_hashes,
+                                           trust_unsigned=trust_unsigned,
+                                           repin=repin)
+    if verification.get('status') == 'repinned' and store is not None:
+        receipt = {'at': utc(), 'kind': 'repin',
+                   'source_device': manifest.get('source_device'),
+                   'source_device_id': manifest.get('source_device_id'),
+                   'previous_key_id': verification.get('previous_key_id'),
+                   'key_id': verification.get('key_id'),
+                   'pack_seq': manifest.get('pack_seq')}
+        save(Path(store) / 'sync-receipts' / ('repin-%s-%s.json'
+             % ((manifest.get('source_device_id') or 'unknown')[:8],
+                _compact_ts(utc()))), receipt)
+        verification = dict(verification, repin_receipt='sync-receipts/repin-*.json')
     entry = dict(manifest)
     entry['files'] = sorted(file_hashes)
     project_manifest = {'format': BUNDLE_FORMAT, 'format_major': FORMAT_MAJOR,
@@ -1652,7 +2138,8 @@ def _bundle_dir_from_clone(clone_dir, key, workdir):
                         'files': file_hashes,
                         'projects': [entry],
                         'encryption': manifest.get('encryption', 'none'),
-                        'encryption_salt': manifest.get('encryption_salt')}
+                        'encryption_salt': manifest.get('encryption_salt'),
+                        'signature_verification': verification}
     save(bundle / 'manifest.json', project_manifest)
     return bundle
 
@@ -2227,11 +2714,18 @@ def sync_setup(store, remote, device_name=None):
     config['device_name'] = device_name or config.get('device_name') or socket.gethostname()
     config['updated_at'] = utc()
     save_sync_config(store, config)
+    # Batch 2, B1: first git setup generates the device signing key
+    # (home-only, 0600). The key file lives outside the store, so setup
+    # on a second device generates a DIFFERENT key -- that is the point:
+    # each device signs with its own seed, and peers pin each device's
+    # public key separately (TOFU, see verify_bundle_signature).
+    sync_key = ensure_sync_key()
     registry = relay.load_registry(store)
     local_by_key = {r['key']: r for r in registry.get('projects', [])
                     if r.get('status', 'active') == 'active'}
     claims = []
-    notes = []
+    notes = ['同步签收密钥已生成（仅存本机 %s，0600 权限，私钥永不进包）：%s'
+             % (_sync_key_path(), sync_key['key_id'])]
     with tempfile.TemporaryDirectory(prefix='relay-setup-') as tmp:
         clone_dir = _clone(remote, tmp, checkout=_git_branch(store))
         if _clone_is_empty(clone_dir):
@@ -2260,6 +2754,17 @@ def sync_setup(store, remote, device_name=None):
 
 
 # ---------------------------------------------------------------- shared pack/unpack helpers (slice 2)
+def _normalize_branch(branch):
+    """Batch 2, B6: branch names compare after normalization -- the
+    archive baseline line may record the full ref (refs/heads/main)
+    while rev-parse reports the short name (main); they are the same
+    branch, and reporting a mismatch for them is pure noise."""
+    branch = (branch or '').strip()
+    if branch.startswith('refs/heads/'):
+        return branch[len('refs/heads/'):]
+    return branch
+
+
 def _consistency_audit(store, toplevel, store_dir):
     """Plan 2.5 step 3, report-only (never fails a pack): archive baseline
     branch vs current branch, dirty working files (capped at 20), drift
@@ -2273,7 +2778,7 @@ def _consistency_audit(store, toplevel, store_dir):
         audit['head'] = head
         state_text = (store_dir / 'archive' / 'state.md').read_text(encoding='utf-8')
         m = re.search(r'^- 当前分支@基线：([^@]+)@', state_text, re.MULTILINE)
-        if m and m.group(1) != branch:
+        if m and _normalize_branch(m.group(1)) != _normalize_branch(branch):
             audit['branch_mismatch'] = '档案基线分支 %s 与当前分支 %s 不一致' % (m.group(1), branch)
         dirty = _text(relay.git(toplevel, 'status', '--porcelain', check=False).stdout).splitlines()
         audit['dirty_files'] = dirty[:20]
@@ -2339,7 +2844,7 @@ def _ready_gate(store, rows):
 
 # ---------------------------------------------------------------- pack
 def _pack_git(store, toplevel, remote=None, device_name=None,
-              overwrite_unconsumed=False):
+              overwrite_unconsumed=False, trust_unsigned=False, repin=False):
     """Fixed pack order (plan 2.5): pull-merge, summarize, health, audit,
     redact-rescan, bundle/commit/push, receipt. Any step failure stops
     the pack with an actionable message; the sequence number is consumed
@@ -2348,7 +2853,10 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
     snapshot aborts the pack before anything is pushed) and its ref is
     pushed only AFTER the bundle push succeeds (so a failed pack never
     leaves a snapshot behind); overwrite_unconsumed is the explicit
-    confirmation for covering an unconsumed snapshot."""
+    confirmation for covering an unconsumed snapshot. Batch 2: B1
+    trust_unsigned/repin thread into the step-0 pull-merge (a tampered
+    remote bundle must stop the pack, not merge silently); B5 identity
+    is pre-checked after the step-2 health gate, before any commit."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     key = row['key']
     slug = row['slug']
@@ -2356,6 +2864,10 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
     remote = remote or cfg.get('remote')
     device = device_name or cfg.get('device_name') or socket.gethostname()
     device_id = cfg.get('device_id')
+    if not device_id:
+        device_id = uuid.uuid4().hex
+        cfg['device_id'] = device_id
+        save_sync_config(store, cfg)
     steps = []
     flow = _flow()
     # 0: pull first, merge deterministically (anti-overwrite discipline)
@@ -2364,7 +2876,9 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
         if _clone_is_empty(clone_dir):
             steps.append({'step': 0, 'status': 'skipped', 'note': '远端为空'})
         else:
-            bundle = _bundle_dir_from_clone(clone_dir, key, tmp)
+            bundle = _bundle_dir_from_clone(clone_dir, key, tmp,
+                                            trust_unsigned=trust_unsigned,
+                                            repin=repin, store=store)
             if bundle is None:
                 steps.append({'step': 0, 'status': 'skipped',
                               'note': '远端无本项目清单'})
@@ -2390,6 +2904,10 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
     if problems:
         raise RelayError('pack 步骤②健康检查失败：%s' % '；'.join(problems))
     steps.append({'step': 2, 'status': 'ok', 'warnings': warnings})
+    # Batch 2, B5: identity pre-check after the health gate and before
+    # any commit step -- a store repo that cannot take a local identity
+    # fails here with a named remedy, not as a bare git error at step 5.
+    _ensure_git_identity(store)
     # 3: archive/code consistency audit (report only, never fails)
     audit = _consistency_audit(store, toplevel, store_dir)
     steps.append({'step': 3, 'status': 'reported', 'audit': audit})
@@ -2419,6 +2937,14 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
         project_manifest['source_device_id'] = device_id
         project_manifest['exported_at'] = manifest['exported_at']
         project_manifest['format_minor'] = FORMAT_MINOR
+        # Batch 2, B1: the committed per-project manifest carries the
+        # signature over the full path->hash manifest (the same dict
+        # folder/server bundles hash-gate) plus the hash dict itself
+        # for readers that want it; verification recomputes hashes
+        # from disk and never trusts this stored copy.
+        project_manifest['file_hashes'] = dict(manifest['files'])
+        project_manifest['signature'] = sign_bundle_manifest(
+            device_id, manifest['exported_at'], seq, manifest['files'])
         save(manifest_path, project_manifest)
         stage = ['sync-manifests/' + manifest_path.name] + [
             f for f in manifest['files'] if f.startswith('projects/%s-%s/' % (key, slug))]
@@ -2638,13 +3164,15 @@ def pack_server(store, toplevel, device_name=None, backend=None):
 
 
 def pack(store, toplevel, remote=None, device_name=None, carrier=None,
-         overwrite_unconsumed=False):
+         overwrite_unconsumed=False, trust_unsigned=False, repin=False):
     """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior;
     folder and server packs share the 2.5 fixed order with carrier-
     specific step 0/5. The fixed order and fail-stop rule are identical
     across carriers; only the transport step differs. The WIP
     overwrite flag is git-only: folder/server carriers have no snapshot
-    channel (plan 2.6), so the flag is ignored there."""
+    channel (plan 2.6), so the flag is ignored there. Batch 2, B1:
+    trust_unsigned/repin are git-only (they gate the step-0 pull-merge
+    signature check) and ignored by the other carriers."""
     cfg = load_sync_config(store)
     c = _carrier_of(store, cfg, carrier)
     if c == 'folder':
@@ -2652,12 +3180,13 @@ def pack(store, toplevel, remote=None, device_name=None, carrier=None,
     if c == 'server':
         return pack_server(store, toplevel, device_name=device_name)
     return _pack_git(store, toplevel, remote=remote, device_name=device_name,
-                     overwrite_unconsumed=overwrite_unconsumed)
+                     overwrite_unconsumed=overwrite_unconsumed,
+                     trust_unsigned=trust_unsigned, repin=repin)
 
 
 # ---------------------------------------------------------------- unpack
 def _unpack_git(store, remote=None, confirm=False, project_keys=None,
-                toplevel=None):
+                toplevel=None, trust_unsigned=False, repin=False):
     """Pull from the git carrier and merge via the import pipeline.
 
     Dry-run (no --confirm) prints a preview and writes NOTHING. On confirm,
@@ -2697,7 +3226,9 @@ def _unpack_git(store, remote=None, confirm=False, project_keys=None,
             seen_keys.add(key)
             if project_keys and key not in project_keys:
                 continue
-            bundle = _bundle_dir_from_clone(clone_dir, key, tmp)
+            bundle = _bundle_dir_from_clone(clone_dir, key, tmp,
+                                            trust_unsigned=trust_unsigned,
+                                            repin=repin, store=store)
             if bundle is None:
                 reports.append({'key': key, 'status': 'skipped',
                                 'note': '远端无本项目清单'})
@@ -2875,13 +3406,14 @@ def unpack_server(store, confirm=False, project_keys=None, backend=None):
 
 
 def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None,
-           toplevel=None):
+           toplevel=None, trust_unsigned=False, repin=False):
     """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior
     (clone -> import -> commit, no push); folder verifies + reconciles
     the synced tree; server downloads -> import pipeline -> reconcile.
     All three end with the same 2.5.4 readiness gate. `toplevel` is the
     code checkout to restore a WIP snapshot into; it is git-only and
-    ignored by the folder/server carriers (no snapshot channel)."""
+    ignored by the folder/server carriers (no snapshot channel). Batch
+    2, B1: trust_unsigned/repin gate git signature verification only."""
     cfg = load_sync_config(store)
     c = _carrier_of(store, cfg, carrier)
     if c == 'folder':
@@ -2889,7 +3421,8 @@ def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None,
     if c == 'server':
         return unpack_server(store, confirm=confirm, project_keys=project_keys)
     return _unpack_git(store, remote=remote, confirm=confirm,
-                       project_keys=project_keys, toplevel=toplevel)
+                       project_keys=project_keys, toplevel=toplevel,
+                       trust_unsigned=trust_unsigned, repin=repin)
 
 
 # ---------------------------------------------------------------- claim / rollback / status
@@ -2922,28 +3455,37 @@ def sync_claim(store, key, toplevel, confirm=False):
     claim_dir, claim = found
     payload = {}
     for root, _dirs, files in os.walk(claim_dir):
+        # Batch 2, B2: the import-time quarantine subtree is evidence,
+        # not payload -- claiming must never resurrect quarantined
+        # entries into a merge (or report them as ignored files).
+        _dirs[:] = [d for d in _dirs if d != '_quarantine']
         for f in files:
             if f == '_claim.json':
                 continue
             p = Path(root) / f
             payload[str(p.relative_to(claim_dir))] = p.read_bytes()
-    files_in, _hits, marker_files, discarded = _redact_incoming(payload)
+    files_in, _hits, marker_files, discarded, redacted_quarantined = \
+        _redact_incoming(payload)
     source_info = {'device': claim.get('source_device'),
                    'device_id': claim.get('source_device_id'),
                    'seq': claim.get('pack_seq')}
     merge_result = merge_project(store_dir, files_in, source_info)
     merge_result['discarded'].extend(discarded)
+    merge_result['quarantined'].update(redacted_quarantined)
     report = {'key': key, 'slug': claim.get('slug'), 'status': 'matched',
               'counts': merge_result['counts'], 'conflicts': merge_result['conflicts'],
               'goal_action': merge_result['goal_action'],
               'discarded': merge_result['discarded'],
+              'quarantined': sorted(merge_result['quarantined']),
               'notes': merge_result['notes'],
               'changed_files': sorted(merge_result['merged_files']),
               'marker_files': sorted(marker_files)}
     if not confirm:
         return {'landed': False, 'report': report}
     landed = _land_project(store, store_dir, merge_result, source_info,
-                           marker_files=marker_files)
+                           marker_files=marker_files,
+                           quarantined=merge_result['quarantined'])
+    report['quarantined_files'] = landed['quarantined_files']
     report['merge_log'] = landed['merge_log']
     shutil.rmtree(claim_dir, ignore_errors=True)
     index_path = unclaimed / '_index.json'
