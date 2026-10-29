@@ -136,7 +136,17 @@ REDACT_PATTERNS = [
     ('jwt', re.compile(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+')),
     ('private_key', re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', re.DOTALL)),
     ('db_conn', re.compile(r'(?:postgres|postgresql|mysql|mongodb(?:\+srv)?|redis)://[^\s:@/]+:[^\s@/]+@[^\s]+')),
-    ('mobile_cn', re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')),
+    # P0 (2026-10-29): the old boundaries (?<!\d)/(?!\d) let a digit run
+    # inside a longer alphanumeric token match -- a 64-hex file hash with
+    # a hex letter on either side lost 11 digits to this pattern, which
+    # then broke entry fingerprint verification on import. A real phone
+    # number in prose is delimited by whitespace, punctuation, or CJK
+    # text (all non-ASCII-alphanumeric), so requiring non-alphanumeric
+    # neighbours keeps real numbers redacted while leaving hex hashes
+    # and other long tokens untouched. A number glued to ASCII letters
+    # (e.g. user13812345678) is deliberately NOT matched: it reads as
+    # part of an identifier, not a standalone number.
+    ('mobile_cn', re.compile(r'(?<![0-9A-Za-z])1[3-9]\d{9}(?![0-9A-Za-z])')),
     ('id_cn', re.compile(r'(?<!\d)[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)')),
     ('slack_token', re.compile(r'xox[baprs]-[A-Za-z0-9\-]{10,}')),
     ('openai_key', re.compile(r'sk-(?:proj-)?[A-Za-z0-9_\-]{20,}')),

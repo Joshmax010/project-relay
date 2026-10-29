@@ -166,11 +166,115 @@ def _collect_payload(store_dir):
     return out
 
 
+# Verification inputs inside a raw entry header. These are evidence, not
+# prose: the peer recomputes fact_hash from them, so redacting them would
+# silently rewrite what the peer verifies. P0 (2026-10-29 e2e): the
+# phone-number pattern deleted 11 digits out of a 64-hex file hash inside
+# fingerprint.code, every entry then failed id-hash verification on
+# import, and the rescan wrote the damage back locally. These fields are
+# never redacted at any level. 'anchor' duplicates fingerprint.anchor, so
+# it is protected too, to keep the two copies identical.
+_PROTECTED_HEADER_FIELDS = ('fingerprint', 'fact_hash', 'backfill', 'anchor')
+
+
+def _is_raw_entry_rel(rel):
+    """True for payload paths that are capture entry files (same predicate
+    as _is_payload_file's raw branch)."""
+    if not (rel.startswith(RAW_PREFIX) and rel.endswith('.md')):
+        return False
+    name = rel[len(RAW_PREFIX):]
+    return name.startswith('cap-') or name.startswith('archived/cap-')
+
+
+def _redact_header_value(value, flow):
+    """Redact one header value, recursing into containers. Protected
+    verification fields are passed through untouched at every level.
+    Returns (value, hits)."""
+    if isinstance(value, str):
+        return flow.redact(value)
+    if isinstance(value, dict):
+        out, hits = {}, 0
+        for k, v in value.items():
+            if k in _PROTECTED_HEADER_FIELDS:
+                out[k] = v
+            else:
+                out[k], n = _redact_header_value(v, flow)
+                hits += n
+        return out, hits
+    if isinstance(value, list):
+        out, hits = [], 0
+        for v in value:
+            nv, n = _redact_header_value(v, flow)
+            out.append(nv)
+            hits += n
+        return out, hits
+    return value, 0
+
+
+def _redact_entry_text(text, flow):
+    """Field-level redaction for one raw entry file. The body is redacted
+    in full; in the header, verification inputs are passed through
+    untouched and every other string leaf is redacted. The head is
+    re-serialized with the same settings capture uses, so a zero-hit
+    entry round-trips byte-identical. Raises ValueError on a malformed
+    entry (caller converts to a fail-closed RelayError)."""
+    head, body = text.split(BODY_DELIM, 1)
+    header = json.loads(head)
+    new_header, head_hits = _redact_header_value(header, flow)
+    new_body, body_hits = flow.redact(body)
+    new_head = json.dumps(new_header, ensure_ascii=False, sort_keys=True, indent=2)
+    return new_head + BODY_DELIM + new_body, head_hits + body_hits
+
+
+def _verify_redacted_entries(original, redacted):
+    """Fail-closed gate for the redact rescan (P0). Runs after redaction,
+    before the caller writes anything back or builds a bundle, so a
+    rescan that damages verification inputs aborts the pack with nothing
+    mutated: no local write-back, no bundle, no receipt.
+
+    For every raw entry: the protected verification fields must be
+    identical, and a non-degraded entry that fails verification after
+    redaction aborts the pack -- whether the damage came from the rescan
+    (verified before, broken after) or was already there (a hand-broken
+    fingerprint must not ship as a cleanly receipted bundle either).
+    Entries that were already unverifiable by design -- degraded
+    captures carry fact_hash None -- keep the peer's existing discard
+    behavior and must not brick packing; their protected fields are
+    still tripwired above."""
+    for rel in sorted(original):
+        if not _is_raw_entry_rel(rel):
+            continue
+        try:
+            old_text = original[rel].decode('utf-8')
+            old_header, _ = _parse_entry_text(old_text)
+        except (UnicodeDecodeError, RelayError, AttributeError, TypeError, ValueError):
+            raise RelayError('脱敏复扫无法建立验算基线，原料条目 %s 格式损坏，拒绝打包' % rel)
+        try:
+            new_text = redacted[rel].decode('utf-8')
+            new_header, _ = _parse_entry_text(new_text)
+        except (UnicodeDecodeError, RelayError, AttributeError, TypeError, ValueError):
+            raise RelayError('pack 已中止：脱敏复扫改动了验算字段，原料条目 %s 脱敏后无法解析；本地文件未改动，未装包' % rel)
+        for field in _PROTECTED_HEADER_FIELDS:
+            if old_header.get(field) != new_header.get(field):
+                raise RelayError('pack 已中止：脱敏复扫改动了验算字段，原料条目 %s 的 %s 被改动；本地文件未改动，未装包' % (rel, field))
+        if new_header.get('degraded'):
+            continue
+        if not _verify_entry_id(new_header):
+            if _verify_entry_id(old_header):
+                raise RelayError('pack 已中止：脱敏复扫改动了验算字段，原料条目 %s 的指纹验算失败；本地文件未改动，未装包' % rel)
+            raise RelayError('pack 已中止：原料条目 %s 指纹验算失败（装包前验门）；本地文件未改动，未装包' % rel)
+
+
 def _redact_payload(files):
     """Rescan every payload text as untrusted input. Returns (files, hits).
 
+    Raw entries get field-level redaction (body in full, header minus
+    verification inputs); every other payload file is redacted in full.
     All v1 payload files are UTF-8 text by construction; a non-UTF-8 file
-    aborts the export instead of shipping bytes nobody can audit."""
+    aborts the export instead of shipping bytes nobody can audit.
+    The verification gate runs here -- after redaction, before the caller
+    writes anything back or builds a bundle -- so a rescan that damages
+    verification inputs aborts the pack with nothing mutated (P0)."""
     flow = _flow()
     out = {}
     hits = 0
@@ -179,9 +283,18 @@ def _redact_payload(files):
             text = files[rel].decode('utf-8')
         except UnicodeDecodeError:
             raise RelayError('负载非 UTF-8 文本，拒绝导出：' + rel)
-        new_text, n = flow.redact(text)
-        hits += n
-        out[rel] = new_text.encode('utf-8')
+        if _is_raw_entry_rel(rel):
+            try:
+                new_text, n = _redact_entry_text(text, flow)
+            except ValueError:
+                raise RelayError('脱敏复扫无法解析原料条目 %s：格式损坏，拒绝打包' % rel)
+            out[rel] = new_text.encode('utf-8')
+            hits += n
+        else:
+            new_text, n = flow.redact(text)
+            out[rel] = new_text.encode('utf-8')
+            hits += n
+    _verify_redacted_entries(files, out)
     return out, hits
 
 
