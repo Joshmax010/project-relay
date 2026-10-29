@@ -1,4 +1,10 @@
-"""project-relay v2 sync (plan part 03, steps 2.1-2.2 + S6 merge on the v1 layout).
+"""project-relay v2 sync (plan part 03, steps 2.1-2.5 + S6 merge on the v1 layout).
+
+Slice 1 (2.1-2.2): carrier-independent import/export pipeline + git carrier.
+Slice 2 (2.3-2.5, this change): folder carrier (sync-folder store root,
+heartbeat locks, conflict-copy isolation, checksum manifest, bundle
+rollback) + server carrier (byte-path backends, atomic current swap,
+(seq, device_id) anti-overwrite key) + reminder-timing landing (2.5).
 
 Standard library only. Loaded lazily by scripts/relay.py like relay_flow and
 relay_backfill (each importlib load creates its own relayctl copy, so tests
@@ -65,7 +71,10 @@ def _flow():
 
 BUNDLE_FORMAT = 'project-relay-export'
 FORMAT_MAJOR = 1
-FORMAT_MINOR = 0
+# Minor 1 (slice 2): manifest gains the encryption reservation fields
+# (encryption / encryption_salt, plan 2.4.6). verify_bundle only warns on
+# minor mismatch, so minor-0 bundles still import.
+FORMAT_MINOR = 1
 TOOL_VERSION = 'project-relay-v2'
 MARKER_PREFIXES = ('<<<<<<<', '=======', '>>>>>>>')
 
@@ -128,6 +137,10 @@ def _no_symlink_components(base, rel):
 
 
 def _is_payload_file(rel):
+    # Rollback trash (plan 2.3.6) is archived, not deleted -- but it must
+    # never ship: it is yesterday's replaced bytes, not the live archive.
+    if rel.startswith('archive/rollback-trash/'):
+        return False
     if rel.startswith(ARCHIVE_PREFIX) or rel.startswith(RECEIPTS_PREFIX):
         return True
     if rel in STATE_INCLUDED or rel.startswith(STATE_SUMMARIES_PREFIX):
@@ -188,11 +201,15 @@ def _fix_local_redactions(store_dir, original, redacted):
 
 # ---------------------------------------------------------------- config
 def load_sync_config(store):
+    """Sync config, any carrier. Legacy git configs (remote, no carrier
+    key) are accepted; a dict with neither carrier nor remote is corrupt."""
     path = store / 'sync-config.json'
     if not path.exists():
         return None
     cfg = read_json(path)
-    require(isinstance(cfg, dict) and cfg.get('remote'), '同步配置损坏：' + str(path))
+    require(isinstance(cfg, dict) and
+            (cfg.get('carrier') in ('git', 'folder', 'server') or cfg.get('remote')),
+            '同步配置损坏：' + str(path))
     return cfg
 
 
@@ -202,6 +219,26 @@ def save_sync_config(store, cfg):
 
 def _device(store, cfg):
     return cfg.get('device_name') or 'device', cfg.get('device_id') or ''
+
+
+def _carrier_of(store, cfg, override=None):
+    """Resolve the carrier for a command (plan 2.3/2.4 dispatch).
+
+    Explicit --carrier wins; otherwise the config's carrier; a legacy
+    config with only a remote is git. No config at all is an error, not
+    a silent default: packing without setup must fail loudly."""
+    if override is not None:
+        require(override in ('git', 'folder', 'server'),
+                '未知载体：' + str(override))
+        return override
+    if cfg is None:
+        raise RelayError('未运行 sync-setup：请先运行 relay sync-setup 配置同步载体')
+    carrier = cfg.get('carrier')
+    if carrier in ('git', 'folder', 'server'):
+        return carrier
+    if cfg.get('remote'):
+        return 'git'
+    raise RelayError('同步配置损坏：' + str(Path(store) / 'sync-config.json'))
 
 
 def _receipt_path(store, kind, key):
@@ -265,6 +302,12 @@ def export_bundle(store, toplevels, dest_dir, device_name, device_id, pack_seqs=
         'tool_version': TOOL_VERSION, 'entry_count': entry_count,
         'redacted_count': redacted_total, 'files': manifest_files,
         'projects': projects_meta,
+        # Encryption reservation (plan 2.4.6, slice 2): whole-bundle
+        # encryption itself is deferred to volume 3, but the fields are
+        # fixed now. 'none' is the only value produced today; a future
+        # encrypted bundle must set encryption to its scheme name and
+        # encryption_salt to the derivation salt (format reserved).
+        'encryption': 'none', 'encryption_salt': None,
     }
     save(dest / 'manifest.json', manifest)
     return manifest
@@ -1133,6 +1176,9 @@ def _land_project(store, local_dir, merge_result, source_info, marker_files=None
                          % (shadow, '；'.join(problems)))
     backup = _land_files(local_dir, merge_result['merged_files'])
     shutil.rmtree(backup, ignore_errors=True)
+    # Slice 2 (plan 2.3.5): every landing refreshes the integrity manifest,
+    # so the next takeover's check runs against post-merge bytes.
+    relay.update_checksum_manifest(local_dir)
     if merge_result.get('pending_info') is not None:
         save(local_dir / 'state' / 'goal-imported.json',
              merge_result['pending_info'])
@@ -1484,9 +1530,548 @@ def _bundle_dir_from_clone(clone_dir, key, workdir):
                         'entry_count': entry_count,
                         'redacted_count': 0,
                         'files': file_hashes,
-                        'projects': [entry]}
+                        'projects': [entry],
+                        'encryption': manifest.get('encryption', 'none'),
+                        'encryption_salt': manifest.get('encryption_salt')}
     save(bundle / 'manifest.json', project_manifest)
     return bundle
+
+
+# ---------------------------------------------------------------- folder carrier (plan 2.3, slice 2)
+# The store root IS the sync folder: registry.json, projects/ and
+# sync-receipts/ all live under it and the sync service copies the whole
+# tree. No sync-service API is ever called and no sync progress is
+# observed; the tool only disciplines its own writes (atomic writes,
+# heartbeat locks, conflict-copy isolation, checksum manifest) and
+# refuses to build on a broken tree.
+CONFLICT_PATTERNS_NOTE = '同步服务典型冲突命名'
+
+
+def _is_conflict_name(name):
+    """A sync-service conflict copy? Matched on the BASENAME only, so a
+    conflict-named directory cannot condemn its children. Deliberately
+    NOT matched: 'goal-conflict.json' (a legitimate plan-2.6 marker: it
+    contains '-conflict.' but none of the patterns below, which all
+    require a space/paren prefix or the sync-conflict infix)."""
+    low = name.lower()
+    return ('冲突副本' in name or 'conflicted copy' in low
+            or '.sync-conflict-' in low or ' (conflict ' in low
+            or '（conflict' in name)
+
+
+def scan_folder_conflicts(store, isolate=True):
+    """Scan the whole store for sync-service conflict copies (plan 2.3.4).
+
+    trash/ (previous isolations) and sync-receipts/ (merge-log evidence)
+    and .git are never scanned, so isolating a file cannot re-isolate
+    its own preserved copy. With isolate=True each hit is MOVED (never
+    deleted) to trash/conflicts/<ts>/ (relative path with '/' -> '__')
+    and a conflicts-<ts>.json record lists the original paths; with
+    isolate=False only the list is returned. Returns
+    {found, isolated, report_path}."""
+    store = Path(store)
+    found = []
+    for path in sorted(store.rglob('*')):
+        if not path.is_file() or path.is_symlink():
+            continue
+        parts = path.relative_to(store).parts
+        if parts[0] in ('.git', 'trash', 'sync-receipts'):
+            continue
+        if _is_conflict_name(path.name):
+            found.append(path.relative_to(store).as_posix())
+    isolated = []
+    report_path = None
+    if found and isolate:
+        ts = _compact_ts(utc())
+        dest_dir = store / 'trash' / 'conflicts' / ts
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for rel in found:
+            dest = dest_dir / rel.replace('/', '__')
+            n = 2
+            while dest.exists():
+                dest = dest_dir / ('%s-%d' % (rel.replace('/', '__'), n))
+                n += 1
+            shutil.move(str(store / rel), str(dest))
+            isolated.append(rel)
+        report_path = store / 'trash' / 'conflicts' / ('conflicts-%s.json' % ts)
+        save(report_path, {'at': utc(), 'found': found, 'isolated': isolated})
+    return {'found': found, 'isolated': isolated,
+            'report_path': str(report_path) if report_path else None}
+
+
+def sync_setup_folder(store, device_name=None):
+    """Point the whole store at a sync folder (plan 2.3.1).
+
+    Refuses when the current default store already holds projects and is
+    a different directory: silently adopting a second store would strand
+    the existing archive. Writes {carrier: folder} config plus the
+    ~/.project-relay-location pointer (via relay.home_dir(), so tests
+    stay inside PROJECT_RELAY_HOME); device identity stays in the home
+    file, never inside the synced tree (two devices must never fight
+    over one device_id). Runs one conflict scan immediately."""
+    store = Path(store)
+    default = relay.default_store()
+    if default != store:
+        reg_path = default / 'registry.json'
+        if reg_path.exists():
+            try:
+                reg = read_json(reg_path)
+            except ValueError:
+                reg = {}
+            if any(r.get('status', 'active') == 'active'
+                   for r in reg.get('projects', [])):
+                raise RelayError(
+                    '本机默认记忆仓已有项目，与同步文件夹不是同一仓：'
+                    '请先在默认仓执行 pack 导出，或手动把项目迁移到同步文件夹后再 setup')
+    cfg = None
+    if (store / 'sync-config.json').exists():
+        try:
+            cfg = read_json(store / 'sync-config.json')
+        except ValueError:
+            cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg['carrier'] = 'folder'
+    cfg.pop('remote', None)
+    cfg.pop('server_type', None)
+    cfg.pop('server_url', None)
+    cfg.pop('server_user', None)
+    cfg.setdefault('device_id', uuid.uuid4().hex)
+    cfg['device_name'] = device_name or cfg.get('device_name') or socket.gethostname()
+    cfg['updated_at'] = utc()
+    save_sync_config(store, cfg)
+    atomic(relay.home_dir() / '.project-relay-location',
+           str(store).encode('utf-8'))
+    scan = scan_folder_conflicts(store, isolate=True)
+    notes = ['记忆仓已指向同步文件夹：' + str(store),
+             '此后默认命令读写该文件夹；换设备时把同步文件夹同步过去即可']
+    if scan['found']:
+        notes.append('发现 %d 个同步冲突副本，已隔离，未自动合并（见 %s）'
+                     % (len(scan['found']), scan['report_path']))
+    return {'config': cfg, 'store': str(store), 'scan': scan, 'notes': notes}
+
+
+# ---------------------------------------------------------------- server carrier (plan 2.4, slice 2)
+# Server-side zero logic: the server is a byte store addressed by path.
+# Remote layout per project key: relay/<key>/current/ holds one complete
+# bundle (manifest.json + projects/... files), relay/<key>/current-index.json
+# is a fast index written AFTER the swap (manifest.json inside current/ is
+# the authority -- an index write crash cannot corrupt comparisons).
+# Uploads go tmp dir -> read-back hash verify -> directory swap; a crash
+# mid-swap leaves current/ missing and .old-<seq>-<ts>/ present, which the
+# next read restores before anything else (see _read_server_current).
+# Anti-overwrite key is (pack_seq, device_id): an existing bundle wins
+# (upload refused) iff its seq is higher, or seq ties with a different
+# device; same-device same-seq with different bytes is that device's own
+# retry and is allowed (refusing it would brick the device after an
+# upload-success-but-seq-not-bumped crash window); identical bundle hash
+# is an idempotent retransmit and is allowed.
+SERVER_TYPES = ('webdav', 'sftp', 'https', 'local')
+
+
+def _server_rel(key, *parts):
+    return '/'.join(['relay', key] + list(parts))
+
+
+class LocalDirBackend:
+    """Local-directory stand-in for a server (tests + local: URLs).
+
+    Same method surface as the network backends: get/put/exists/list_dir/
+    rename/remove_tree over posix relative paths."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def _p(self, rel):
+        _jail_check(rel)
+        return self.root / rel
+
+    def exists(self, rel):
+        return self._p(rel).exists()
+
+    def get(self, rel):
+        p = self._p(rel)
+        return p.read_bytes() if p.is_file() else None
+
+    def put(self, rel, data):
+        p = self._p(rel)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+
+    def list_dir(self, rel):
+        p = self._p(rel)
+        return sorted(x.name for x in p.iterdir()) if p.is_dir() else []
+
+    def rename(self, src, dst):
+        s, d = self._p(src), self._p(dst)
+        require(s.exists(), '服务器上无此路径：' + src)
+        require(not d.exists(), '服务器目标路径已存在：' + dst)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        s.rename(d)
+
+    def remove_tree(self, rel):
+        shutil.rmtree(self._p(rel), ignore_errors=True)
+
+
+class FaultBackend:
+    """Wraps any backend and injects failures for tests (plan 2.4 tests).
+
+    put_fail_after=N writes only the first N bytes of a tmp-dir upload
+    then raises (simulated断线 mid-upload); get_fail makes every read
+    raise. All other methods delegate untouched."""
+
+    def __init__(self, inner, put_fail_after=None, get_fail=False):
+        self.inner = inner
+        self.put_fail_after = put_fail_after
+        self.get_fail = get_fail
+
+    def exists(self, rel):
+        return self.inner.exists(rel)
+
+    def get(self, rel):
+        if self.get_fail:
+            raise RelayError('模拟断线：读取失败')
+        return self.inner.get(rel)
+
+    def put(self, rel, data):
+        if self.put_fail_after is not None and '/.tmp-' in rel:
+            self.inner.put(rel, data[:self.put_fail_after])
+            raise RelayError('模拟断线：写入中断（临时文件已残留，正式版本未动）')
+        return self.inner.put(rel, data)
+
+    def list_dir(self, rel):
+        return self.inner.list_dir(rel)
+
+    def rename(self, src, dst):
+        return self.inner.rename(src, dst)
+
+    def remove_tree(self, rel):
+        return self.inner.remove_tree(rel)
+
+
+class CurlBackend:
+    """WebDAV / plain-HTTPS byte store via curl (plan 2.4.1).
+
+    NOT exercised against a real server in this slice (tests use
+    LocalDirBackend); the code path is straightforward curl and is
+    marked as such in v2-sync.md §9. get() returns None on any curl
+    failure (404 and network failure are indistinguishable here, and
+    the download path treats None as missing -- fail-closed).
+    rename() uses WebDAV MOVE; plain-HTTPS endpoints (allow_move=False)
+    cannot swap atomically and are refused at swap time."""
+
+    def __init__(self, base_url, token=None, allow_move=True):
+        self.base = base_url.rstrip('/')
+        self.token = token
+        self.allow_move = allow_move
+
+    def _url(self, rel):
+        from urllib.parse import quote
+        return self.base + '/' + '/'.join(quote(p) for p in rel.split('/'))
+
+    def _run(self, args, data=None):
+        cmd = ['curl', '-sf'] + args
+        if self.token:
+            cmd += ['-H', 'Authorization: Bearer ' + self.token]
+        return subprocess.run(cmd, input=data, capture_output=True)
+
+    def exists(self, rel):
+        return self._run(['-I', self._url(rel)]).returncode == 0
+
+    def get(self, rel):
+        r = self._run([self._url(rel)])
+        return r.stdout if r.returncode == 0 else None
+
+    def put(self, rel, data):
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(data)
+            tmp = tf.name
+        try:
+            r = self._run(['-X', 'PUT', '--data-binary', '@' + tmp,
+                           self._url(rel)])
+        finally:
+            os.unlink(tmp)
+        require(r.returncode == 0, '服务器上传失败：' + _text(r.stderr)[:200])
+
+    def list_dir(self, rel):
+        # WebDAV PROPFIND, Depth 1; href basenames only, best-effort.
+        r = self._run(['-X', 'PROPFIND', '-H', 'Depth: 1', self._url(rel)])
+        if r.returncode != 0:
+            return []
+        names = []
+        for m in re.finditer(rb'<(?:\w+:)?href>([^<]+)</(?:\w+:)?href>',
+                             r.stdout):
+            href = m.group(1).decode('utf-8', 'ignore').rstrip('/')
+            base = href.split('/')[-1]
+            if base and base not in names:
+                names.append(base)
+        return names
+
+    def rename(self, src, dst):
+        require(self.allow_move, 'HTTPS 端点不支持改名，无法原子换位')
+        r = self._run(['-X', 'MOVE', '-H', 'Destination: ' + self._url(dst),
+                       self._url(src)])
+        require(r.returncode == 0, '服务器改名失败：' + _text(r.stderr)[:200])
+
+    def remove_tree(self, rel):
+        self._run(['-X', 'DELETE', self._url(rel)])
+
+
+class SftpBackend:
+    """SFTP/rsync-over-SSH byte store (plan 2.4.1).
+
+    Endpoint form: [user@]host:/base/path. Authentication is the user's
+    ssh key/agent (no password handling here). Like CurlBackend, NOT
+    exercised against a real server in this slice."""
+
+    def __init__(self, endpoint, user=None):
+        m = re.match(r'^(?:([^@]+)@)?([^:]+):(.+)$', endpoint or '')
+        require(m, 'SFTP 端点格式错误，应为 [user@]host:/base/path：' + str(endpoint))
+        self.user = user or m.group(1)
+        self.host = m.group(2)
+        self.base = m.group(3).rstrip('/')
+        require(self.host and self.base, 'SFTP 端点缺少 host 或路径')
+
+    def _remote(self, rel):
+        prefix = ('%s@' % self.user) if self.user else ''
+        return '%s%s:%s/%s' % (prefix, self.host, self.base, rel)
+
+    def _ssh(self, script):
+        r = subprocess.run(['ssh', self.host, script], capture_output=True)
+        require(r.returncode == 0, 'SSH 命令失败：' + _text(r.stderr)[:200])
+        return r
+
+    def _rsync(self, src, dst):
+        r = subprocess.run(['rsync', '-az', '-e', 'ssh', src, dst],
+                           capture_output=True)
+        require(r.returncode == 0, 'rsync 失败：' + _text(r.stderr)[:200])
+
+    def exists(self, rel):
+        r = subprocess.run(['ssh', self.host, 'test', '-e',
+                            '%s/%s' % (self.base, rel)], capture_output=True)
+        return r.returncode == 0
+
+    def get(self, rel):
+        with tempfile.TemporaryDirectory(prefix='relay-sftp-') as tmp:
+            target = Path(tmp) / 'file'
+            r = subprocess.run(['rsync', '-az', '-e', 'ssh', self._remote(rel),
+                                str(target)], capture_output=True)
+            return target.read_bytes() if r.returncode == 0 and target.is_file() else None
+
+    def put(self, rel, data):
+        with tempfile.TemporaryDirectory(prefix='relay-sftp-') as tmp:
+            target = Path(tmp) / 'file'
+            target.write_bytes(data)
+            parent = '%s/%s' % (self.base, '/'.join(rel.split('/')[:-1]))
+            self._ssh('mkdir -p %s' % parent)
+            self._rsync(str(target), self._remote(rel))
+
+    def list_dir(self, rel):
+        r = subprocess.run(['ssh', self.host, 'ls', '-1',
+                            '%s/%s' % (self.base, rel)], capture_output=True)
+        return _text(r.stdout).splitlines() if r.returncode == 0 else []
+
+    def rename(self, src, dst):
+        self._ssh('mv %s/%s %s/%s' % (self.base, src, self.base, dst))
+
+    def remove_tree(self, rel):
+        self._ssh('rm -rf %s/%s' % (self.base, rel))
+
+
+def _server_backend(store, cfg):
+    """Backend from a server-carrier config (plan 2.4.5: address + user
+    in config, token only in the separate credentials file, never in the
+    bundle and never printed)."""
+    stype = cfg.get('server_type')
+    url = cfg.get('server_url')
+    require(stype in SERVER_TYPES and url,
+            '服务器配置不完整：请先运行 relay sync-setup --carrier server')
+    if stype == 'local':
+        root = url[6:] if url.startswith('local:') else url
+        return LocalDirBackend(root)
+    token = None
+    cred = cfg.get('credential_file')
+    if cred:
+        cred_path = Path(cred) if Path(cred).is_absolute() else Path(store) / cred
+        if cred_path.exists():
+            try:
+                token = read_json(cred_path).get('token')
+            except ValueError:
+                token = None
+    if stype == 'sftp':
+        return SftpBackend(url, user=cfg.get('server_user'))
+    return CurlBackend(url, token=token, allow_move=(stype == 'webdav'))
+
+
+def _read_server_current(backend, key):
+    """Current bundle info for a project, restoring a crashed swap first.
+
+    Returns None when the server holds nothing for the key. Raises when
+    current/ exists but has no readable manifest (unknown state must
+    block an upload, never be overwritten blind)."""
+    base = _server_rel(key)
+    names = backend.list_dir(base)
+    if 'current' not in names:
+        olds = sorted(n for n in names if n.startswith('.old-'))
+        if not olds:
+            return None
+        backend.rename('%s/%s' % (base, olds[-1]), base + '/current')
+    raw = backend.get(base + '/current/manifest.json')
+    if raw is None:
+        raise RelayError('服务器 current 缺少 manifest.json（可能换位中断后未恢复），'
+                         '请检查服务器端 %s/current' % base)
+    try:
+        manifest = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        raise RelayError('服务器 current 的 manifest.json 无法解析，拒绝覆盖')
+    projects = manifest.get('projects') or []
+    seq = projects[0].get('pack_seq') if projects else None
+    device_id = manifest.get('source_device_id')
+    if seq is None:
+        # Standalone exports carry pack_seq=None in their manifest; the
+        # index written by upload_server_bundle (same swap) carries the
+        # seq the upload was issued with, so fall back to it rather
+        # than comparing against an unknown (None would disable the
+        # anti-overwrite key entirely).
+        index_raw = backend.get(base + '/current-index.json')
+        if index_raw is not None:
+            try:
+                index = json.loads(index_raw.decode('utf-8'))
+                seq = index.get('seq')
+                device_id = device_id or index.get('device_id')
+            except (ValueError, UnicodeDecodeError):
+                pass
+    return {'seq': seq, 'device_id': device_id,
+            'device_name': manifest.get('source_device'),
+            'exported_at': manifest.get('exported_at'),
+            'bundle_hash': _sha256(raw), 'manifest': manifest,
+            'manifest_raw': raw}
+
+
+def upload_server_bundle(backend, key, bundle_dir, seq, device_id,
+                         device_name=None):
+    """Atomic-ish server upload (plan 2.4.2-2.4.3).
+
+    Verifies the bundle first (import-grade validation), refuses a
+    newer existing bundle, writes a tmp dir, reads every file back and
+    compares hashes, then swaps tmp into current/ (previous current/
+    parked as .old-*, removed after the swap). A failure before the swap
+    leaves the formal version untouched; a crash during the swap is
+    recovered by _read_server_current on the next read. The sequence
+    number is NOT consumed here -- the caller bumps pack-seq only after
+    this returns (plan 2.4.3 / slice-1 rule)."""
+    manifest, files, _warnings = verify_bundle(bundle_dir)
+    bundle = Path(bundle_dir)
+    new_hash = _sha256((bundle / 'manifest.json').read_bytes())
+    current = _read_server_current(backend, key)
+    if current is not None:
+        if current['bundle_hash'] == new_hash:
+            return {'status': 'unchanged', 'seq': seq,
+                    'bundle_hash': new_hash}
+        eseq, edev = current['seq'], current['device_id']
+        if eseq is not None and seq is not None:
+            if eseq > seq or (eseq == seq and edev != device_id):
+                raise RelayError(
+                    '服务器上已有更新的包（seq %s，设备 %s），拒绝覆盖：'
+                    '先在本机拉取最新包合并，再重新导出' % (eseq, edev))
+    base = _server_rel(key)
+    tmp = '%s/.tmp-%s-%s' % (base, seq, (device_id or 'nodev')[:8])
+    backend.remove_tree(tmp)  # stale tmp from a crashed earlier upload
+    ordered = ['manifest.json'] + sorted(files)
+    for rel in ordered:
+        data = (bundle / 'manifest.json').read_bytes() if rel == 'manifest.json' \
+            else files[rel]
+        backend.put('%s/%s' % (tmp, rel), data)
+    for rel in ordered:
+        got = backend.get('%s/%s' % (tmp, rel))
+        want = (bundle / 'manifest.json').read_bytes() if rel == 'manifest.json' \
+            else files[rel]
+        require(got == want, '远端字节校验失败，正式版本未动：' + rel)
+    old = None
+    try:
+        if backend.exists(base + '/current'):
+            old = '%s/.old-%s-%s' % (base, seq, _compact_ts(utc()))
+            backend.rename(base + '/current', old)
+        backend.rename(tmp, base + '/current')
+    except Exception:
+        if old is not None and not backend.exists(base + '/current'):
+            try:
+                backend.rename(old, base + '/current')
+            except Exception:
+                pass
+        raise
+    if old is not None:
+        backend.remove_tree(old)
+    index = {'seq': seq, 'device_id': device_id, 'device_name': device_name,
+             'bundle_hash': new_hash, 'exported_at': manifest.get('exported_at'),
+             'updated_at': utc()}
+    backend.put(base + '/current-index.json',
+                json.dumps(index, ensure_ascii=False).encode('utf-8'))
+    return {'status': 'uploaded', 'seq': seq, 'device_id': device_id,
+            'bundle_hash': new_hash, 'exported_at': manifest.get('exported_at')}
+
+
+def download_server_bundle(backend, key, dest_dir):
+    """Download current/ into a bundle dir, hash-checking every file
+    against the server manifest (plan 2.4.4: download feeds the 2.1
+    import pipeline, never a shortcut overwrite)."""
+    current = _read_server_current(backend, key)
+    if current is None:
+        raise RelayError('服务器上无本项目包：' + _server_rel(key, 'current'))
+    manifest = current['manifest']
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / 'manifest.json').write_bytes(current['manifest_raw'])
+    for rel, want in (manifest.get('files') or {}).items():
+        data = backend.get(_server_rel(key, 'current', rel))
+        require(data is not None, '远端包文件缺失：' + rel)
+        require(_sha256(data) == want, '远端包文件哈希不符：' + rel)
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    return dest
+
+
+def sync_setup_server(store, server_type, server_url, server_user=None,
+                      token=None, device_name=None):
+    """Server-carrier config (plan 2.4.5): address + user in
+    sync-config.json; a token, when given, goes ONLY to the separate
+    sync-credentials.json (0600) referenced by pointer, never into the
+    config and never into any bundle. Setup without a token still
+    succeeds (token can be added later)."""
+    store = Path(store)
+    require(server_type in SERVER_TYPES, '未知服务器类型：' + str(server_type))
+    require(server_url, '服务器地址必填（--server-url）')
+    cfg = None
+    if (store / 'sync-config.json').exists():
+        try:
+            cfg = read_json(store / 'sync-config.json')
+        except ValueError:
+            cfg = None
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cfg['carrier'] = 'server'
+    cfg.pop('remote', None)
+    cfg['server_type'] = server_type
+    cfg['server_url'] = server_url
+    if server_user:
+        cfg['server_user'] = server_user
+    cfg.setdefault('device_id', uuid.uuid4().hex)
+    cfg['device_name'] = device_name or cfg.get('device_name') or socket.gethostname()
+    cfg['updated_at'] = utc()
+    notes = ['服务器载体已配置：%s %s' % (server_type, server_url)]
+    if token is not None:
+        cred_path = store / 'sync-credentials.json'
+        save(cred_path, {'token': token})
+        os.chmod(cred_path, 0o600)
+        cfg['credential_file'] = 'sync-credentials.json'
+        notes.append('凭据已单独存入 sync-credentials.json（0600 权限），'
+                     '仍属本机明文：请保护本机账户安全；凭据永不进入导出包')
+    else:
+        notes.append('未提供凭据：需要时可用 sync-setup --server-token 补录'
+                     '（或设 RELAY_SERVER_TOKEN 环境变量）')
+    save_sync_config(store, cfg)
+    return {'config': cfg, 'notes': notes}
 
 
 # ---------------------------------------------------------------- setup
@@ -1554,8 +2139,86 @@ def sync_setup(store, remote, device_name=None):
     return {'config': config, 'claims': claims, 'notes': notes}
 
 
+# ---------------------------------------------------------------- shared pack/unpack helpers (slice 2)
+def _consistency_audit(store, toplevel, store_dir):
+    """Plan 2.5 step 3, report-only (never fails a pack): archive baseline
+    branch vs current branch, dirty working files (capped at 20), drift
+    count. Drift is normal; this only reports it."""
+    flow = _flow()
+    audit = {}
+    try:
+        branch = _text(relay.git(toplevel, 'rev-parse', '--abbrev-ref', 'HEAD').stdout).strip()
+        head = _text(relay.git(toplevel, 'rev-parse', 'HEAD').stdout).strip()
+        audit['branch'] = branch
+        audit['head'] = head
+        state_text = (store_dir / 'archive' / 'state.md').read_text(encoding='utf-8')
+        m = re.search(r'^- 当前分支@基线：([^@]+)@', state_text, re.MULTILINE)
+        if m and m.group(1) != branch:
+            audit['branch_mismatch'] = '档案基线分支 %s 与当前分支 %s 不一致' % (m.group(1), branch)
+        dirty = _text(relay.git(toplevel, 'status', '--porcelain', check=False).stdout).splitlines()
+        audit['dirty_files'] = dirty[:20]
+        audit['dirty_truncated'] = len(dirty) > 20
+        measure = flow.measure_change(store, toplevel)
+        audit['drift'] = measure.get('drift_count')
+    except Exception as exc:
+        audit['error'] = str(exc)
+    return audit
+
+
+def _reconcile_note(store, row):
+    """One read-only reconcile line for a project (plan 2.5.4): goal
+    status, pending count, code branch/HEAD. Mirrors the slice-1 git
+    unpack loop; missing code paths yield a note without branch fields
+    (the caller skips such rows when the toplevel is not a local dir)."""
+    store_dir = relay.project_store_dir(store, row)
+    note = {'key': row['key'], 'slug': row['slug']}
+    try:
+        note['goal_status'] = relay.goal_status(store, row['paths'][0])[0]
+    except Exception as exc:
+        note['goal_status'] = 'error: %s' % exc
+    try:
+        note['pending'] = _flow().queue_status(store_dir, repair=False)['pending']
+    except Exception as exc:
+        note['pending_error'] = str(exc)
+    try:
+        note['branch'] = _text(relay.git(
+            row['paths'][0], 'rev-parse', '--abbrev-ref', 'HEAD').stdout).strip()
+        note['head'] = _text(relay.git(
+            row['paths'][0], 'rev-parse', 'HEAD').stdout).strip()
+    except Exception:
+        pass
+    return note
+
+
+def _ready_gate(store, rows):
+    """Plan 2.5.4 readiness gate: ready iff every project passes health,
+    has no tampered goal, and has no checksum-manifest mismatch. Branch
+    drift and other normal differences are listed by reconcile, not
+    blockers (see v2-sync.md §9, D-sync-17)."""
+    problems = []
+    for row in rows:
+        store_dir = relay.project_store_dir(store, row)
+        if not store_dir.is_dir():
+            continue
+        probs, _warnings = health_check(store_dir)
+        if probs:
+            problems.append('%s 健康检查失败：%s' % (row['slug'], '；'.join(probs)))
+        try:
+            status = relay.goal_status(store, row['paths'][0])[0] \
+                if row.get('paths') else None
+        except Exception:
+            status = None
+        if status == 'tampered':
+            problems.append('%s 目标被篡改（tampered），请先处理目标冲突' % row['slug'])
+        _present, mismatches = relay.verify_checksum_manifest(store_dir)
+        if mismatches:
+            problems.append('%s 校验清单不符：%s'
+                            % (row['slug'], '、'.join(m['file'] for m in mismatches)))
+    return (not problems, problems)
+
+
 # ---------------------------------------------------------------- pack
-def pack(store, toplevel, remote=None, device_name=None):
+def _pack_git(store, toplevel, remote=None, device_name=None):
     """Fixed pack order (plan 2.5): pull-merge, summarize, health, audit,
     redact-rescan, bundle/commit/push, receipt. Any step failure stops
     the pack with an actionable message; the sequence number is consumed
@@ -1602,23 +2265,7 @@ def pack(store, toplevel, remote=None, device_name=None):
         raise RelayError('pack 步骤②健康检查失败：%s' % '；'.join(problems))
     steps.append({'step': 2, 'status': 'ok', 'warnings': warnings})
     # 3: archive/code consistency audit (report only, never fails)
-    audit = {}
-    try:
-        branch = _text(relay.git(toplevel, 'rev-parse', '--abbrev-ref', 'HEAD').stdout).strip()
-        head = _text(relay.git(toplevel, 'rev-parse', 'HEAD').stdout).strip()
-        audit['branch'] = branch
-        audit['head'] = head
-        state_text = (store_dir / 'archive' / 'state.md').read_text(encoding='utf-8')
-        m = re.search(r'^- 当前分支@基线：([^@]+)@', state_text, re.MULTILINE)
-        if m and m.group(1) != branch:
-            audit['branch_mismatch'] = '档案基线分支 %s 与当前分支 %s 不一致' % (m.group(1), branch)
-        dirty = _text(relay.git(toplevel, 'status', '--porcelain', check=False).stdout).splitlines()
-        audit['dirty_files'] = dirty[:20]
-        audit['dirty_truncated'] = len(dirty) > 20
-        measure = flow.measure_change(store, toplevel)
-        audit['drift'] = measure.get('drift_count')
-    except Exception as exc:
-        audit['error'] = str(exc)
+    audit = _consistency_audit(store, toplevel, store_dir)
     steps.append({'step': 3, 'status': 'reported', 'audit': audit})
     # 4: redact rescan (repairs local files, counts only)
     payload = _collect_payload(store_dir)
@@ -1684,8 +2331,181 @@ def pack(store, toplevel, remote=None, device_name=None):
             'commit': commit, 'manifest': manifest}
 
 
+def pack_folder(store, toplevel, device_name=None):
+    """Folder-carrier pack (plan 2.3 + 2.5 fixed order).
+
+    No bundle, no commit, no sequence number: the synced folder IS the
+    transport, so "packing" means: isolate conflict copies, refuse on a
+    broken checksum manifest, force-summarize (a foreign heartbeat aborts
+    the pack -- never pack with unsummarized raw), health gate, audit,
+    redact rescan, refresh the checksum manifest, write a pack receipt.
+    Any step failure stops the pack with an actionable message."""
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    key, slug = row['key'], row['slug']
+    cfg = load_sync_config(store)
+    device = device_name or cfg.get('device_name') or socket.gethostname()
+    device_id = cfg.get('device_id') or ''
+    steps = []
+    flow = _flow()
+    scan = scan_folder_conflicts(store, isolate=True)
+    steps.append({'step': 0, 'status': 'conflicts-isolated' if scan['found'] else 'clean',
+                  'found': scan['found'], 'report': scan['report_path']})
+    present, mismatches = relay.verify_checksum_manifest(store_dir)
+    if present and mismatches:
+        raise RelayError('pack 中止：校验清单不符（可能被同步截断/冲突污染）：%s；'
+                         '先从其他设备或最近导出包恢复，恢复前不汇总、不写档案'
+                         % '、'.join(m['file'] for m in mismatches))
+    summary_seq = None
+    status = flow.queue_status(store_dir, repair=False)
+    if status['pending'] > 0:
+        try:
+            result = flow.summarize(store, toplevel, source='pack',
+                                    semantic_text=None)
+        except Exception as exc:
+            raise RelayError('pack 步骤①汇总失败：%s；请先手工运行 relay summarize 排查'
+                             % exc)
+        if isinstance(result, dict) and result.get('degraded'):
+            raise RelayError('pack 中止：另一台设备近期在写此项目，本次只采集不汇总；'
+                             '请等对方写完后再 pack，不要带着未汇总原料打包')
+        summary_seq = result
+        steps.append({'step': 1, 'status': 'summarized', 'seq': summary_seq})
+    else:
+        steps.append({'step': 1, 'status': 'noop'})
+    problems, warnings = health_check(store_dir)
+    if problems:
+        raise RelayError('pack 步骤②健康检查失败：%s' % '；'.join(problems))
+    steps.append({'step': 2, 'status': 'ok', 'warnings': warnings})
+    audit = _consistency_audit(store, toplevel, store_dir)
+    steps.append({'step': 3, 'status': 'reported', 'audit': audit})
+    payload = _collect_payload(store_dir)
+    cleaned, hits = _redact_payload(payload)
+    fixed = _fix_local_redactions(store_dir, payload, cleaned)
+    steps.append({'step': 4, 'status': 'ok', 'redacted_count': hits,
+                  'fixed_local': fixed})
+    manifest_count = relay.update_checksum_manifest(store_dir)
+    steps.append({'step': 5, 'status': 'ok', 'checksum_files': manifest_count})
+    summaries_dir = store_dir / 'state' / 'summaries'
+    receipt = {'at': utc(), 'kind': 'pack', 'carrier': 'folder', 'remote': None,
+               'device_name': device, 'device_id': device_id,
+               'project_key': key, 'project_slug': slug, 'seq': None,
+               'commit': None,
+               'entry_count': len([r for r in payload
+                                   if r.startswith(RAW_PREFIX) and r.endswith('.md')]),
+               'summary_count': len(list(summaries_dir.glob('*.json')))
+               if summaries_dir.is_dir() else 0,
+               'file_count': len(payload),
+               'redacted_count': hits, 'summary_seq': summary_seq,
+               'scan': scan, 'steps': steps}
+    receipt_path = _receipt_path(store, 'pack', key)
+    save(receipt_path, receipt)
+    return {'receipt': receipt, 'receipt_path': str(receipt_path), 'seq': None,
+            'commit': None, 'manifest': None}
+
+
+def pack_server(store, toplevel, device_name=None, backend=None):
+    """Server-carrier pack (plan 2.4 + 2.5 fixed order).
+
+    Step 0 pulls the server's current bundle and merges it (server empty
+    -> skip; pull failure aborts); steps 1-4 mirror the git pack; step 5
+    uploads (upload failure aborts WITHOUT consuming the sequence
+    number); step 6 writes a server pack receipt (server_url recorded,
+    credentials never)."""
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    key, slug = row['key'], row['slug']
+    cfg = load_sync_config(store)
+    backend = backend or _server_backend(store, cfg)
+    device = device_name or cfg.get('device_name') or socket.gethostname()
+    device_id = cfg.get('device_id') or ''
+    steps = []
+    flow = _flow()
+    # 0: pull first, merge deterministically (anti-overwrite discipline)
+    try:
+        with tempfile.TemporaryDirectory(prefix='relay-pack-server-') as tmp:
+            bundle = download_server_bundle(backend, key, Path(tmp) / 'bundle')
+            merged = import_bundle(bundle, store, confirm=True)
+            steps.append({'step': 0, 'status': 'merged', 'report': merged})
+    except RelayError as exc:
+        if '服务器上无本项目包' in str(exc):
+            steps.append({'step': 0, 'status': 'skipped', 'note': '服务器为空'})
+        else:
+            raise RelayError('pack 步骤⓪拉取合并失败：%s；请检查服务器地址与网络后重试'
+                             % exc)
+    # 1: forced summarize (pending only, deterministic minimal increment)
+    summary_seq = None
+    status = flow.queue_status(store_dir, repair=False)
+    if status['pending'] > 0:
+        try:
+            summary_seq = flow.summarize(store, toplevel, source='pack',
+                                         semantic_text=None)
+        except Exception as exc:
+            raise RelayError('pack 步骤①汇总失败：%s；请先手工运行 relay summarize 排查'
+                             % exc)
+        steps.append({'step': 1, 'status': 'summarized', 'seq': summary_seq})
+    else:
+        steps.append({'step': 1, 'status': 'noop'})
+    # 2: health gate
+    problems, warnings = health_check(store_dir)
+    if problems:
+        raise RelayError('pack 步骤②健康检查失败：%s' % '；'.join(problems))
+    steps.append({'step': 2, 'status': 'ok', 'warnings': warnings})
+    # 3: archive/code consistency audit (report only, never fails)
+    audit = _consistency_audit(store, toplevel, store_dir)
+    steps.append({'step': 3, 'status': 'reported', 'audit': audit})
+    # 4: redact rescan (repairs local files, counts only)
+    payload = _collect_payload(store_dir)
+    cleaned, hits = _redact_payload(payload)
+    fixed = _fix_local_redactions(store_dir, payload, cleaned)
+    steps.append({'step': 4, 'status': 'ok', 'redacted_count': hits,
+                  'fixed_local': fixed})
+    # 5: bundle + upload (sequence consumed only after a successful upload)
+    seq_path = store_dir / 'state' / 'pack-seq.json'
+    seq = read_json(seq_path)['next_seq'] if seq_path.exists() else 1
+    with tempfile.TemporaryDirectory(prefix='relay-pack-server-') as tmp:
+        staging = Path(tmp) / 'bundle'
+        manifest = export_bundle(store, [toplevel], staging, device, device_id,
+                                 pack_seqs={key: seq})
+        try:
+            uploaded = upload_server_bundle(backend, key, staging, seq,
+                                            device_id, device_name=device)
+        except RelayError as exc:
+            raise RelayError('pack 步骤⑤上传失败：%s；序列号未消耗，可直接重试'
+                             % exc)
+    save(seq_path, {'next_seq': seq + 1})
+    summaries_dir = store_dir / 'state' / 'summaries'
+    receipt = {'at': utc(), 'kind': 'pack', 'carrier': 'server',
+               'server_url': cfg.get('server_url'),
+               'server_type': cfg.get('server_type'),
+               'device_name': device, 'device_id': device_id,
+               'project_key': key, 'project_slug': slug, 'seq': seq,
+               'commit': None, 'upload': uploaded,
+               'entry_count': manifest['entry_count'],
+               'summary_count': len(list(summaries_dir.glob('*.json')))
+               if summaries_dir.is_dir() else 0,
+               'file_count': len(manifest['files']),
+               'redacted_count': hits, 'summary_seq': summary_seq,
+               'pull_merge': steps[0], 'audit': audit, 'steps': steps}
+    receipt_path = _receipt_path(store, 'pack', key)
+    save(receipt_path, receipt)
+    return {'receipt': receipt, 'receipt_path': str(receipt_path), 'seq': seq,
+            'commit': None, 'manifest': manifest}
+
+
+def pack(store, toplevel, remote=None, device_name=None, carrier=None):
+    """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior;
+    folder and server packs share the 2.5 fixed order with carrier-
+    specific step 0/5. The fixed order and fail-stop rule are identical
+    across carriers; only the transport step differs."""
+    cfg = load_sync_config(store)
+    c = _carrier_of(store, cfg, carrier)
+    if c == 'folder':
+        return pack_folder(store, toplevel, device_name=device_name)
+    if c == 'server':
+        return pack_server(store, toplevel, device_name=device_name)
+    return _pack_git(store, toplevel, remote=remote, device_name=device_name)
+
+
 # ---------------------------------------------------------------- unpack
-def unpack(store, remote=None, confirm=False, project_keys=None):
+def _unpack_git(store, remote=None, confirm=False, project_keys=None):
     """Pull from the git carrier and merge via the import pipeline.
 
     Dry-run (no --confirm) prints a preview and writes NOTHING. On confirm,
@@ -1755,6 +2575,7 @@ def unpack(store, remote=None, confirm=False, project_keys=None):
         if head.returncode == 0:
             commit = _text(head.stdout).strip()
         reconcile = []
+        matched_rows = []
         for proj in [r for r in reports if 'report' in r]:
             for entry in proj['report']['projects']:
                 if entry.get('status') != 'matched':
@@ -1763,36 +2584,140 @@ def unpack(store, remote=None, confirm=False, project_keys=None):
                             if x.get('key') == entry['key']), None)
                 if row is None or not row.get('paths'):
                     continue
-                toplevel = row['paths'][0]
-                if not Path(toplevel).is_dir():
+                if not Path(row['paths'][0]).is_dir():
                     continue
-                store_dir = relay.project_store_dir(store, row)
-                note = {'key': entry['key'], 'slug': entry['slug']}
-                try:
-                    note['goal_status'] = relay.goal_status(store, toplevel)[0]
-                except Exception as exc:
-                    note['goal_status'] = 'error: %s' % exc
-                try:
-                    note['pending'] = _flow().queue_status(store_dir, repair=False)['pending']
-                except Exception as exc:
-                    note['pending_error'] = str(exc)
-                try:
-                    note['branch'] = _text(relay.git(
-                        toplevel, 'rev-parse', '--abbrev-ref', 'HEAD').stdout).strip()
-                    note['head'] = _text(relay.git(
-                        toplevel, 'rev-parse', 'HEAD').stdout).strip()
-                except Exception:
-                    pass
-                reconcile.append(note)
+                matched_rows.append(row)
+                reconcile.append(_reconcile_note(store, row))
+        ready, ready_problems = _ready_gate(store, matched_rows)
         receipt = {'at': utc(), 'kind': 'unpack', 'carrier': 'git', 'remote': remote,
                    'device_name': cfg.get('device_name'),
                    'device_id': cfg.get('device_id'), 'commit': commit,
                    'history_merge': history_merge,
-                   'reports': reports, 'reconcile': reconcile}
+                   'reports': reports, 'reconcile': reconcile,
+                   'ready': ready, 'ready_problems': ready_problems}
         receipt_path = _receipt_path(store, 'unpack', '')
         save(receipt_path, receipt)
         return {'landed': True, 'commit': commit, 'reports': reports,
-                'reconcile': reconcile, 'receipt_path': str(receipt_path)}
+                'reconcile': reconcile, 'ready': ready,
+                'ready_problems': ready_problems,
+                'receipt_path': str(receipt_path)}
+
+
+def unpack_folder(store, confirm=False, project_keys=None):
+    """Folder-carrier unpack (plan 2.3 + 2.5.4): there is no bundle to
+    import -- the synced folder already holds the archive. So this is a
+    verify + reconcile pass: isolate conflict copies, check every
+    project's checksum manifest (a mismatch blocks readiness and names
+    the recovery path, it never writes on top of broken bytes), build
+    read-only reconcile notes, and apply the readiness gate. The
+    `confirm` flag is accepted for CLI symmetry and ignored (nothing
+    here needs confirmation because nothing is merged)."""
+    cfg = load_sync_config(store)
+    scan = scan_folder_conflicts(store, isolate=True)
+    registry = relay.load_registry(store)
+    rows = [r for r in registry.get('projects', [])
+            if r.get('status', 'active') == 'active']
+    if project_keys:
+        rows = [r for r in rows if r['key'] in project_keys]
+    checksum = {}
+    for row in rows:
+        store_dir = relay.project_store_dir(store, row)
+        if not store_dir.is_dir():
+            continue
+        present, mismatches = relay.verify_checksum_manifest(store_dir)
+        checksum[row['key']] = {'present': present,
+                                'mismatches': [m['file'] for m in mismatches]}
+    reconcile = []
+    for row in rows:
+        if row.get('paths') and Path(row['paths'][0]).is_dir():
+            reconcile.append(_reconcile_note(store, row))
+    ready, ready_problems = _ready_gate(store, rows)
+    receipt = {'at': utc(), 'kind': 'unpack', 'carrier': 'folder',
+               'device_name': cfg.get('device_name'),
+               'device_id': cfg.get('device_id'),
+               'scan': scan, 'checksum': checksum, 'reconcile': reconcile,
+               'ready': ready, 'ready_problems': ready_problems}
+    receipt_path = _receipt_path(store, 'unpack', '')
+    save(receipt_path, receipt)
+    return {'landed': True, 'carrier': 'folder', 'conflicts': scan,
+            'checksum': checksum, 'reconcile': reconcile, 'ready': ready,
+            'ready_problems': ready_problems,
+            'receipt_path': str(receipt_path)}
+
+
+def unpack_server(store, confirm=False, project_keys=None, backend=None):
+    """Server-carrier unpack (plan 2.4.4 + 2.5.4): download each
+    project's current bundle and run it through the 2.1 import pipeline
+    (dry-run without --confirm writes nothing). On confirm, landed
+    results are NOT committed anywhere (the server carrier has no git
+    semantics); a read-only reconcile + readiness gate follows, and
+    only a passed gate is announced as ready by the caller."""
+    cfg = load_sync_config(store)
+    backend = backend or _server_backend(store, cfg)
+    registry = relay.load_registry(store)
+    rows = [r for r in registry.get('projects', [])
+            if r.get('status', 'active') == 'active']
+    if project_keys:
+        rows = [r for r in rows if r['key'] in project_keys]
+    reports = []
+    with tempfile.TemporaryDirectory(prefix='relay-unpack-server-') as tmp:
+        for row in rows:
+            try:
+                bundle = download_server_bundle(
+                    backend, row['key'], Path(tmp) / ('bundle-%s' % row['key']))
+            except RelayError as exc:
+                reports.append({'key': row['key'], 'status': 'skipped',
+                                'note': str(exc)})
+                continue
+            report = import_bundle(bundle, store, confirm=confirm)
+            reports.append({'key': row['key'], 'report': report})
+    if not confirm:
+        return {'landed': False, 'carrier': 'server', 'reports': reports}
+    matched_rows = []
+    reconcile = []
+    for rep in reports:
+        if 'report' not in rep:
+            continue
+        for entry in rep['report']['projects']:
+            if entry.get('status') != 'matched':
+                continue
+            row = next((x for x in registry.get('projects', [])
+                        if x.get('key') == entry['key']), None)
+            if row is None or not row.get('paths'):
+                continue
+            if not Path(row['paths'][0]).is_dir():
+                continue
+            matched_rows.append(row)
+            reconcile.append(_reconcile_note(store, row))
+    ready, ready_problems = _ready_gate(store, matched_rows)
+    receipt = {'at': utc(), 'kind': 'unpack', 'carrier': 'server',
+               'server_url': cfg.get('server_url'),
+               'server_type': cfg.get('server_type'),
+               'device_name': cfg.get('device_name'),
+               'device_id': cfg.get('device_id'),
+               'reports': reports, 'reconcile': reconcile,
+               'ready': ready, 'ready_problems': ready_problems}
+    receipt_path = _receipt_path(store, 'unpack', '')
+    save(receipt_path, receipt)
+    return {'landed': True, 'carrier': 'server', 'reports': reports,
+            'reconcile': reconcile, 'ready': ready,
+            'ready_problems': ready_problems,
+            'receipt_path': str(receipt_path)}
+
+
+def unpack(store, remote=None, confirm=False, project_keys=None, carrier=None):
+    """Carrier dispatcher (plan 2.3/2.4): git keeps the slice-1 behavior
+    (clone -> import -> commit, no push); folder verifies + reconciles
+    the synced tree; server downloads -> import pipeline -> reconcile.
+    All three end with the same 2.5.4 readiness gate."""
+    cfg = load_sync_config(store)
+    c = _carrier_of(store, cfg, carrier)
+    if c == 'folder':
+        return unpack_folder(store, confirm=confirm, project_keys=project_keys)
+    if c == 'server':
+        return unpack_server(store, confirm=confirm, project_keys=project_keys)
+    return _unpack_git(store, remote=remote, confirm=confirm,
+                       project_keys=project_keys)
 
 
 # ---------------------------------------------------------------- claim / rollback / status
@@ -1860,7 +2785,7 @@ def sync_claim(store, key, toplevel, confirm=False):
     return {'landed': True, 'report': report}
 
 
-def sync_rollback(store, toplevel, ref, reason=''):
+def _rollback_git(store, toplevel, ref, reason=''):
     """Restore one project to a git ref (plan 2.2.6: git history is the
     undo mechanism). Payload files are replaced wholesale; local-only
     files (config, enforce, cursor, ...) are untouched. The rollback note
@@ -1908,6 +2833,7 @@ def sync_rollback(store, toplevel, ref, reason=''):
             atomic(p, data)
         note = {'ref': ref, 'at': utc(), 'reason': reason}
         save(store_dir / 'state' / 'rollback-note.json', note)
+        relay.update_checksum_manifest(store_dir)
         stage = [prefix + r for r in ref_files]
         stage += [prefix + r for r in current if r not in ref_files]
         commit = None
@@ -1927,19 +2853,124 @@ def sync_rollback(store, toplevel, ref, reason=''):
                 'files_restored': len(ref_files), 'note': note}
 
 
+def _collect_payload_lenient(store_dir):
+    """Payload files present on disk, without the archive-five
+    requirement: a rollback target may itself be the broken tree being
+    rescued, and its backup must not fail on a missing file."""
+    out = {}
+    for path in sorted(store_dir.rglob('*')):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(store_dir).as_posix()
+        if _is_payload_file(rel):
+            out[rel] = path.read_bytes()
+    return out
+
+
+def rollback_from_bundle(store, toplevel, bundle, reason=''):
+    """Folder/server-carrier rollback (plan 2.3 boundary: no git
+    semantics, rollback rides on export bundles).
+
+    The bundle is verified as untrusted input first (zero writes on
+    failure). Current payload files are backed up to
+    sync-receipts/rollback-<ts>/ AND moved (renamed, never deleted) to
+    archive/rollback-trash/<ts>/ -- the plan-2.3.6 deletion shield, so a
+    mistaken rollback can be undone from the trash. Bundle files then
+    replace the payload wholesale; local-only files are untouched. No
+    commit exists on these carriers (commit: None)."""
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    key, slug = row['key'], row['slug']
+    store = Path(store)
+    bundle = Path(bundle)
+    with tempfile.TemporaryDirectory(prefix='relay-rollback-bundle-') as tmp:
+        if bundle.is_file():
+            bundle_dir = read_bundle_zip(bundle, Path(tmp) / 'bundle')
+        elif bundle.is_dir():
+            bundle_dir = bundle
+        else:
+            raise RelayError('回退包不存在：' + str(bundle))
+        manifest, files, _warnings = verify_bundle(bundle_dir)
+        entry = next((p for p in manifest.get('projects', [])
+                      if p.get('key') == key), None)
+        require(entry is not None, '包内无本项目：' + key)
+        dirname = '%s-%s' % (entry['key'], entry['slug'])
+        ref_files = {}
+        for rel, data in files.items():
+            if not rel.startswith('projects/%s/' % dirname):
+                continue
+            proj_rel = rel[len('projects/%s/' % dirname):]
+            if _is_payload_file(proj_rel):
+                ref_files[proj_rel] = data
+        require(ref_files, '包内无本项目负载：' + key)
+        backup_dir = store / 'sync-receipts' / ('rollback-%s' % _compact_ts(utc()))
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        current = _collect_payload_lenient(store_dir)
+        for rel, data in current.items():
+            p = backup_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        ts = _compact_ts(utc())
+        trash_dir = store_dir / 'archive' / 'rollback-trash' / ts
+        for rel in current:
+            dest = trash_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(store_dir / rel), str(dest))
+        for rel, data in ref_files.items():
+            p = store_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            atomic(p, data)
+        note = {'bundle': str(bundle), 'at': utc(), 'reason': reason}
+        save(store_dir / 'state' / 'rollback-note.json', note)
+        relay.update_checksum_manifest(store_dir)
+        return {'backup_dir': str(backup_dir), 'trash_dir': str(trash_dir),
+                'commit': None, 'files_restored': len(ref_files), 'note': note}
+
+
+def sync_rollback(store, toplevel, ref=None, reason='', bundle=None):
+    """Rollback dispatcher: git keeps the ref path (slice 1); folder and
+    server carriers roll back from an export bundle (plan 2.3 boundary:
+    never pretend git exists there). A bundle-less folder/server rollback
+    fails with the recovery path instead of silently reusing git."""
+    cfg = load_sync_config(store)
+    c = _carrier_of(store, cfg, None)
+    if c == 'git':
+        if bundle is not None:
+            raise RelayError('git 载体请用 --to ref 回退，--bundle 仅用于 folder/server 载体')
+        if not ref:
+            raise RelayError('git 载体回退需要 --to ref')
+        return _rollback_git(store, toplevel, ref, reason)
+    if bundle is None:
+        raise RelayError('%s 载体回退需要 --bundle 导出包（目录或 zip）：'
+                         '先用 relay pack 留一份导出包，或用 sync-receipts/rollback-* 备份恢复'
+                         % c)
+    return rollback_from_bundle(store, toplevel, bundle, reason)
+
+
 # ---------------------------------------------------------------- status
 def sync_status(store, toplevel=None):
-    """Read-only sync state per project (plan 2.5.5 "状态可见").
+    """Sync state per project (plan 2.5.5 "状态可见").
 
     Compares the latest pack receipt's counts against current counts;
-    never writes, never nags (the only reminder moment is a device-switch
-    intent, which this command does not guess)."""
+    never nags (the only reminder moment is a device-switch intent,
+    which this command does not guess). Git/server rows are read-only;
+    the ONE folder-carrier exception is the conflict scan (plan 2.3.4):
+    scanning a synced tree isolates hits into trash/conflicts, which is
+    a reversible move, not a delete -- and a status that only reported
+    pollution without removing it would leave the next pack shipping
+    conflict copies as payload."""
     store = Path(store)
     registry = relay.load_registry(store)
     rows = registry.get('projects', [])
     if toplevel is not None:
         row, _store_dir = relay.resolve_store_dir(store, toplevel)
         rows = [row]
+    try:
+        cfg = load_sync_config(store)
+    except RelayError:
+        cfg = None
+    scan = None
+    if cfg is not None and cfg.get('carrier') == 'folder':
+        scan = scan_folder_conflicts(store, isolate=True)
     out = []
     receipts_dir = store / 'sync-receipts'
     for row in rows:
@@ -1961,22 +2992,29 @@ def sync_status(store, toplevel=None):
                 if latest is None or data.get('at', '') > latest.get('at', ''):
                     latest = data
         if latest is None:
-            out.append({'key': row['key'], 'slug': row['slug'],
-                        'display_name': row.get('display_name'),
-                        'packed': False,
-                        'current_entries': current_entries,
-                        'current_summaries': current_summaries})
+            row_out = {'key': row['key'], 'slug': row['slug'],
+                       'display_name': row.get('display_name'),
+                       'packed': False,
+                       'carrier': cfg.get('carrier') if cfg else None,
+                       'current_entries': current_entries,
+                       'current_summaries': current_summaries}
         else:
-            out.append({'key': row['key'], 'slug': row['slug'],
-                        'display_name': row.get('display_name'),
-                        'packed': True,
-                        'last_pack_at': latest.get('at'),
-                        'last_pack_seq': latest.get('seq'),
-                        'last_pack_commit': latest.get('commit'),
-                        'remote': latest.get('remote'),
-                        'new_entries_since_pack': max(
-                            0, current_entries - latest.get('entry_count', 0)),
-                        'new_summaries_since_pack': max(
-                            0, current_summaries - latest.get('summary_count', 0))
-                        if 'summary_count' in latest else None})
+            row_out = {'key': row['key'], 'slug': row['slug'],
+                       'display_name': row.get('display_name'),
+                       'packed': True,
+                       'carrier': latest.get('carrier')
+                       or (cfg.get('carrier') if cfg else None),
+                       'last_pack_at': latest.get('at'),
+                       'last_pack_seq': latest.get('seq'),
+                       'last_pack_commit': latest.get('commit'),
+                       'remote': latest.get('remote'),
+                       'new_entries_since_pack': max(
+                           0, current_entries - latest.get('entry_count', 0)),
+                       'new_summaries_since_pack': max(
+                           0, current_summaries - latest.get('summary_count', 0))
+                       if 'summary_count' in latest else None}
+        if scan is not None:
+            row_out['conflicts_found'] = scan['found']
+            row_out['conflicts_report'] = scan['report_path']
+        out.append(row_out)
     return out

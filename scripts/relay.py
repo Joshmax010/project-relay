@@ -81,7 +81,101 @@ def home_dir():
 
 
 def default_store():
+    # Folder carrier (plan 2.3): the user may point the whole store at a
+    # sync folder via ~/.project-relay-location (written by sync-setup
+    # --carrier folder). The env override (tests) always wins; a pointer
+    # to a missing directory is returned as-is so commands fail loudly
+    # instead of silently writing to the wrong store.
+    if os.environ.get('PROJECT_RELAY_HOME'):
+        return home_dir() / STORE_DIRNAME
+    try:
+        target = (Path.home() / '.project-relay-location').read_text(
+            encoding='utf-8').strip()
+    except OSError:
+        target = ''
+    if target:
+        return Path(target).expanduser()
     return home_dir() / STORE_DIRNAME
+
+
+def device_identity():
+    """Stable per-device identity for folder-carrier heartbeat locks.
+
+    Lives in the home directory, never inside a synced store, so two
+    devices never fight over it. Generated once on first use (write
+    paths only; read-only flows must never call this).
+    """
+    path = home_dir() / '.project-relay-device.json'
+    try:
+        data = read_json(path)
+        if isinstance(data, dict) and data.get('device_id'):
+            return data['device_id'], data.get('device_name')
+    except (ValueError, OSError):
+        pass
+    import socket
+    import uuid
+    device_id = uuid.uuid4().hex
+    device_name = socket.gethostname()
+    save(path, {'device_id': device_id, 'device_name': device_name})
+    return device_id, device_name
+
+
+# ---------------------------------------------------------------- checksum manifest (plan 2.3.5)
+CHECKSUM_MANIFEST = 'state/checksum-manifest.json'
+ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
+
+
+def _manifest_files(store_dir):
+    archive = store_dir / 'archive'
+    out = {}
+    if archive.is_dir():
+        for p in sorted(archive.rglob('*')):
+            if p.is_file() and not p.is_symlink():
+                rel = 'archive/' + p.relative_to(archive).as_posix()
+                if rel.startswith(ROLLBACK_TRASH_PREFIX):
+                    continue
+                out[rel] = p.read_bytes()
+    return out
+
+
+def update_checksum_manifest(store_dir):
+    """Integrity manifest (plan 2.3.5): SHA256 of every formal archive file.
+
+    Refreshed by every archive writer (summarize, import landing, goal
+    confirm/decline, rollback). Rollback-trash is excluded: it is
+    deliberately not part of the formal archive.
+    """
+    files = _manifest_files(store_dir)
+    save(store_dir / CHECKSUM_MANIFEST,
+         {'updated_at': utc(),
+          'files': {rel: digest(data) for rel, data in files.items()}})
+    return len(files)
+
+
+def verify_checksum_manifest(store_dir):
+    """Returns (present, mismatches). Extra files are ignored: merges and
+    goal writes may add files between refreshes; only listed files are
+    asserted (missing or hash-changed means possible sync truncation or
+    conflict pollution -- never write on top of it, recover first)."""
+    path = store_dir / CHECKSUM_MANIFEST
+    if not path.exists():
+        return False, []
+    try:
+        manifest = read_json(path)
+    except ValueError:
+        return True, [{'file': CHECKSUM_MANIFEST, 'expected': '可解析',
+                       'actual': '损坏'}]
+    mismatches = []
+    for rel, expected in (manifest.get('files') or {}).items():
+        p = store_dir / rel
+        if not p.exists():
+            mismatches.append({'file': rel, 'expected': expected, 'actual': None})
+        else:
+            actual = digest(p.read_bytes())
+            if actual != expected:
+                mismatches.append({'file': rel, 'expected': expected,
+                                   'actual': actual})
+    return True, mismatches
 
 
 def store_path(store, *rel):
@@ -494,6 +588,7 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         store_path(store_dir, 'state', 'goal-tentative.md').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-tentative.json').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-imported.json').unlink(missing_ok=True)
+        update_checksum_manifest(store_dir)
         return {'already': False, 'receipt': new_receipt}
     text = draft.decode('utf-8')
     if not GOAL_STATUS_RE.search(text):
@@ -507,6 +602,7 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
     store_path(store_dir, 'state', 'goal-draft.md').unlink(missing_ok=True)
     store_path(store_dir, 'state', 'goal-draft.json').unlink(missing_ok=True)
     store_path(store_dir, 'state', 'goal-imported.json').unlink(missing_ok=True)
+    update_checksum_manifest(store_dir)
     return {'tentative': True, 'hash': digest(draft)}
 
 
@@ -569,6 +665,7 @@ def goal_decline(store, toplevel):
     atomic(_goal_file(store_dir), text.encode('utf-8'))
     store_path(store_dir, 'state', 'goal-draft.md').unlink(missing_ok=True)
     store_path(store_dir, 'state', 'goal-draft.json').unlink(missing_ok=True)
+    update_checksum_manifest(store_dir)
     return {'declined': True}
 
 
@@ -683,21 +780,33 @@ def _parser():
     # Implemented in scripts/relay_sync.py; imported lazily in main() like
     # relay_flow/relay_backfill. The sync branch wraps its own errors
     # because relay_sync's RelayError class is not this module's.
+    # Slice 2 (2.3-2.5) adds --carrier overrides and folder/server setup;
+    # the carrier default is inferred (remote -> git, folder -> folder,
+    # server-url -> server) so old invocations keep working.
     pk = sub.add_parser('pack')
     pk.add_argument('--remote')
     pk.add_argument('--device-name')
+    pk.add_argument('--carrier', choices=['git', 'folder', 'server'])
     un = sub.add_parser('unpack')
     un.add_argument('--remote')
     un.add_argument('--confirm', action='store_true')
     un.add_argument('--project', action='append', dest='projects')
+    un.add_argument('--carrier', choices=['git', 'folder', 'server'])
     ss = sub.add_parser('sync-setup')
-    ss.add_argument('--remote', required=True)
+    ss.add_argument('--remote')
     ss.add_argument('--device-name')
+    ss.add_argument('--carrier', choices=['git', 'folder', 'server'])
+    ss.add_argument('--folder')
+    ss.add_argument('--server-type', choices=['webdav', 'sftp', 'https', 'local'])
+    ss.add_argument('--server-url')
+    ss.add_argument('--server-user')
+    ss.add_argument('--server-token')
     sc = sub.add_parser('sync-claim')
     sc.add_argument('--key', required=True)
     sc.add_argument('--confirm', action='store_true')
     rb = sub.add_parser('sync-rollback')
-    rb.add_argument('--to', required=True)
+    rb.add_argument('--to')
+    rb.add_argument('--bundle')
     rb.add_argument('--reason', default='')
     sub.add_parser('sync-status')
     return p
@@ -880,9 +989,16 @@ def main(argv=None):
                 _sspec.loader.exec_module(sync)
                 if a.command == 'pack':
                     result = sync.pack(store, a.root, remote=a.remote,
-                                       device_name=a.device_name)
+                                       device_name=a.device_name,
+                                       carrier=a.carrier)
                     rec = result['receipt']
-                    print('pack 完成：序列号 %d，提交 %s' % (rec['seq'], rec['commit']))
+                    if rec['carrier'] == 'folder':
+                        print('pack 完成（文件夹载体，无包序列号）')
+                    elif rec['carrier'] == 'server':
+                        print('pack 完成：序列号 %d，服务器 %s'
+                              % (rec['seq'], rec.get('server_url')))
+                    else:
+                        print('pack 完成：序列号 %d，提交 %s' % (rec['seq'], rec['commit']))
                     print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
                           % (rec['entry_count'], rec['file_count'], rec['redacted_count']))
                     print('回执：' + result['receipt_path'])
@@ -890,7 +1006,8 @@ def main(argv=None):
                         print('步骤 %s：%s' % (step['step'], step['status']))
                 elif a.command == 'unpack':
                     result = sync.unpack(store, remote=a.remote, confirm=a.confirm,
-                                         project_keys=a.projects)
+                                         project_keys=a.projects,
+                                         carrier=a.carrier)
                     if not result.get('landed'):
                         if result.get('note'):
                             print(result['note'])
@@ -899,27 +1016,88 @@ def main(argv=None):
                         for rep in result.get('reports', []):
                             _print_sync_report(rep)
                     else:
-                        print('unpack 已落盘并提交：%s' % result['commit'])
+                        if result.get('carrier') == 'folder':
+                            print('文件夹载体对账完成')
+                            found = result.get('conflicts', {}).get('found') or []
+                            if found:
+                                print('发现 %d 个同步冲突副本，已隔离，未自动合并'
+                                      % len(found))
+                        elif result.get('carrier') == 'server':
+                            print('unpack 已落盘（服务器载体）')
+                        else:
+                            print('unpack 已落盘并提交：%s' % result['commit'])
                         for rep in result.get('reports', []):
                             _print_sync_report(rep)
                         for note in result.get('reconcile', []):
                             print('对账 %s：目标状态 %s，pending %s，分支 %s'
                                   % (note['slug'], note.get('goal_status'),
                                      note.get('pending'), note.get('branch')))
+                        if result.get('ready'):
+                            print('接力就绪')
+                        else:
+                            for problem in result.get('ready_problems', []):
+                                print('对账差异：' + problem)
                         print('回执：' + result['receipt_path'])
                 elif a.command == 'sync-setup':
-                    result = sync.sync_setup(store, a.remote, device_name=a.device_name)
-                    print('同步配置已写入：设备 %s（%s），远端 %s'
-                          % (result['config']['device_name'],
-                             result['config']['device_id'], a.remote))
-                    for claim in result['claims']:
-                        if claim['status'] == 'matched':
-                            print('可认领：%s ↔ 本机项目 %s'
-                                  % (claim['slug'], claim['local_display']))
+                    carrier = a.carrier
+                    if a.folder and not a.store_root:
+                        store = Path(a.folder).expanduser()
+                    if carrier is None:
+                        if a.server_url:
+                            carrier = 'server'
+                        elif a.folder:
+                            carrier = 'folder'
+                        elif a.remote:
+                            carrier = 'git'
                         else:
-                            print('待认领区：%s（本机无对应项目）' % claim['slug'])
-                    for note in result['notes']:
-                        print('注：' + note)
+                            raise Exception(
+                                'sync-setup 需要指定载体：git 用 --remote，'
+                                'folder 用 --folder，server 用 --server-url')
+                    if carrier == 'folder':
+                        result = sync.sync_setup_folder(
+                            store, device_name=a.device_name)
+                        print('同步配置已写入：设备 %s（%s），文件夹 %s'
+                              % (result['config']['device_name'],
+                                 result['config']['device_id'], result['store']))
+                        for note in result['notes']:
+                            print('注：' + note)
+                    elif carrier == 'server':
+                        if not a.server_url:
+                            raise Exception('server 载体需要 --server-url')
+                        stype = a.server_type
+                        if stype is None:
+                            if a.server_url.startswith('local:'):
+                                stype = 'local'
+                            else:
+                                raise Exception(
+                                    'server 载体需要 --server-type'
+                                    '（webdav/sftp/https/local）')
+                        token = a.server_token or os.environ.get('RELAY_SERVER_TOKEN')
+                        result = sync.sync_setup_server(
+                            store, stype, a.server_url,
+                            server_user=a.server_user, token=token,
+                            device_name=a.device_name)
+                        print('同步配置已写入：设备 %s（%s），服务器 %s %s'
+                              % (result['config']['device_name'],
+                                 result['config']['device_id'], stype,
+                                 a.server_url))
+                        for note in result['notes']:
+                            print('注：' + note)
+                    else:
+                        if not a.remote:
+                            raise Exception('git 载体需要 --remote')
+                        result = sync.sync_setup(store, a.remote, device_name=a.device_name)
+                        print('同步配置已写入：设备 %s（%s），远端 %s'
+                              % (result['config']['device_name'],
+                                 result['config']['device_id'], a.remote))
+                        for claim in result['claims']:
+                            if claim['status'] == 'matched':
+                                print('可认领：%s ↔ 本机项目 %s'
+                                      % (claim['slug'], claim['local_display']))
+                            else:
+                                print('待认领区：%s（本机无对应项目）' % claim['slug'])
+                        for note in result['notes']:
+                            print('注：' + note)
                 elif a.command == 'sync-claim':
                     result = sync.sync_claim(store, a.key, a.root, confirm=a.confirm)
                     if not result['landed']:
@@ -928,23 +1106,36 @@ def main(argv=None):
                     if result['landed']:
                         print('认领完成，合并日志：' + result['report']['merge_log'])
                 elif a.command == 'sync-rollback':
-                    result = sync.sync_rollback(store, a.root, ref=a.to, reason=a.reason)
-                    print('已回退到 %s，恢复文件 %d 个，提交 %s'
-                          % (a.to, result['files_restored'], result['commit']))
+                    result = sync.sync_rollback(store, a.root, ref=a.to,
+                                                reason=a.reason, bundle=a.bundle)
+                    if result['commit'] is None:
+                        print('已回退（无提交载体），恢复文件 %d 个'
+                              % result['files_restored'])
+                    else:
+                        print('已回退到 %s，恢复文件 %d 个，提交 %s'
+                              % (a.to, result['files_restored'], result['commit']))
                     print('回退前内容备份于：' + result['backup_dir'])
+                    if result.get('trash_dir'):
+                        print('被替换的旧文件已归档到：' + result['trash_dir'])
                 elif a.command == 'sync-status':
                     for row in sync.sync_status(store, a.root):
+                        if row.get('conflicts_found'):
+                            print('发现 %d 个同步冲突副本，已隔离，未自动合并'
+                                  % len(row['conflicts_found']))
+                        carrier = row.get('carrier') or '—'
                         if not row['packed']:
-                            print('%s：未 pack 过，当前原料 %d 条、汇总 %d 个'
+                            print('%s：未 pack 过，当前原料 %d 条、汇总 %d 个，载体 %s'
                                   % (row['slug'], row['current_entries'],
-                                     row['current_summaries']))
+                                     row['current_summaries'], carrier))
                         else:
-                            print('%s：上次 pack %s（seq %d，提交 %s），'
-                                  '自 pack 后新增汇总 %s 个、新原料 %d 条'
-                                  % (row['slug'], row['last_pack_at'], row['last_pack_seq'],
-                                     row['last_pack_commit'],
-                                     row['new_summaries_since_pack'],
-                                     row['new_entries_since_pack']))
+                            seq = row['last_pack_seq'] \
+                                if row['last_pack_seq'] is not None else '—'
+                            commit = row['last_pack_commit'] or '—'
+                            print('%s：上次 pack %s（seq %s，提交 %s），'
+                                  '自 pack 后新增汇总 %s 个、新原料 %d 条，载体 %s'
+                                  % (row['slug'], row['last_pack_at'], seq,
+                                     commit, row['new_summaries_since_pack'],
+                                     row['new_entries_since_pack'], carrier))
             except Exception as exc:
                 print('ERROR: ' + str(exc), file=sys.stderr)
                 return 1

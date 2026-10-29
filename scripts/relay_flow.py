@@ -61,6 +61,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -160,8 +161,14 @@ def _raw_dir(store_dir):
     return store_dir / 'raw'
 
 
-def _entry_path(store_dir, seq):
-    return _raw_dir(store_dir) / ('cap-%04d.md' % seq)
+def _entry_path(store_dir, seq, filename_tag=None):
+    # Folder carrier (plan 2.3.3): degraded-mode captures are named per
+    # device (cap-NNNN-<device8>.md) so two devices' same-seq entries can
+    # never collide by filename when the sync service merges raw/.
+    name = 'cap-%04d.md' % seq
+    if filename_tag:
+        name = 'cap-%04d-%s.md' % (seq, filename_tag)
+    return _raw_dir(store_dir) / name
 
 
 def _parse_entry(path):
@@ -174,9 +181,10 @@ def _parse_entry(path):
     return header, body
 
 
-def _write_entry(store_dir, header, body):
+def _write_entry(store_dir, header, body, filename_tag=None):
     text = json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2) + BODY_DELIM + body
-    atomic(_entry_path(store_dir, header['seq']), text.encode('utf-8'))
+    atomic(_entry_path(store_dir, header['seq'], filename_tag),
+           text.encode('utf-8'))
 
 
 def list_entries(store_dir, include_archived=False):
@@ -214,10 +222,13 @@ def _recent_commits(toplevel, base_head, limit=5):
     return [line for line in text.splitlines() if line.strip()]
 
 
-def capture(store, toplevel, tool=None, session=None, message=None):
+def capture(store, toplevel, tool=None, session=None, message=None,
+            filename_tag=None):
     """Create one deterministic capture entry (plan 1.6). Zero LLM, zero
     conversation reads: only git facts are collected. On internal failure a
-    degraded entry is written and RelayError is raised (exit 1, plan 1.6)."""
+    degraded entry is written and RelayError is raised (exit 1, plan 1.6).
+    filename_tag (plan 2.3.3) names the entry file per device so folder
+    sync can never collide two devices' same-seq captures."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     toplevel = relay.git_toplevel(toplevel)
     seq = _next_seq(store_dir)
@@ -271,9 +282,10 @@ def capture(store, toplevel, tool=None, session=None, message=None):
                   'fact_hash': fact_hash, 'queue': 'pending', 'redacted_count': hits,
                   'retries': 0, 'semantic': 'pending', 'degraded': False,
                   'user_message': message}
-        _write_entry(store_dir, header, body)
+        _write_entry(store_dir, header, body, filename_tag=filename_tag)
         _check_limits(store_dir)
-        return {'seq': seq, 'deduped': False, 'path': str(_entry_path(store_dir, seq))}
+        return {'seq': seq, 'deduped': False,
+                'path': str(_entry_path(store_dir, seq, filename_tag))}
     except RelayError:
         raise
     except Exception as exc:  # degraded entry, then fail loudly (plan 1.6)
@@ -1012,7 +1024,105 @@ def _next_id(archive_text, prefix):
     return '%s-%03d' % (prefix, (max(int(i) for i in ids) + 1) if ids else 1)
 
 
+HEARTBEAT_TTL_SECONDS = 600
+DEVICE_NOTICE_FILE = 'state/device-notice.json'
+
+
+def _folder_carrier_config(store):
+    """This store's sync config, if it declares the folder carrier."""
+    cfg_path = Path(store) / 'sync-config.json'
+    if not cfg_path.exists():
+        return None
+    try:
+        cfg = read_json(cfg_path)
+    except ValueError:
+        return None
+    return cfg if isinstance(cfg, dict) and cfg.get('carrier') == 'folder' else None
+
+
+def _heartbeat_path(store_dir, device_id):
+    return store_dir / ('heartbeat-%s.json' % device_id)
+
+
+def _active_foreign_heartbeat(store_dir, device_id):
+    """Another device's heartbeat lock active within 10 min (plan 2.3.3).
+
+    Stale locks (older than TTL, e.g. a crashed writer) are ignored; clock
+    skew between devices can shorten the effective window, so the TTL is
+    a heuristic, not a lock guarantee (plan boundary: simultaneous long
+    writes are out of scope, losses degrade to both-sides-kept).
+    """
+    now = time.time()
+    for path in sorted(store_dir.glob('heartbeat-*.json')):
+        if path.name == 'heartbeat-%s.json' % device_id:
+            continue
+        try:
+            data = read_json(path)
+        except ValueError:
+            continue
+        at = data.get('at_epoch')
+        if isinstance(at, (int, float)) and now - at < HEARTBEAT_TTL_SECONDS:
+            return data
+    return None
+
+
 def summarize(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False):
+    """Public summarize: folder-carrier heartbeat gate + checksum refresh.
+
+    When this store is folder-carried and another device's heartbeat lock
+    is active (10 min), the write degrades to capture-only (plan 2.3.3):
+    a device-tagged capture is taken, a notice is left for the next
+    resume, and no archive write happens. Otherwise the own heartbeat
+    lock is held for the whole summarize and released afterwards; on a
+    real (non-noop) summarize the checksum manifest refreshes and any
+    stale device notice is cleared.
+    """
+    row, store_dir = relay.resolve_store_dir(store, toplevel)
+    toplevel = relay.git_toplevel(toplevel)
+    cfg = _folder_carrier_config(store)
+    if cfg is None:
+        record = _summarize_impl(store, toplevel, source, semantic_text,
+                                 session, semantic_auto)
+        # The manifest invariant is carrier-independent: once a manifest
+        # exists (goal confirm writes one on any store), EVERY archive
+        # writer must refresh it, or the next resume correctly reports a
+        # stale manifest as corruption. Summarize is the main archive
+        # writer, so it refreshes on every real (non-noop) run.
+        if not record.get('noop'):
+            relay.update_checksum_manifest(store_dir)
+        return record
+    device_id, device_name = relay.device_identity()
+    foreign = _active_foreign_heartbeat(store_dir, device_id)
+    if foreign is not None:
+        notice = {'at': utc(), 'device_id': foreign.get('device_id'),
+                  'device_name': foreign.get('device_name'),
+                  'note': '另一台设备近期在写此项目'}
+        save(store_dir / DEVICE_NOTICE_FILE, notice)
+        try:
+            cap = capture(store, toplevel, session=session,
+                          filename_tag=device_id[:8])
+        except Exception:
+            cap = None
+        return {'degraded': True, 'reason': 'foreign-heartbeat',
+                'foreign': foreign, 'capture': cap,
+                'note': '另一台设备近期在写此项目，本次只采集不汇总'}
+    own_lock = _heartbeat_path(store_dir, device_id)
+    atomic(own_lock, json.dumps({'device_id': device_id,
+                                 'device_name': device_name,
+                                 'at': utc(), 'at_epoch': time.time()},
+                                ensure_ascii=False).encode('utf-8'))
+    try:
+        record = _summarize_impl(store, toplevel, source, semantic_text,
+                                 session, semantic_auto)
+    finally:
+        own_lock.unlink(missing_ok=True)
+    if not record.get('noop'):
+        relay.update_checksum_manifest(store_dir)
+        (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
+    return record
+
+
+def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False):
     """Incremental merge of pending raw entries into the archive (plan 1.12).
 
     Order: roll back stale claims -> refresh digest -> deterministic assembly
@@ -1207,6 +1317,10 @@ def recover(store, toplevel):
             raise RelayError('恢复中止：%s 当前内容既非事务前也非事务后，外部改动在场，日志保留' % name)
     for name, rec in tx['files'].items():
         atomic(archive / name, base64.b64decode(rec['before_b64']))
+    # Archive writer invariant (plan 2.3.5): recovery rewrites archive
+    # files, so the manifest must follow or the next resume will
+    # (correctly) flag the restored bytes as corruption.
+    relay.update_checksum_manifest(store_dir)
     save(store_dir / 'tx' / (path.stem + '.recovered.json'),
          {'recovered_from': path.name, 'at': utc()})
     path.unlink()
@@ -1345,10 +1459,19 @@ def resume(store, toplevel, tool=None):
     toplevel = relay.git_toplevel(toplevel)
     found = relay.where(store, path=toplevel)
     if not found['found']:
-        return {'no_archive': True,
-                'message': ('无档案：本项目尚未建仓。二选一：走回溯建档（relay backfill，卷一 1.15）'
-                            '或从零 init（relay init）。选定前本命令只做只读速览，不写任何东西。'),
-                'sections': []}
+        # Plan 2.5.1, third reminder moment: on a new device, a cloned
+        # project (it has a remote) with no local store most likely left
+        # its archive on the old device. A purely local project (no
+        # remote) is just new, so no hint there.
+        try:
+            has_remote = relay.origin_remote(toplevel) is not None
+        except Exception:
+            has_remote = False
+        message = ('无档案：本项目尚未建仓。二选一：走回溯建档（relay backfill，卷一 1.15）'
+                   '或从零 init（relay init）。选定前本命令只做只读速览，不写任何东西。')
+        if has_remote:
+            message += '若这是新设备上 clone 下来的项目：此项目的档案可能还在旧设备上，请回旧设备执行 pack。'
+        return {'no_archive': True, 'message': message, 'sections': []}
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     cfg = load_config(store_dir)
     # Section 1: archive summary.
@@ -1402,6 +1525,11 @@ def resume(store, toplevel, tool=None):
         lines2.append('尚无汇总基线：对账以当前工作区为准')
     if snap['gaps']:
         lines2.append('缺口：%s' % '；'.join('子模块 %s 未深入' % g['path'] for g in snap['gaps']))
+    # Integrity manifest (plan 2.3.5): verify before any write section.
+    _manifest_present, manifest_mismatches = relay.verify_checksum_manifest(store_dir)
+    if manifest_mismatches:
+        lines2.append('校验清单不符（可能被截断或冲突副本污染，先从其他设备或最近导出包恢复，不带着坏档案继续写）：%s'
+                      % '、'.join(m['file'] for m in manifest_mismatches))
     cursor = _cursor(store_dir)
     if tool:
         foreign = [e for e in list_entries(store_dir)
@@ -1437,6 +1565,18 @@ def resume(store, toplevel, tool=None):
             'summarizing：%d 条（超时 %s；回退超 3 次 %s）\n%s'
             % (q['pending'], q['oldest_pending'], q['summarizing'],
                q['stale_summarizing'], q['over_retries'], '；'.join(diffs)))
+    # Folder-carrier device notice (plan 2.3.3): read-only display of a
+    # local notice file. It names no sync concept, so same-machine flows
+    # stay free of sync wording; the notice is cleared by the next
+    # successful local summarize, never by resume itself.
+    notice_path = store_dir / DEVICE_NOTICE_FILE
+    if notice_path.exists():
+        try:
+            notice = read_json(notice_path)
+            sec3 += '\n另一台设备近期在写此项目（设备 %s，时间 %s）' % (
+                notice.get('device_name') or notice.get('device_id'), notice.get('at'))
+        except ValueError:
+            sec3 += '\n另一台设备近期在写此项目'
     # Section 4: backfill summary (the ONLY writing section).
     banner = None
     if q['pending']:
@@ -1453,19 +1593,28 @@ def resume(store, toplevel, tool=None):
         uncovered = [e for e in list_entries(store_dir)
                      if e['header'].get('queue') == 'pending'
                      and e['header']['seq'] > cursor['entry_seq']]
-    if uncovered or corrections:
+    if manifest_mismatches:
+        # Integrity first (plan 2.3.5): never summarize on top of a
+        # manifest-mismatched archive; recovery comes first.
+        banner = ('【带病接手】校验清单不符：%s。先从其他设备或最近导出包恢复，'
+                  '恢复前不汇总、不写档案。' % '、'.join(m['file'] for m in manifest_mismatches))
+        sec4 = '四段·补汇总结果\n校验清单不符，暂不汇总（见上）。'
+    elif uncovered or corrections:
         try:
             corr_text = None
             if corrections:
                 corr_text = '## 已验证\n' + ''.join('- %s\n' % c for c in corrections)
             record = summarize(store, toplevel, source='resume-backfill',
                                semantic_text=corr_text, semantic_auto=True)
-            if record.get('noop'):
+            if record.get('degraded'):
+                sec4 = '四段·补汇总结果\n另一台设备近期在写此项目，本次只采集不汇总，稍后再接手。'
+            elif record.get('noop'):
                 raise RelayError('兜底汇总无原料可消费，纠正未能入档')
-            sec4 = ('四段·补汇总结果\n兜底汇总完成：序号 %d，覆盖条目 %s，触发源 resume-backfill'
-                    % (record['seq'], record['entry_range']))
-            if corrections:
-                sec4 += '\n对账纠正已随汇总入档（%d 条），档案正文无直改' % len(corrections)
+            else:
+                sec4 = ('四段·补汇总结果\n兜底汇总完成：序号 %d，覆盖条目 %s，触发源 resume-backfill'
+                        % (record['seq'], record['entry_range']))
+                if corrections:
+                    sec4 += '\n对账纠正已随汇总入档（%d 条），档案正文无直改' % len(corrections)
         except Exception as exc:
             banner = ('【带病接手】兜底汇总失败：%r。先说清带什么病：积压原料未能并入档案，'
                       '接手后请先处理缺口再开工。' % exc)

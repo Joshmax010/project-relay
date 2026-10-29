@@ -1,8 +1,8 @@
-# project-relay v2 同步（卷二第一片：2.1 导出/导入协议 + 2.2 私有 Git 仓载体）
+# project-relay v2 同步（卷二第一、二片：2.1–2.5）
 
 来源：改造计划第 03 部分（2.1、2.2、2.5、S4、S6）。实现：`scripts/relay_sync.py`
 （标准库 only，relay.py 惰性加载，与 relay_flow / relay_backfill 同体例）。
-测试：`tests/test_relay_sync.py`。
+测试：`tests/test_relay_sync.py`（第一片）、`tests/test_relay_sync2.py`（第二片）。
 
 > 先读警告：S6 的目录/文件清单是规划层面描述，与卷一实际布局不一致。
 > 本片所有合并语义都落在卷一实际布局上，不凭空发明 S6 的目录名。
@@ -25,7 +25,8 @@
 - 形态：目录；单文件时用 zip，内部结构不变（`write_bundle_zip` /
   `read_bundle_zip`，读包时拒绝绝对路径、`..` 与符号链接条目）。
 - 根部 `manifest.json`，字段固定：`format='project-relay-export'`、
-  `format_major=1`、`format_minor=0`、`exported_at`（ISO 8601 带时区）、
+  `format_major=1`、`format_minor=1`（第二片起：新增加密预留字段，见 §9）、
+  `exported_at`（ISO 8601 带时区）、
   `source_device`（用户可读名）、`source_device_id`（随机设备 ID）、
   `tool_version='project-relay-v2'`、`entry_count`（原料条目总数）、
   `redacted_count`（只记数）、`files`（包根相对路径 → SHA256，一律带
@@ -168,10 +169,13 @@ S6 明言不同步），以及仓根的 `registry.json`、`global/`、`trash/`�
 命令（relay.py 分发体例，relay_sync 惰性加载；sync 分支自己包
 `except Exception`，因 RelayError 类身份问题）：
 
-- `pack [--remote] [--device-name]`：pack 的调用本身就是用户确认
-  （2.5 的提醒时机之一），无需 `--confirm`。
-- `unpack [--remote] [--confirm] [--project <key>（可重复）]`：无
-  `--confirm` 时只打印干跑报告、不写任何东西。
+- `pack [--remote] [--device-name] [--carrier git|folder|server]`：pack 的
+  调用本身就是用户确认（2.5 的提醒时机之一），无需 `--confirm`。
+  未指定 `--carrier` 时按配置载体分发（见 §9.1）。
+- `unpack [--remote] [--confirm] [--project <key>（可重复）]
+  [--carrier git|folder|server]`：git/server 载体无 `--confirm` 时只打印
+  干跑报告、不写任何东西；文件夹载体无包可导，unpack 为校验 + 对账
+  （仍写一份对账回执），`--confirm` 对其无意义。
 - `sync-setup --remote <url> [--device-name]`：写 `.gitignore`、写
   `sync-config.json`（`{carrier:'git', remote, device_name（缺省主机名）,
   device_id（uuid4 hex，沿用已有）, updated_at}`）、克隆远端做认领扫描
@@ -179,6 +183,14 @@ S6 明言不同步），以及仓根的 `registry.json`、`global/`、`trash/`�
   匹配只比项目键（远端目录名前 16 位 hex = 本地注册表行的 key，键相等
   即 remote 相等），输出「可认领 / 待认领区」两列清单，setup 本身不落
   盘任何项目负载（落盘走 unpack）。
+- `sync-setup --carrier folder --folder <目录> [--device-name]`：见 §9.2
+  （写 `{carrier:'folder'}` 配置 + `~/.project-relay-location` 指针 +
+  一次冲突扫描；默认仓已有项目且非同一仓时拒绝）。
+- `sync-setup --carrier server --server-type <webdav|sftp|https|local>
+  --server-url <url> [--server-user <u>] [--server-token <t>]`：见 §9.3
+  （token 只进 `sync-credentials.json`（0600），亦可用
+  `RELAY_SERVER_TOKEN` 环境变量；`local:` URL 缺省推断 `--server-type
+  local`）。
 - `sync-claim --key <key> [--confirm]`：用户须先对代码仓跑过 `relay init`
   （未建仓则 claim 内部自动 init）；按 `--key` 找到待认领目录，走同一
   合并预览/落盘（无 `--confirm` 只干跑），成功后删除待认领目录与索引
@@ -190,10 +202,15 @@ S6 明言不同步），以及仓根的 `registry.json`、`global/`、`trash/`�
   的文件（本地文件如配置、执法计数等一律不动）；写本地文件
   `state/rollback-note.json`（`{ref, at, reason}`，reason 缺省为空字符串）；
   在活动仓提交（只暂存包内文件，note 文件不进提交）。
-- `sync-status`（`--root` 指定单个项目，缺省列全部已注册项目）：只读；
-  按项目读最新 pack 回执（`sync-receipts/pack-<key>-*.json` 按文件名
-  时间戳取最新）、当前汇总记录数与原料条目数，算出「自 pack 后新增
-  汇总数/新增条目数」，无回执则报「未 pack 过」；不写任何东西、不催促。
+- `sync-rollback --bundle <包目录或 zip> [--reason]`：文件夹/服务器载体
+  专用，见 §9.2（git 载体传 `--bundle` 会报错）。
+- `sync-status`（`--root` 指定单个项目，缺省列全部已注册项目）：按项目
+  读最新 pack 回执（`sync-receipts/pack-<key>-*.json` 按文件名时间戳取
+  最新）、当前汇总记录数与原料条目数，算出「自 pack 后新增汇总数/
+  新增条目数」，无回执则报「未 pack 过」；输出行含 `carrier` 字段
+  （文件夹载体 seq/commit 为空时显示 `—`）；不催促。唯一例外：
+  文件夹载体下 `sync-status` 会执行隔离式冲突扫描（见 D-sync-16），
+  其余载体下纯只读。
 
 pack 固定顺序（2.5.3 + ⓪）：
 
@@ -305,29 +322,243 @@ slug 对应的那一个，不要直接读其他 slug 目录。
   Git 载体把每项目清单另存为 `sync-manifests/<key>-<seq>.json` 提交
   （单仓根清单会被多项目 pack 互相覆盖）。
 
-## 8. 留给下一片（2.3–2.7）的接口与注意事项
+## 8. 留给下一片（2.6–2.7）的接口与注意事项
 
-- `import_bundle` / `merge_project` / `export_bundle` / `verify_bundle` /
-  `health_check` 已是载体无关的纯管线：2.3（同步文件夹载体）与 2.4
-  （自托管服务器载体）只需提供「取远端包目录」的方式，复用同一导入
-  管线；不要为新载体另写合并规则。
-- 2.3 注意：文件夹载体没有 git 的提交/回退语义——回退（`sync-rollback`）
-  目前依赖活动仓是 Git 仓；文件夹载体需另给回退方案（例如用
-  `sync-receipts/rollback-*` 备份做反向恢复），不要假装 git 可用。
-- 2.5 提醒时机（仅在用户表达换设备意图时提醒）尚未接任何触发器：
-  本片只做了 `sync-status`（只读可见）与 pack/unpack 命令；提醒文案与
-  触发点是 2.5 的事，不得塞进 resume/capture 等同机流程。
+- 2.3（同步文件夹载体）与 2.4（自托管服务器载体）已在本片后半段落地，
+  见 §9；2.5 提醒时机已落地，见 §9 末尾。以下仍是下一片（2.6–2.7）的事。
 - 2.6 冲突裁决 UI（分叉待裁、目标冲突的人工裁决入口）尚未做：
   本片只把冲突记进 merge-log 与 `goal-conflict.json` / 分叉待裁行；
   下一片给裁决命令时，裁决结果要写回档案并清掉对应标记，不能只改
-  merge-log。
+  merge-log。裁决后若改了 `archive/` 下文件，须刷新校验清单
+  （`relay.update_checksum_manifest`），否则下次 resume 会报清单不符。
 - `sync-claim` 目前落盘不提交（下一次 pack 一并提交）；若 2.7 要求认领
   即提交，在 claim 成功后补一次 `_commit_if_changes` 即可，路径前缀用
   本地 slug（见 unpack 的 slug 教训：远端 slug ≠ 本地 slug）。
 - 远端 slug 与本地 slug 可能不同（同一 remote、不同检出目录名）：
   任何按 slug 拼 store 路径的代码都必须用本地注册表行的 slug，不得用
   包内 slug；包内 slug 只用于显示与待认领目录名。
-- `state/pack-seq.json` 的 next 只有推送成功后才递增；新载体沿用同一
+- `state/pack-seq.json` 的 next 只有推送/上传成功后才递增；新载体沿用同一
   规则（上传成功才消耗序列号），否则断线重 pack 会跳号。
 - 本片未动 `SKILL.md`（仍是旧版人审流程）；v2 纪律的对外文档化等旧
   流程退役时统一重写，不要在本片中途改 SKILL。
+
+## 9. 第二片：文件夹载体（2.3）与服务器载体（2.4）、提醒时机（2.5）
+
+### 9.1 与第一片管线的衔接（两载体都不另写合并规则）
+
+- 文件夹载体没有「远端包」：同步文件夹本身就是记忆仓，`pack` 不生成
+  包、不提交、不消耗序列号，只做「隔离冲突副本 → 校验清单验证 →
+  强制汇总 → 健康检查 → 一致性自检 → 脱敏复扫 → 刷新清单 → 写 pack
+  回执」（回执 `seq`/`commit` 为空，`sync-status` 显示为 `—`）。
+- 服务器载体复用同一导入管线：`pack` 第 ⓪ 步下载 current 包 →
+  `import_bundle(confirm=True)` 合并；`unpack` 下载 current 包 → 同一
+  `import_bundle`（干跑/落盘与 git unpack 完全一致）。`export_bundle` /
+  `verify_bundle` / `merge_project` / `health_check` 一律复用。
+- 三载体 pack 固定顺序相同（2.5.2/2.5.3），只有第 ⓪ 步（拉取合并的
+  来源）与第 ⑤ 步（提交/上传/仅刷新清单）随载体而变；任一步失败停在
+  该步并给出可执行的下一步提示（例如外来心跳锁活跃时 pack 中止并
+  提示「等对方写完后再 pack」，而不是带着未汇总原料打包）。
+
+### 9.2 文件夹载体（2.3）
+
+- 启用：`relay sync-setup --carrier folder --folder <目录>`（或先
+  `--store-root` 指向文件夹再 setup）。配置只含 `{carrier: 'folder',
+  device_id, device_name, updated_at}`，不存文件夹绝对路径（两台设备
+  的路径本就不同）；`~/.project-relay-location` 指针文件记录本机文件夹
+  位置（`PROJECT_RELAY_HOME` 环境变量优先于指针，测试隔离不受影响）。
+  设备身份只存本机 `~/.project-relay-device.json`，绝不进同步仓。
+- 拒绝条件：本机默认仓已有项目且与目标文件夹不是同一仓时 setup 拒绝，
+  提示先 pack 导出或手动迁移（防止无声启用第二个仓、旧档案被 stranded）。
+- 写入纪律：一切写入仍走原子写（临时文件 + rename）。2.3.2 的「JSONL
+  按日切分」不映射到 v1 布局：v1 条目已是每条目独立文件
+  （`raw/cap-*.md`），爆炸半径天然限于单文件，不另造日切分机制（偏离
+  D-sync-18）。
+- 心跳锁（2.3.3）：实现在 `relay_flow.summarize` 的 wrapper 内（而非
+  relay_sync 模块，避免 relay_flow ↔ relay_sync 循环 import，且第一片
+  docstring 已声明 sync 模块不被同机流程调用）。文件夹载体下，汇总前
+  写本设备心跳锁 `heartbeat-<device_id>.json`（`{device_id, device_name,
+  at, at_epoch}`），写完删除；发现另一台设备 10 分钟内的活跃锁时，
+  本次汇总降级为只采集不汇总：采集文件按设备分名
+  （`cap-<seq>-<device_id 前 8 位>.md`，`list_entries` 的 `cap-*.md` glob
+  与 `_next_seq` 天然兼容，同 seq 不同设备内容共存时以 fact_hash 为
+  合并键），并写 `state/device-notice.json`，供下次 resume 第 3 段展示
+  「另一台设备近期在写此项目」；下一次本机成功汇总后清除该文件。
+  锁过期（>600 秒，如写崩溃残留）视为失效；时钟漂移会缩短有效窗口，
+  属启发式而非锁保证（边界：两台设备同时长时间写同一项目不在支持
+  范围内，损失只降到「双方都保留、人工裁决」）。
+- 冲突副本（2.3.4）：`scan_folder_conflicts(store, isolate=True)` 递归
+  扫描整个仓根（跳过 `.git`、`trash/`、`sync-receipts/`，避免隔离自己
+  的隔离产物与合并日志证据），按 basename 匹配：`冲突副本`、
+  `conflicted copy`、`.sync-conflict-`、` (conflict `、`（conflict`
+  （大小写不敏感匹配拉丁部分）。合法文件 `state/goal-conflict.json`
+  不命中（它含 `-conflict.` 但不含上述模式）。命中即移入
+  `trash/conflicts/<时间戳>/`（相对路径 `/` 换 `__`，重名加 `-2` 后缀，
+  永不删除）并写 `conflicts-<时间戳>.json` 原路径记录。扫描点：
+  文件夹 pack 第 ⓪ 步（必须在收包前，否则冲突副本会随 `archive/` 被
+  当成负载）、文件夹 unpack、`sync-status`（见 9.4 落点解释）。
+- 完整性自检（2.3.5）：`state/checksum-manifest.json`，scope 仅
+  `archive/**`（排除 `archive/rollback-trash/**`；清单外的多余文件一律
+  忽略，只断言清单内文件存在且哈希一致）。不变量：一切档案写入方都
+  刷新清单——summarize（全部载体，非 noop 时）、`_land_project` 落盘后、
+  `goal_confirm`/`goal_decline`、git/包回退后、`recover` 后；capture /
+  enforce 只写 `raw/` 区，不影响清单。resume 第 2 段验清单（不符时
+  列出文件），第 4 段遇不符则带病横幅并跳过汇总（「先从其他设备或
+  最近导出包恢复，恢复前不汇总、不写档案」）。注意：清单一旦存在就
+  会被 resume 检查，因此「只在文件夹载体刷新」是不够的——这是第二片
+  实测踩到的坑（验收 Act 3 曾因此 FAIL），见 D-sync-20。
+- 删除传播防护（2.3.6）：工具从不真正删除档案文件。包回退把被替换的
+  当前负载文件改名（非删除）到 `archive/rollback-trash/<时间戳>/`，
+  且该目录已排除出负载与清单；`sync-receipts/rollback-<时间戳>/` 另存
+  一份备份。整个记忆仓目录被误删只能靠 2.1 导出包兜底（文案见 2.7，
+  留给下一片）。
+- 回退（2.3 边界）：文件夹载体无 git 语义，`sync-rollback` 必须带
+  `--bundle`（目录或 zip），走 `rollback_from_bundle`：先
+  `verify_bundle`（不可信输入全套校验，失败零写入），按包内项目键
+  匹配本地项目（slug 不同时以包内 slug 定目录），当前负载备份 +
+  改名进 rollback-trash，写入包内负载，写 `state/rollback-note.json`，
+  刷新清单，无提交。无 `--bundle` 时报错并给出路径（先 pack 留导出
+  包，或用 `sync-receipts/rollback-*` 备份恢复）；git 载体传 `--bundle`
+  时报错（请用 `--to ref`）。
+
+### 9.3 服务器载体（2.4）
+
+- 后端接口（字节存取，`get/put/exists/list_dir/rename/remove_tree`，
+  相对路径一律过 `_jail_check`）：`LocalDirBackend`（本地目录，
+  `local:` scheme，测试主力）、`FaultBackend`（包装任意后端，可注入
+  写 tmp 途中失败与读失败）、`CurlBackend`（WebDAV MOVE 改名 /
+  HTTPS PUT/GET/HEAD，Bearer 头；`allow_move=False` 的纯 HTTPS 端点在
+  换位时拒绝）、`SftpBackend`（rsync over ssh 上传下载 + ssh mv 改名，
+  端点形如 `user@host:/base/path`，认证走 ssh 密钥/agent）。
+  注意：Curl/SFTP 后端未接真实服务器实测（沙箱内无真实端点），代码为
+  直接的 curl/rsync 调用，留待真机验证时再验。
+- 远端布局：`relay/<项目键>/current/` 一套完整包文件（manifest.json +
+  `projects/...`），外加 `relay/<项目键>/current-index.json` 快速索引
+  （换位之后写；`current/manifest.json` 是权威比对源，index 写崩溃不
+  影响比对）。上传先写临时目录
+  `relay/<key>/.tmp-<seq>-<device8>/` 并逐文件读回验哈希，再做目录
+  换位（现存 current/ 改名 `.old-<seq>-<时间戳>/`，临时目录改名
+  current/，删 `.old`）；换位中途崩溃导致 current/ 缺失且 `.old` 存在
+  时，下一次读先把 `.old` 恢复为 current/（见 `_read_server_current`）。
+  换位不是单文件原子改名，是两步目录换位 + `.old` 恢复 + manifest
+  权威比对（偏离 D-sync-19）。
+- 防覆盖比较键 `(seq, device_id)`：允许上传当且仅当无现存包，或现存包
+  哈希与待上传包相同（幂等重传），或现存键严格小于待上传键；拒绝当
+  且仅当现存 seq 更大，或 seq 相等但 device_id 不同（拒绝文案用计划
+  原话「先在本机拉取最新包合并，再重新导出」）。同设备同 seq 不同
+  哈希允许覆盖（属本设备自己的重试；若拒绝会因「上传成功但本地 seq
+  未递增」的崩溃窗口而永久 brick）。现存包 seq 取自 manifest 的
+  `projects[0].pack_seq`，独立导出包该字段为空时回退读
+  `current-index.json` 的 seq（否则比较键失效）。
+- pack-seq 规则沿用第一片：`state/pack-seq.json` 的 next 只有上传成功
+  后才递增，断线重 pack 不跳号（`upload_server_bundle` 本身不消耗
+  序列号，调用方成功后才 bump）。
+- 下载与导入合一：`download_server_bundle` 按 manifest 逐文件下载并
+  验哈希（缺失或不符报错），再进 `import_bundle` 全套校验，不提供跳过
+  校验直接覆盖的捷径。服务器 unpack 落盘后不提交（无 git 语义），
+  只做只读对账 + 就绪门。
+- 凭据：地址与用户名进 `sync-config.json`，口令/令牌只进独立文件
+  `sync-credentials.json`（`save` 后 `chmod 0600`，配置中只记
+  `credential_file` 指针，不记口令原文），凭据永不进导出包与同步内容；
+  CLI 也可用 `RELAY_SERVER_TOKEN` 环境变量供 token（`--server-token`
+  优先）。`local:` 后端无需凭据。
+- 加密预留（2.4.6）：manifest 增加 `encryption: 'none'` 与
+  `encryption_salt: None` 字段；`FORMAT_MINOR` 由 0 升为 1（次版本差异
+  只警告不拒绝，minor-0 旧包仍可导入，测试已覆盖）。整体加密本身
+  推迟到卷三，但字段定义已定死：未来加密包须把 `encryption` 置为
+  方案名、`encryption_salt` 置为派生盐（格式预留）。
+
+### 9.4 提醒时机（2.5）落地清单
+
+- 唯一提醒时机只有三个，落点如下（其余时机一律不提醒）：
+  ① 用户主动执行 pack 命令：pack 本身就是提醒与执行合一的入口，
+  各载体 pack 输出含步骤与回执；
+  ② 用户在对话中明说要换设备/换电脑：Agent 侧话术模板——先跑
+  `relay sync-status` 看未打包情况（上次 pack 时间、载体、包序列号、
+  自 pack 后新增汇总/原料数），再提示「请回旧设备执行 pack」；话术
+  中禁止出现「换工具前请先同步」一类表述（同机换工具与同步彻底
+  解耦，见下）；
+  ③ 新设备上首次接手某项目却发现本机无此项目记忆仓：resume 无档案
+  分支在项目有 git remote 时追加「若这是新设备上 clone 下来的项目：
+  此项目的档案可能还在旧设备上，请回旧设备执行 pack。」（纯本地
+  项目无 remote 时不追加；该提示不含「同步」二字）。
+- pack 固定顺序沿用第一片（⓪ 拉取合并 → ① 强制汇总 → ② 健康检查 →
+  ③ 一致性自检（仅报告）→ ④ 脱敏复扫 → ⑤ 生成包/提交/上传 →
+  ⑥ 本地 pack 回执），三载体同顺序，任一步失败停在该步并给出可执行
+  的下一步提示。pack 前积压先汇总后打包（有 pending 才跑确定性最小
+  增量汇总，失败中止）；文件夹载体外来锁活跃时 pack 直接中止（绝不
+  带着未汇总原料打包）。
+- unpack 后对账（2.5.4）：三载体 unpack 落盘后都跑只读对账
+  （`_reconcile_note`：目标状态、pending 数、分支/HEAD）+ 就绪门
+  （`_ready_gate`：健康检查通过 + 目标无 tampered + 校验清单无不符
+  即 ready；分支漂移等正常现象只列为差异说明，不阻塞就绪，见
+  D-sync-17）。CLI 在 ready 时打印「接力就绪」，否则逐条打印对账
+  差异，不宣布就绪。对账通过才宣布就绪；标注修正（以现状为准修正
+  档案标注）留给随后的 resume 或人工，不在 unpack 内写档案（偏离
+  D-sync-21）。
+- 同步状态可见（2.5.5）：落点为 `sync-status` 命令（已含上次 pack
+  时间、序列号、新汇总/新原料数，本片补 `carrier` 字段；文件夹载体
+  seq/commit 为空时显示 `—`），不放进 resume——因为 resume 是同机
+  流程，放同步状态行会与 2.5.6「同机流程无同步字样」的验收标准冲突
+  （偏离 D-sync-15）。resume 里只允许两处不含「同步」二字的本地
+  状态提示：无档案 + 有 remote 时的回旧设备 pack 提示（9.4③），以及
+  文件夹载体第 3 段的 device-notice 展示（「另一台设备近期在写此
+  项目」）。冲突副本报告同理不进 resume，落点为 `sync-status`（文件
+  夹载体，扫描并隔离后报告「发现 N 个同步冲突副本，已隔离，未自动
+  合并」）与文件夹 pack 输出（偏离 D-sync-16）。
+- 同机换工具彻底解耦（2.5.6）：resume / capture / inject 全程不得出现
+  「同步」二字（测试覆盖：健康 resume、inject、以及校验清单不符时
+  的 resume 文案——后者曾含「同步截断」字样，已改写为「截断或冲突
+  副本污染」）。文档与话术中禁止「换工具前请先同步」一类表述。
+  唯一例外是 `sync-status` / pack / unpack 等同步命令自身的输出，
+  它们本来就是同步入口。
+
+## 10. 第二片偏离清单（续 D-sync-1 – D-sync-14）
+
+- **D-sync-15**：2.5.5 的「接手输出中的同步状态行」落在 `sync-status`
+  而非 resume。原因：resume 是同机流程，2.5.6 验收标准要求同机流程
+  全程无同步字样；状态行放 resume 会直接违反该标准。`sync-status`
+  本就是「状态可见」的本机入口，信息完全相同（上次 pack 时间、载体、
+  序列号、未打包增量），只展示、不催促。主聊 2026-10-29 确认：该取舍成立，2.5.6 的字面验收标准优先于 2.5.5 的落点字面表述，信息完整且只展示不催促，意图未损。
+- **D-sync-16**：2.3.4 的「每次启动检查时扫描」与「接手输出中报告」
+  落点为 `sync-status`（文件夹载体）与文件夹 pack/unpack，而非
+  resume。原因同上：报告文案含「同步冲突副本」字样，进 resume 即破
+  2.5.6；且 `sync-status` 的扫描是隔离式扫描（命中即移入
+  `trash/conflicts`），不是只读报告——只报告不隔离会让下一次 pack 把
+  冲突副本当成 `archive/` 负载运走，所以状态命令在这里例外地写（可逆
+  移动，非删除），docstring 已注明。主聊确认：同理成立。
+- **D-sync-17**：unpack 就绪判定口径为「健康检查通过 + 目标无 tampered
+  + 校验清单无不符」即 ready；分支漂移、档案后又有新提交、引用文件
+  缺失等对账差异只列出、不阻塞。原因：漂移是正常现象（第一片
+  D-sync-7 已定一致性自检只报告不失败），就绪门若把它当阻塞项，新
+  设备永远无法宣布就绪。主聊确认：就绪口径合理，漂移类差异只列出不阻塞，与 D-sync-7 一致。
+- **D-sync-18**：2.3.2 的「JSONL 按日切分」不直接映射 v1 布局。v1 条目
+  已是每条目独立文件，爆炸半径天然限于单文件；已汇总的历史文件永不
+  被改写（汇总只追加新记录、旧条目归档改名），与日切分追求的效果
+  相同，故不另造日切分机制。
+- **D-sync-19**：服务器换位不是单文件原子改名。目录换位是两步
+  （current/ → `.old-*/`，tmp/ → current/），中途崩溃由 `.old` 恢复 +
+  manifest 权威比对兜底；`current-index.json` 写在换位之后，写崩溃不
+  影响比对。单文件原子改名在「一套完整包文件」形态下不可行（多文件
+  须整体换位），目录换位 + 恢复是等价的崩溃安全语义。主聊确认：多文件包形态下单文件原子改名不可行，远端端点更无此原语；两步换位 + .old 恢复 + manifest 权威比对 + 下载侧哈希校验，等价保障了“失败后正式版本仍是上一完整包”这一不变量；换位中途 current/ 短暂缺失的窗口由下载侧校验兜住。
+- **D-sync-20**：校验清单刷新不变量推广到全部载体。起因是实测失败：
+  第二片初期只在文件夹载体汇总时刷新，但 `goal_confirm` 在任何载体
+  都会写清单；随后非文件夹载体的汇总改了档案却不刷新，验收 Act 3
+  的 resume 正确地报了清单不符导致 FAIL。修复：summarize wrapper
+  非 noop 时一律刷新（全部载体），`recover` 恢复后也刷新；规则是
+  「清单一旦存在，一切档案写入方都必须刷新」，与载体无关。
+- **D-sync-21**：2.5.4 的「以现状为准修正档案标注」在 unpack 侧只做
+  只读对账、不写档案。原因：第一片 D-sync-10 已定「unpack 的写必须
+  保持显式」（resume 第 4 段可写，unpack 不可）；差异逐条列出、对账
+  通过宣布就绪后，标注修正留给随后的 resume 或人工。
+- **D-sync-22**：心跳锁与降级实现在 `relay_flow.summarize` wrapper 内，
+  而非 relay_sync 模块。原因：避免 relay_flow ↔ relay_sync 循环
+  import，且第一片 docstring 已声明 sync 模块不被同机流程调用；心跳
+  与 notice 只是本机文件操作，不属于 sync 模块。
+- **D-sync-23**：新增测试集中放在 `tests/test_relay_sync2.py`，未按原
+  计划拆一部分进 `tests/test_relay_flow.py`。原因：旧测试文件零改动
+  更安全（不得悄悄弱化既有测试）；flow 侧用例（降级、notice、resume
+  文案）通过加载的 flow 模块同样覆盖。
+- **D-sync-24**：Curl/SFTP 后端未接真实服务器实测。沙箱内无真实
+  WebDAV/NAS/SFTP 端点，测试以 `LocalDirBackend` + `FaultBackend`
+  覆盖全部语义（原子换位、防覆盖、断线、篡改拒绝）；网络后端代码为
+  直接的 curl/rsync 调用，留待真机验证时再验，文档已明示。
