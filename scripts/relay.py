@@ -758,6 +758,28 @@ def _parser():
     cap.add_argument('--tool')
     cap.add_argument('--session')
     cap.add_argument('--message')
+    cap.add_argument('--correction', help='纠正标记：本次采集是一次用户纠正，值为被纠正的错误类（卷三 3.2 晋升触发证据）')
+    # --- volume-3 slice 2 (plan part 03, step 3.2: promotion channel) ---
+    pr = sub.add_parser('promote')
+    prsub = pr.add_subparsers(dest='promote_command', required=True)
+    prsub.add_parser('list')
+    prsub.add_parser('refresh')
+    dec = prsub.add_parser('decide')
+    dec.add_argument('--id', required=True)
+    dec.add_argument('--adopt', action='store_true')
+    dec.add_argument('--reject', action='store_true')
+    dec.add_argument('--shelve', action='store_true')
+    dec.add_argument('--reason', help='否决时必填的一句理由，随提议归档')
+    it = prsub.add_parser('intent')
+    it.add_argument('--target', required=True, help='拟写入的正式文件（绝对路径或相对项目根）')
+    it.add_argument('--content', required=True, help='拟写入的原文')
+    it.add_argument('--source-pointer', help='证据指针，如原料条目或会话')
+    it.add_argument('--consequence', help='不采纳的后果（一行）')
+    it.add_argument('--kind', default='rule', choices=['rule', 'preference', 'goal', 'decision'])
+    it.add_argument('--origin', default='rule',
+                    choices=['rule', 'user_words', 'assistant_proposal_accepted'])
+    it.add_argument('--quote', help='目标/偏好类必填：用户原话逐字引用')
+    it.add_argument('--quote-session', help='目标/偏好类必填：原话出处会话')
     sub.add_parser('queue')
     enf = sub.add_parser('enforce')
     enf.add_argument('--tool')
@@ -1276,6 +1298,42 @@ def main(argv=None):
             except Exception as exc:
                 print('ERROR: ' + str(exc), file=sys.stderr)
                 return 1
+        elif a.command == 'promote':
+            _pspec = importlib.util.spec_from_file_location(
+                'relay_promote', Path(__file__).resolve().parent / 'relay_promote.py')
+            promote = importlib.util.module_from_spec(_pspec)
+            _pspec.loader.exec_module(promote)
+            _row, store_dir = resolve_store_dir(store, a.root)
+            if a.promote_command == 'list':
+                print(promote.render_section(store_dir))
+            elif a.promote_command == 'refresh':
+                result = promote.refresh(store_dir, a.root)
+                print('过期：%s；新提议：%s' % (result['expired'], result['proposed']))
+            elif a.promote_command == 'decide':
+                actions = [x for x in ('adopt', 'reject', 'shelve') if getattr(a, x)]
+                if len(actions) != 1:
+                    print('ERROR: decide 必须且只能选 --adopt/--reject/--shelve 其中之一',
+                          file=sys.stderr)
+                    return 1
+                result = promote.decide(store_dir, a.id, actions[0], reason=a.reason)
+                verb = {'adopted': '采纳', 'rejected': '否决', 'shelved': '搁置'}[result['action']]
+                print('提议 %s 已%s' % (result['id'], verb))
+                if result['action'] == 'adopted':
+                    print('写入：%s（决策记录 %s）' % (result['target'], result['decision']))
+                if result['action'] == 'shelved':
+                    print('搁置到期：%s' % result['shelved_until'])
+            elif a.promote_command == 'intent':
+                result = promote.record_formal_intent(
+                    store_dir, a.root, a.target, a.content,
+                    source_pointer=a.source_pointer, consequence=a.consequence,
+                    content_kind=a.kind, origin=a.origin,
+                    quote=a.quote, quote_session=a.quote_session)
+                prop = result['proposal']
+                if prop['proposed']:
+                    print('晋升提议已生成：%s' % prop['proposed'])
+                else:
+                    print('意向已记录（intent #%d），未生成提议：%s'
+                          % (result['intent_seq'], prop['detail']))
         elif a.command in ('capture', 'queue', 'enforce', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
                            'handoff', 'inject', 'resume'):
@@ -1286,7 +1344,7 @@ def main(argv=None):
             root = a.root
             if a.command == 'capture':
                 info = flow.capture(store, root, tool=a.tool, session=a.session,
-                                    message=a.message)
+                                    message=a.message, correction_of=a.correction)
                 if info.get('deduped'):
                     if a.message is not None:
                         # Batch 2, B4: the dedup key is the repo state
@@ -1300,6 +1358,13 @@ def main(argv=None):
                         print('采集去重：事实未变，返回已有条目 cap-%04d' % info['seq'])
                 else:
                     print('采集条目：cap-%04d（%s）' % (info['seq'], info['path']))
+                    promo = info.get('promotion') or {}
+                    if promo.get('proposed'):
+                        print('晋升提议已生成：%s（见 relay promote list）'
+                              % '、'.join(promo['proposed']))
+                    elif promo.get('error'):
+                        print('晋升检测失败（采集本身已成功）：%s' % promo['error'],
+                              file=sys.stderr)
             elif a.command == 'queue':
                 st = flow.queue_status(flow.relay.resolve_store_dir(store, root)[1],
                                        repair=False)
