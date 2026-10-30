@@ -91,6 +91,30 @@ SEMANTIC_PLACEHOLDER = '<!-- relay:semantic pending -->'
 
 
 _PROMOTE_MOD = None
+_FORK_MOD = None
+
+
+def _fork_module():
+    """Lazy relay_fork load (plan part 03, step 3.3). Same discipline as
+    _promote_module: a fork bug must never break flow import, and the
+    module is loaded on write paths (summarize) and read-only rendering
+    (resume), never as part of an archive write itself."""
+    global _FORK_MOD
+    if _FORK_MOD is None:
+        spec = importlib.util.spec_from_file_location(
+            'relay_fork', _HERE / 'relay_fork.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FORK_MOD = mod
+    return _FORK_MOD
+
+
+def _read_archive_bytes(archive, name):
+    """Single re-read point for the summarize write guard (plan 3.3
+    item 5): tests patch this one function to simulate a concurrent
+    writer between the start read and the pre-write re-read."""
+    path = archive / name
+    return path.read_bytes() if path.exists() else b''
 
 
 def _promote_module():
@@ -121,6 +145,8 @@ DEFAULT_CONFIG = {
     'inject_budget_tokens': 2000,
     'smoke_command': None,
     'exclude_globs': [],
+    'chain_compress_threshold': 200,
+    'chain_compress_keep': 10,
 }
 ARCHIVE_BUDGETS = {
     'state.md': (100, 8000),
@@ -1303,8 +1329,10 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
         # exists (goal confirm writes one on any store), EVERY archive
         # writer must refresh it, or the next resume correctly reports a
         # stale manifest as corruption. Summarize is the main archive
-        # writer, so it refreshes on every real (non-noop) run.
-        if not record.get('noop'):
+        # writer, so it refreshes on every real (non-noop, non-branched)
+        # run; a branched product wrote no archive file, so there is
+        # nothing to refresh.
+        if not record.get('noop') and not record.get('branched'):
             relay.update_checksum_manifest(store_dir)
         return record
     device_id, device_name = relay.device_identity()
@@ -1332,7 +1360,7 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
                                  session, semantic_auto)
     finally:
         own_lock.unlink(missing_ok=True)
-    if not record.get('noop'):
+    if not record.get('noop') and not record.get('branched'):
         relay.update_checksum_manifest(store_dir)
         (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
     return record
@@ -1426,6 +1454,13 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
     # would append the same decisions/todos a second time (pack's
     # automatic summarize funnels through here, so it is covered too).
     _recover_incomplete_tx(store, toplevel, store_dir)
+    # Plan part 03, step 3.3 item 2: detection runs before every summary
+    # write; the result refreshes the local meta (state/forks.json).
+    # The chain base for this product is the latest summary at start.
+    fork = _fork_module()
+    detection = fork.detect_forks(store_dir, persist=True)
+    base_entry = fork.latest_summary(store_dir)
+    base_id = base_entry['id'] if base_entry else None
     digest_doc = precompress(store, toplevel)
     cursor = _cursor(store_dir)
     entries = [e for e in list_entries(store_dir)
@@ -1514,6 +1549,20 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         appended_backlog.append(tid)
     # State patch: replace the managed block, verifying markers exist.
     state_text = (archive / 'state.md').read_text(encoding='utf-8')
+    # Plan part 03, step 3.3 items 4-5: disk hashes at start are the
+    # write guard's baseline, and open branches merge into the working
+    # texts BEFORE assembly (append-type items deduped by content hash,
+    # state-field conflicts to the pending section outside the managed
+    # block, so the block replacement below can never wipe them).
+    start_hashes = {name: digest(_read_archive_bytes(archive, name))
+                    for name in fork.ARCHIVE_FILES}
+    merged_texts, merged_ids, merge_notes = fork.merge_branches(
+        store_dir, {'state.md': state_text, 'decisions.md': decisions_text,
+                    'lessons.md': lessons_text, 'backlog.md': backlog_text}, seq)
+    state_text = merged_texts['state.md']
+    decisions_text = merged_texts['decisions.md']
+    lessons_text = merged_texts['lessons.md']
+    backlog_text = merged_texts['backlog.md']
     block = (STATE_BEGIN + '\n- 当前分支@基线：%s@%s\n- 正在做什么：汇总 %d（触发源 %s）\n'
              '- 下一动作：见待办清单\n- 已完成且有证据：%s\n- 已改动但尚未验证：%s\n'
              '- 阻塞待确认：%s\n- 最近会话：汇总 %d，覆盖条目 %d-%d\n' + STATE_END)
@@ -1529,6 +1578,28 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         state_text = state_text.rstrip('\n') + '\n\n' + block + '\n'
     new_contents = {'state.md': state_text, 'decisions.md': decisions_text,
                     'lessons.md': lessons_text, 'backlog.md': backlog_text}
+    # Plan part 03, step 3.3 item 5: prevention beats merge. Re-read the
+    # targets before writing; if anything moved since this summarize
+    # started, the product becomes a new branch instead of overwriting
+    # -- better one more branch than one lost branch. Entries stay
+    # pending (the main chain re-consumes them; branch merge dedups by
+    # content hash, so nothing is duplicated), and no tx log, cursor,
+    # or entry transition is written on this path.
+    current_hashes = {name: digest(_read_archive_bytes(archive, name))
+                      for name in fork.ARCHIVE_FILES}
+    mismatches = [name for name in fork.ARCHIVE_FILES
+                  if current_hashes[name] != start_hashes[name]]
+    if mismatches:
+        branch = fork.write_branch(
+            store_dir, new_contents, base_id, source,
+            [entries[0]['header']['seq'], entries[-1]['header']['seq']],
+            {'decisions': appended_decisions, 'lessons': appended_lessons,
+             'backlog': appended_backlog}, mismatches)
+        return {'branched': True, 'branch': branch['id'], 'based_on': base_id,
+                'mismatches': mismatches,
+                'entry_range': [entries[0]['header']['seq'], entries[-1]['header']['seq']],
+                'note': '汇总基线在写入前被改动，产物已作为新支 %s 写入，未覆盖主支'
+                        % branch['id']}
     # Transaction log first, then atomic writes (old substrate pattern).
     # Codex PR #5 batch 2, A2: the tx log doubles as the undo record, so
     # it must also carry the pre-transaction cursor / baseline /
@@ -1579,7 +1650,17 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
               'appended_backlog': appended_backlog,
               'rejected_lessons': rejected_lessons,
               'model_calls': model_calls,
-              'checked_semantic_tail': checked_semantic[-500:]}
+              'checked_semantic_tail': checked_semantic[-500:],
+              # Plan part 03, step 3.3 item 1: every summary product
+              # carries its chain pointer. The chain head (first summary
+              # ever) has based_on None and an origin annotation;
+              # backfill sources are 回溯式, everything else 过程式.
+              'based_on': base_id,
+              'origin': '回溯式' if 'backfill' in source else '过程式',
+              'branch': None,
+              'forks_before': len(detection['forks']),
+              'merged_branches': merged_ids,
+              'merge_notes': merge_notes}
     # Plan part 03, step 3.2: lessons appended by this summary may complete
     # the >= 3 repeat trigger. Like the capture hook, promotion failure is
     # reported on the record, never raised past a successful summary.
@@ -1589,6 +1670,12 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         record['promotions'] = {'error': repr(exc)}
     save(store_dir / 'state' / 'summaries' / ('%04d.json' % seq), record)
     enforce_budget(store_dir)
+    # Plan part 03, step 3.3 item 6: long-chain governance runs on a
+    # normal summarize once the live chain passes the threshold.
+    cfg = load_config(store_dir)
+    fork.maybe_compress_chain(store_dir,
+                              threshold=cfg.get('chain_compress_threshold', 200),
+                              keep=cfg.get('chain_compress_keep', 10))
     return record
 
 
@@ -1600,6 +1687,12 @@ def _b64(data):
 def _next_summary_seq(store_dir):
     d = store_dir / 'state' / 'summaries'
     seqs = [int(p.stem) for p in d.glob('*.json')] if d.exists() else []
+    # Plan part 03, step 3.3 item 6: folded seqs still count, or a new
+    # summary would reuse a packaged seq and collide with history.
+    try:
+        seqs += _fork_module().packaged_seqs(store_dir)
+    except Exception:
+        pass
     return (max(seqs) + 1) if seqs else 1
 
 
@@ -2146,6 +2239,18 @@ def resume(store, toplevel, tool=None):
             sec5 = '五段·基线确认\n冒烟命令执行异常：%r' % exc
     else:
         sec5 = '五段·基线确认\n未配置冒烟命令（state/config.json 的 smoke_command），跳过；建议配置。'
+    # Plan part 03, step 3.3 items 2-3: fork detection runs at every
+    # takeover read, computed LIVE and deliberately NOT persisted here
+    # (the resume zero-write contract stands; summarize refreshes
+    # state/forks.json). The fork list rides alongside the five
+    # sections, like the promotion block, so a fork is never invisible.
+    try:
+        fork_detection = _fork_module().detect_forks(store_dir, persist=False)
+        fork_section = _fork_module().render_fork_section(store_dir, fork_detection)
+        if _fork_module().goal_fork_active(store_dir):
+            sec1 += '\n目标已冻结（分叉待重新确认，见分叉清单）'
+    except Exception as exc:
+        fork_section = ('分叉清单\n\n（分叉检测读取失败：%r，见 relay fork list）' % (exc,))
     sections = [sec1, sec2, sec3, sec4, sec5]
     # Plan part 03, step 3.2: the promotion block rides ALONGSIDE the five
     # sections, not as a sixth one -- the five-section contract and the
@@ -2157,7 +2262,8 @@ def resume(store, toplevel, tool=None):
         promotion = ('## 晋升提议（待处置）\n\n'
                      '（晋升提议读取失败：%r，见 relay promote list）' % (exc,))
     return {'no_archive': False, 'banner': banner, 'sections': sections,
-            'sick': banner is not None, 'promotion': promotion}
+            'sick': banner is not None, 'promotion': promotion,
+            'fork_section': fork_section}
 
 
 def render_resume(result):
@@ -2167,6 +2273,8 @@ def render_resume(result):
         out.append(result['banner'])
         out.append('')
     out.extend(result['sections'])
+    if result.get('fork_section'):
+        out.append(result['fork_section'])
     if result.get('promotion'):
         out.append(result['promotion'])
     return '\n\n'.join(out)

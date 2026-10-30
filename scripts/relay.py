@@ -594,6 +594,9 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         receipt_path, receipt = _latest_receipt(store_dir)
         if receipt and current is not None and digest(current) == receipt['goal_hash'] \
                 and digest(draft) == receipt['goal_hash']:
+            # Re-confirming the current goal also lifts a goal-fork
+            # freeze: the user has decided this version stands.
+            store_path(store_dir, 'state', 'goal-fork.json').unlink(missing_ok=True)
             return {'already': True, 'receipt': receipt}
         seq = (receipt['seq'] + 1) if receipt else 1
         if current is not None and current != _skeleton_bytes() and current != draft:
@@ -611,6 +614,10 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         store_path(store_dir, 'state', 'goal-tentative.md').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-tentative.json').unlink(missing_ok=True)
         store_path(store_dir, 'state', 'goal-imported.json').unlink(missing_ok=True)
+        # Plan part 03, step 3.3 item 4③: a normal (non-tentative)
+        # confirmation IS the S4 reconfirmation that lifts a goal-fork
+        # freeze; tentative adoption is not confirmation, so it does not.
+        store_path(store_dir, 'state', 'goal-fork.json').unlink(missing_ok=True)
         update_checksum_manifest(store_dir)
         return {'already': False, 'receipt': new_receipt}
     text = draft.decode('utf-8')
@@ -696,6 +703,15 @@ def goal_inject(store, toplevel):
     """Text a new session may inject, by goal state (plan 1.5)."""
     state, info = goal_status(store, toplevel)
     row, store_dir = resolve_store_dir(store, toplevel)
+    # Plan part 03, step 3.3 item 4③: a forked goal never auto-merges --
+    # injection freezes and the S4 reconfirmation flow takes over. The
+    # canonical definition lives in relay_fork.goal_fork_active (flag
+    # file or volume-2 sync goal-conflict marker); this inline check
+    # keeps goal_inject free of an import cycle with the fork module.
+    if (store_dir / 'state' / 'goal-fork.json').exists() \
+            or (store_dir / 'state' / 'goal-conflict.json').exists():
+        return ('【目标已冻结】目标文件存在分叉，注入已停止；请走 S4 重新确认流程'
+                '（relay goal confirm 或 relay sync-resolve --goal）后再接手。')
     text = _goal_text(store_dir) or ''
     if state == 'confirmed':
         return text
@@ -780,6 +796,17 @@ def _parser():
                     choices=['rule', 'user_words', 'assistant_proposal_accepted'])
     it.add_argument('--quote', help='目标/偏好类必填：用户原话逐字引用')
     it.add_argument('--quote-session', help='目标/偏好类必填：原话出处会话')
+    # --- volume-3 slice 3 (plan part 03, step 3.3: fork chain) ---------
+    fk = sub.add_parser('fork')
+    fksub = fk.add_subparsers(dest='fork_command', required=True)
+    fksub.add_parser('list')
+    adj = fksub.add_parser('adjudicate')
+    adj.add_argument('--fork', required=True, help='待裁分叉支 id（如 br-xxxxxxxxxxxx）')
+    adj.add_argument('--winner', required=True, choices=['branch', 'main'],
+                     help='裁定哪支属实：branch（支）或 main（主支）')
+    adj.add_argument('--note', default='', help='裁定理由（一句）')
+    flg = fksub.add_parser('flag-goal')
+    flg.add_argument('--reason', required=True, help='目标分叉事由')
     sub.add_parser('queue')
     enf = sub.add_parser('enforce')
     enf.add_argument('--tool')
@@ -1334,6 +1361,22 @@ def main(argv=None):
                 else:
                     print('意向已记录（intent #%d），未生成提议：%s'
                           % (result['intent_seq'], prop['detail']))
+        elif a.command == 'fork':
+            _fspec = importlib.util.spec_from_file_location(
+                'relay_fork', Path(__file__).resolve().parent / 'relay_fork.py')
+            fork = importlib.util.module_from_spec(_fspec)
+            _fspec.loader.exec_module(fork)
+            _row, store_dir = resolve_store_dir(store, a.root)
+            if a.fork_command == 'list':
+                detection = fork.detect_forks(store_dir, persist=False)
+                print(fork.render_fork_section(store_dir, detection))
+            elif a.fork_command == 'adjudicate':
+                result = fork.adjudicate(store_dir, a.fork, a.winner, a.note)
+                print('分叉 %s 已裁定：%s 胜（%s）'
+                      % (result['fork'], result['winner'], result['note']))
+            elif a.fork_command == 'flag-goal':
+                fork.flag_goal_fork(store_dir, a.reason)
+                print('目标分叉已标记，注入已冻结；请走 S4 重新确认流程。')
         elif a.command in ('capture', 'queue', 'enforce', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
                            'handoff', 'inject', 'resume'):
