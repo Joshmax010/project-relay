@@ -109,6 +109,33 @@ def _fork_module():
     return _FORK_MOD
 
 
+_STATS_MOD = None
+
+
+def _stats_module():
+    """Lazy relay_stats load (plan part 03, step 3.4). Same discipline as
+    _promote_module/_fork_module: a stats bug must never break flow
+    import, and every stats write is additionally guarded so it can
+    never fail the capture/summarize/resume operation it measures."""
+    global _STATS_MOD
+    if _STATS_MOD is None:
+        spec = importlib.util.spec_from_file_location(
+            'relay_stats', _HERE / 'relay_stats.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _STATS_MOD = mod
+    return _STATS_MOD
+
+
+def _record_stats_safe(fn, *args, **kwargs):
+    """Best-effort stats write: measurement must never break the
+    operation being measured."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return None
+
+
 def _read_archive_bytes(archive, name):
     """Single re-read point for the summarize write guard (plan 3.3
     item 5): tests patch this one function to simulate a concurrent
@@ -143,6 +170,10 @@ DEFAULT_CONFIG = {
     'threshold_lines': 800,
     'time_days': 7,
     'inject_budget_tokens': 2000,
+    # Batch 3.4: tuning knobs. None means uncapped (current behavior);
+    # the monthly cap is alert-only by design, never a hard block.
+    'precompress_sample_cap': None,
+    'monthly_llm_token_cap': None,
     'smoke_command': None,
     'exclude_globs': [],
     'chain_compress_threshold': 200,
@@ -289,7 +320,11 @@ def capture(store, toplevel, tool=None, session=None, message=None,
     countable evidence the promotion channel's correction trigger counts.
     Dedup is unchanged: a correction capture deduped against an identical
     same-session entry counts once (use a distinct session, or changed
-    repo state, for a second correction event)."""
+    repo state, for a second correction event).
+    Batch 3.4: every capture appends one stats row (time, tool, entries,
+    fingerprint changed files, duration). The stats write is best-effort
+    and can never fail the capture itself."""
+    _cap_t0 = time.monotonic()
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     toplevel = relay.git_toplevel(toplevel)
     seq = _next_seq(store_dir)
@@ -328,6 +363,11 @@ def capture(store, toplevel, tool=None, session=None, message=None,
         if prev and prev['header'].get('session') == session \
                 and prev['header'].get('fact_hash') == fact_hash \
                 and not prev['header'].get('degraded'):
+            _record_stats_safe(_stats_module().record_capture, store_dir,
+                               tool=tool, session=session, entries=0,
+                               changed_files=len(changed_paths),
+                               duration_s=time.monotonic() - _cap_t0,
+                               deduped=True)
             return {'seq': prev['header']['seq'], 'deduped': True,
                     'path': str(prev['path'])}
         body = ('# 采集条目 cap-%04d\n\n' % seq + fact + '\n## 语义（待填）\n'
@@ -359,6 +399,10 @@ def capture(store, toplevel, tool=None, session=None, message=None,
                     store_dir, toplevel, correction_of)
             except Exception as exc:
                 info['promotion'] = {'error': repr(exc)}
+        _record_stats_safe(_stats_module().record_capture, store_dir,
+                           tool=tool, session=session, entries=1,
+                           changed_files=len(changed_paths),
+                           duration_s=time.monotonic() - _cap_t0)
         return info
     except RelayError:
         raise
@@ -380,6 +424,11 @@ def capture(store, toplevel, tool=None, session=None, message=None,
             _write_entry(store_dir, header, body)
         except Exception:
             pass
+        _record_stats_safe(_stats_module().record_capture, store_dir,
+                           tool=tool, session=session, entries=1,
+                           changed_files=None,
+                           duration_s=time.monotonic() - _cap_t0,
+                           degraded=True)
         raise RelayError('采集降级：本次采集失败，已写降级条目 cap-%04d：%r' % (seq, exc))
 
 
@@ -1103,6 +1152,13 @@ def precompress(store, toplevel):
     (the number whitelist for 1.12). Failed (degraded) samples are all kept."""
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
     entries = [e for e in list_entries(store_dir) if e['header'].get('queue') == 'pending']
+    # Batch 3.4 tuning knob: when set, only the most recent N pending
+    # entries feed the digest/numbers. None (the default) preserves the
+    # old behavior exactly; capping is an explicit user action and the
+    # digest then describes the sample, not the full queue.
+    _cap = load_config(store_dir).get('precompress_sample_cap')
+    if _cap is not None and len(entries) > _cap:
+        entries = entries[-_cap:]
     counts = {t: 0 for t in EVENT_TYPES}
     files_changed = set()
     claimed = []
@@ -1308,7 +1364,8 @@ def _active_foreign_heartbeat(store_dir, device_id):
     return None
 
 
-def summarize(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False):
+def summarize(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False,
+              trigger=None, llm_usage=None):
     """Public summarize: folder-carrier heartbeat gate + checksum refresh.
 
     When this store is folder-carried and another device's heartbeat lock
@@ -1318,13 +1375,27 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
     lock is held for the whole summarize and released afterwards; on a
     real (non-noop) summarize the checksum manifest refreshes and any
     stale device notice is cleared.
+    Batch 3.4: trigger names the scale class for the stats row (None
+    derives it from source); llm_usage is an optional caller-reported
+    {calls, input_tokens, output_tokens} object that turns the LLM
+    figures from estimates into measured values. When the cost fuse is
+    tripped, caller-supplied (non-auto) semantic text is dropped and the
+    run degrades to assembled-only; tool-generated auto text (zero model
+    calls by construction) passes through.
     """
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     toplevel = relay.git_toplevel(toplevel)
+    stats = _stats_module()
+    fused = False
+    if _record_stats_safe(stats.fuse_tripped, store_dir):
+        if semantic_text is not None and not semantic_auto:
+            semantic_text = None
+            fused = True
+    _arch_before = _archive_text_lens(store_dir)
     cfg = _folder_carrier_config(store)
     if cfg is None:
         record = _summarize_impl(store, toplevel, source, semantic_text,
-                                 session, semantic_auto)
+                                 session, semantic_auto, trigger)
         # The manifest invariant is carrier-independent: once a manifest
         # exists (goal confirm writes one on any store), EVERY archive
         # writer must refresh it, or the next resume correctly reports a
@@ -1334,6 +1405,8 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
         # nothing to refresh.
         if not record.get('noop') and not record.get('branched'):
             relay.update_checksum_manifest(store_dir)
+        _record_stats_safe(_stats_record_summarize, store_dir, record,
+                           source, trigger, llm_usage, _arch_before, fused)
         return record
     device_id, device_name = relay.device_identity()
     foreign = _active_foreign_heartbeat(store_dir, device_id)
@@ -1347,6 +1420,8 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
                           filename_tag=device_id[:8])
         except Exception:
             cap = None
+        _record_stats_safe(_stats_module().record_summarize, store_dir,
+                           source, trigger, degraded=True, fused=fused)
         return {'degraded': True, 'reason': 'foreign-heartbeat',
                 'foreign': foreign, 'capture': cap,
                 'note': '另一台设备近期在写此项目，本次只采集不汇总'}
@@ -1357,13 +1432,77 @@ def summarize(store, toplevel, source, semantic_text=None, session=None, semanti
                                 ensure_ascii=False).encode('utf-8'))
     try:
         record = _summarize_impl(store, toplevel, source, semantic_text,
-                                 session, semantic_auto)
+                                 session, semantic_auto, trigger)
     finally:
         own_lock.unlink(missing_ok=True)
     if not record.get('noop') and not record.get('branched'):
         relay.update_checksum_manifest(store_dir)
         (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
+    _record_stats_safe(_stats_record_summarize, store_dir, record,
+                       source, trigger, llm_usage, _arch_before, fused)
     return record
+
+
+def _archive_text_lens(store_dir):
+    """Character lengths of the four formal archive files (stats input
+    for the archive increment; missing files read as zero)."""
+    out = {}
+    for name in ('state.md', 'decisions.md', 'lessons.md', 'backlog.md'):
+        path = Path(store_dir) / 'archive' / name
+        try:
+            out[name] = len(path.read_text(encoding='utf-8')) if path.exists() else 0
+        except (OSError, UnicodeDecodeError):
+            out[name] = 0
+    return out
+
+
+def _stats_record_summarize(store_dir, record, source, trigger, llm_usage,
+                            arch_before, fused):
+    """Translate a summarize outcome into one stats row. LLM figures:
+    a caller-reported usage object is measured; caller-supplied semantic
+    text without usage is one estimated call (input = new raw + old
+    summary, output = semantic text); assembled/auto runs provably made
+    zero calls and are measured zero."""
+    stats = _stats_module()
+    if record.get('noop'):
+        stats.record_summarize(store_dir, source, trigger, noop=True, fused=fused)
+        return
+    if record.get('branched'):
+        stats.record_summarize(store_dir, source, trigger,
+                               entry_range=record.get('entry_range'),
+                               branched=True, fused=fused)
+        return
+    if llm_usage:
+        calls = int(llm_usage.get('calls', 0))
+        in_tok = int(llm_usage.get('input_tokens', 0))
+        out_tok = int(llm_usage.get('output_tokens', 0))
+        measured = True
+    elif record.get('model_calls'):
+        calls = 1
+        in_tok = int(record.get('new_raw_tokens_est', 0)) \
+            + int(record.get('old_summary_tokens_est', 0))
+        out_tok = stats.tokens_for_chars(int(record.get('semantic_chars', 0)))
+        measured = False
+    else:
+        calls = 0
+        in_tok = 0
+        out_tok = 0
+        measured = True
+    arch_after = _archive_text_lens(store_dir)
+    delta_chars = sum(max(0, arch_after.get(k, 0) - arch_before.get(k, 0))
+                      for k in arch_before)
+    stats.record_summarize(
+        store_dir, source, trigger,
+        entry_count=int(record.get('entry_count', 0)),
+        entry_range=record.get('entry_range'),
+        new_raw_tokens_est=int(record.get('new_raw_tokens_est', 0)),
+        old_summary_tokens_est=int(record.get('old_summary_tokens_est', 0)),
+        llm_calls=calls, llm_in_tokens=in_tok, llm_out_tokens=out_tok,
+        llm_measured=measured,
+        assembled_chars=int(record.get('assembled_chars', 0)),
+        semantic_chars=int(record.get('semantic_chars', 0)),
+        archive_delta_tokens=stats.tokens_for_chars(delta_chars),
+        fused=fused)
 
 
 def _recover_incomplete_tx(store, toplevel, store_dir):
@@ -1435,7 +1574,8 @@ def _recover_incomplete_tx(store, toplevel, store_dir):
     return None
 
 
-def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False):
+def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, semantic_auto=False,
+                    trigger=None):
     """Incremental merge of pending raw entries into the archive (plan 1.12).
 
     Order: roll back stale claims -> refresh digest -> deterministic assembly
@@ -1479,7 +1619,8 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
             raise RelayError('锚点不匹配：游标锚点消息与条目 cap-%04d 不一致，汇总中止'
                              % cursor['entry_seq'])
     if not entries:
-        return {'noop': True, 'note': '游标之后无 pending 原料，无需汇总'}
+        return {'noop': True, 'note': '游标之后无 pending 原料，无需汇总',
+                'trigger': trigger}
     seq = _next_summary_seq(store_dir)
     snap = snapshot_v2(toplevel)
     numbers_path = store_dir / 'state' / 'numbers.json'
@@ -1549,6 +1690,13 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         appended_backlog.append(tid)
     # State patch: replace the managed block, verifying markers exist.
     state_text = (archive / 'state.md').read_text(encoding='utf-8')
+    # Batch 3.4: the old summary carried into this run is the previous
+    # managed state block (the whole file when unmarked).
+    if STATE_BEGIN in state_text and STATE_END in state_text:
+        _old_block = state_text[state_text.index(STATE_BEGIN):
+                                state_text.index(STATE_END) + len(STATE_END)]
+    else:
+        _old_block = state_text
     # Plan part 03, step 3.3 items 4-5: disk hashes at start are the
     # write guard's baseline, and open branches merge into the working
     # texts BEFORE assembly (append-type items deduped by content hash,
@@ -1598,6 +1746,7 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         return {'branched': True, 'branch': branch['id'], 'based_on': base_id,
                 'mismatches': mismatches,
                 'entry_range': [entries[0]['header']['seq'], entries[-1]['header']['seq']],
+                'trigger': trigger,
                 'note': '汇总基线在写入前被改动，产物已作为新支 %s 写入，未覆盖主支'
                         % branch['id']}
     # Transaction log first, then atomic writes (old substrate pattern).
@@ -1650,6 +1799,19 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
               'appended_backlog': appended_backlog,
               'rejected_lessons': rejected_lessons,
               'model_calls': model_calls,
+              # Batch 3.4 stats inputs (additive keys; old readers ignore
+              # them). Assembled vs LLM split: when the tool made no
+              # model call, the whole semantic text is assembled output;
+              # otherwise the state block is the assembled share and the
+              # caller-supplied text is the LLM share.
+              'entry_count': len(entries),
+              'new_raw_tokens_est': sum(estimate_tokens(e.get('body', ''))
+                                        for e in entries),
+              'old_summary_tokens_est': estimate_tokens(_old_block),
+              'assembled_chars': len(block) + (len(semantic_text)
+                                               if model_calls == 0 else 0),
+              'semantic_chars': len(semantic_text) if model_calls == 1 else 0,
+              'trigger': trigger,
               'checked_semantic_tail': checked_semantic[-500:],
               # Plan part 03, step 3.3 item 1: every summary product
               # carries its chain pointer. The chain head (first summary
@@ -2022,10 +2184,14 @@ def estimate_tokens(text):
     return -(-len(text) * 2 // 3)
 
 
-def inject(store, toplevel, budget=None):
-    """Fixed-order injection under a hard budget (plan 1.13): navigation ->
-    goal -> state top block -> backlog -> decisions/lessons trimmed last.
-    State top lines and backlog are never cut."""
+def _injection_parts(store, toplevel, budget=None):
+    """Shared construction for inject() and the 3.4 handoff counter.
+    Returns (text, layers). Layer map (plan S7): index = navigation +
+    goal + state top block; timeline = backlog; full = decisions/lessons
+    actually included after budget trimming (full text or headers-only).
+    All layer figures are estimates (chars / 1.5), like the budget
+    itself; the layer sum may differ from the total by separator
+    tokens, so the row uses the total for cost math."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     cfg = load_config(store_dir)
     budget = budget if budget is not None else cfg['inject_budget_tokens']
@@ -2042,18 +2208,39 @@ def inject(store, toplevel, budget=None):
     details = [(archive / 'decisions.md').read_text(encoding='utf-8'),
                (archive / 'lessons.md').read_text(encoding='utf-8')]
     text = '\n\n'.join(parts)
+    included = []
     for detail in details:
         candidate = text + '\n\n' + detail
         if estimate_tokens(candidate) <= budget:
             text = candidate
+            included.append(detail)
         else:
             # Trim details to headers only, then stop adding.
             headers = '\n'.join(l for l in detail.splitlines() if l.startswith('## '))
             candidate = text + '\n\n' + headers
             if estimate_tokens(candidate) <= budget:
                 text = candidate
+                included.append(headers)
             break
-    return {'text': text, 'tokens_estimate': estimate_tokens(text), 'budget': budget}
+    layers = {
+        'index': estimate_tokens('\n\n'.join(parts[:3])),
+        'timeline': estimate_tokens(parts[3]),
+        'full': estimate_tokens('\n\n'.join(included)) if included else 0,
+        'total': estimate_tokens(text),
+        'budget': budget,
+        'estimated': True,
+    }
+    return text, layers
+
+
+def inject(store, toplevel, budget=None):
+    """Fixed-order injection under a hard budget (plan 1.13): navigation ->
+    goal -> state top block -> backlog -> decisions/lessons trimmed last.
+    State top lines and backlog are never cut. Batch 3.4 adds the
+    per-layer measurement in 'layers' (same text, same budget)."""
+    text, layers = _injection_parts(store, toplevel, budget)
+    return {'text': text, 'tokens_estimate': layers['total'],
+            'budget': layers['budget'], 'layers': layers}
 
 
 # ---------------------------------------------------------------- resume (1.14)
@@ -2080,6 +2267,13 @@ def resume(store, toplevel, tool=None):
         return {'no_archive': True, 'message': message, 'sections': []}
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     cfg = load_config(store_dir)
+    # Batch 3.4: the handoff row's "previous summarize" is the latest
+    # summarize row BEFORE this takeover (a catch-up triggered below
+    # belongs to the next takeover's total, not this one). Fuse state
+    # is computed, not evaluated, so the read path stays write-free.
+    _stats = _stats_module()
+    _prev_sum = _record_stats_safe(_stats.latest_summarize_row, store_dir)
+    _fuse = _record_stats_safe(_stats.compute_fuse, store_dir) or {}
     # Section 1: archive summary.
     gstate, ginfo = relay.goal_status(store, toplevel)
     # Volume-2 display mapping only (plan 2.5.6 decoupling): the raw state
@@ -2185,6 +2379,7 @@ def resume(store, toplevel, tool=None):
             sec3 += '\n另一台设备近期在写此项目'
     # Section 4: backfill summary (the ONLY writing section).
     banner = None
+    _catchup = 0
     if q['pending']:
         uncovered = [e for e in list_entries(store_dir)
                      if e['header'].get('queue') == 'pending'
@@ -2217,6 +2412,7 @@ def resume(store, toplevel, tool=None):
             elif record.get('noop'):
                 raise RelayError('兜底汇总无原料可消费，纠正未能入档')
             else:
+                _catchup = 1
                 sec4 = ('四段·补汇总结果\n兜底汇总完成：序号 %d，覆盖条目 %s，触发源 resume-backfill'
                         % (record['seq'], record['entry_range']))
                 if corrections:
@@ -2252,6 +2448,32 @@ def resume(store, toplevel, tool=None):
     except Exception as exc:
         fork_section = ('分叉清单\n\n（分叉检测读取失败：%r，见 relay fork list）' % (exc,))
     sections = [sec1, sec2, sec3, sec4, sec5]
+    # Batch 3.4 handoff row: injection layers (same construction as
+    # inject(), read-only here), reconcile diffs by class, catch-up
+    # count, and the headline total (previous summarize LLM + injection).
+    # A stats failure must never fail the takeover itself.
+    try:
+        _text, _layers = _injection_parts(store, toplevel)
+    except Exception:
+        _layers = {'index': 0, 'timeline': 0, 'full': 0, 'total': 0}
+    _reconcile = {
+        'changed_files': changed_n if base is not None else 0,
+        'missing_files': len(missing) if base is not None else 0,
+        'branch_mismatch': 1 if (base is not None and snap['anchor']['branch']
+                                 != base['snapshot']['anchor']['branch']) else 0,
+        'staged_mismatches': len(mismatches) if base is not None else 0,
+        'manifest_mismatches': len(manifest_mismatches),
+    }
+    _record_stats_safe(_stats.record_handoff, store_dir, _layers, _reconcile,
+                       catchup_summaries=_catchup,
+                       prev_summarize_llm_tokens=(_prev_sum or {}).get('llm_tokens', 0))
+    # Batch 3.4 fuse alert: rides the sick banner (printed before
+    # section 1) so a tripped fuse is visible before any work starts.
+    if _fuse.get('tripped'):
+        _fuse_alert = ('【保险丝】周内汇总 LLM 成本异常飙升（%s），汇总已降级为'
+                       '只拼装；先查触发逻辑是否出 bug，再清保险丝。'
+                       % _fuse.get('reason', ''))
+        banner = _fuse_alert + ('\n' + banner if banner else '')
     # Plan part 03, step 3.2: the promotion block rides ALONGSIDE the five
     # sections, not as a sixth one -- the five-section contract and the
     # resume zero-write rule both stand. Rendering reads stored proposals

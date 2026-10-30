@@ -829,6 +829,10 @@ def _parser():
     su.add_argument('--source', default='scales')
     su.add_argument('--semantic-file')
     su.add_argument('--session')
+    su.add_argument('--trigger', choices=['milestone', 'volume', 'time',
+                                          'handoff', 'manual', 'pack'])
+    su.add_argument('--llm-usage', help='JSON：{"calls":n,"input_tokens":n,'
+                                        '"output_tokens":n}，有则记为实测')
     sub.add_parser('recover')
     sub.add_parser('handoff')
     inj = sub.add_parser('inject')
@@ -900,6 +904,17 @@ def _parser():
     sr.add_argument('--decision', choices=['keep-local', 'adopt-incoming'])
     sr.add_argument('--file')
     sub.add_parser('sync-accept')
+    # --- volume-3 slice 4 (plan part 03, step 3.4) ------------------------
+    # Cost stats: local-only report, tuning, and fuse controls.
+    st = sub.add_parser('stats')
+    st.add_argument('--weeks', type=int, default=4)
+    st.add_argument('--tune-knob', choices=['volume_files', 'volume_lines',
+                                            'time_days', 'inject_budget',
+                                            'precompress_sample_cap'])
+    st.add_argument('--tune-value', type=int)
+    st.add_argument('--tune-note', default='')
+    st.add_argument('--eval-tune', action='store_true')
+    st.add_argument('--clear-fuse', action='store_true')
     return p
 
 
@@ -981,6 +996,38 @@ def _print_sync_report(rep):
               % (verification.get('status'), verification.get('device_id'),
                  verification.get('key_id'),
                  '：' + verification['note'] if verification.get('note') else ''))
+
+
+def _stats_body(a, stats, store_dir):
+    """`relay stats` subcommands (plan part 03, step 3.4). Kept out of
+    main() so the stats module's own RelayError can be converted by
+    the caller (it loads a separate relay copy; see the stats branch)."""
+    if a.tune_knob is not None:
+        if a.tune_value is None:
+            raise RelayError('调优须同时给 --tune-value')
+        row = stats.apply_tuning(store_dir, a.tune_knob,
+                                 a.tune_value, note=a.tune_note or '')
+        print('调优：%s %s → %s（前两周接手均值 %s tokens，%d 次）'
+              % (row['knob'], row['old'], row['new'],
+                 row['before_mean'], row['before_n']))
+    elif a.eval_tune:
+        res = stats.evaluate_tuning(store_dir)
+        if not res.get('evaluated'):
+            print('评估：' + res.get('reason', ''))
+        else:
+            print('评估：%s %s → %s，前均值 %s，后均值 %s，%s'
+                  % (res['knob'], res['old'], res['new'],
+                     res['before_mean'], res['after_mean'],
+                     '有改善' if res['improved'] else '无改善'))
+            if res.get('rolled_back'):
+                print('已回退到稳定值 %s，结论写进教训 %s'
+                      % (res['stable'], res['lesson']))
+    elif a.clear_fuse:
+        stats.clear_fuse(store_dir)
+        print('保险丝已人工清除（下次评估若仍满足飙升条件会重新触发）。')
+    else:
+        print(stats.render_report(stats.build_report(store_dir,
+                                                     weeks=a.weeks)))
 
 
 def main(argv=None):
@@ -1470,8 +1517,10 @@ def main(argv=None):
             elif a.command == 'summarize':
                 semantic = (Path(a.semantic_file).read_text(encoding='utf-8')
                             if a.semantic_file else None)
+                usage = json.loads(a.llm_usage) if a.llm_usage else None
                 info = flow.summarize(store, root, source=a.source,
-                                      semantic_text=semantic, session=a.session)
+                                      semantic_text=semantic, session=a.session,
+                                      trigger=a.trigger, llm_usage=usage)
                 if info.get('noop'):
                     print(info['note'])
                 else:
@@ -1503,6 +1552,21 @@ def main(argv=None):
                     print(result['message'])
                 else:
                     print(flow.render_resume(result))
+        elif a.command == 'stats':
+            _sspec = importlib.util.spec_from_file_location(
+                'relay_stats', Path(__file__).resolve().parent / 'relay_stats.py')
+            stats = importlib.util.module_from_spec(_sspec)
+            _sspec.loader.exec_module(stats)
+            root = a.root
+            _row, store_dir = resolve_store_dir(store, root)
+            try:
+                _stats_body(a, stats, store_dir)
+            except stats.RelayError as exc:
+                # Stats loads its own relay copy, so its RelayError is a
+                # different class from this module's; convert it here so
+                # a guardrail refusal prints cleanly instead of tracing.
+                print('ERROR: ' + str(exc), file=sys.stderr)
+                return 1
     except (RelayError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
         print('ERROR: ' + str(exc), file=sys.stderr)
         return 1
