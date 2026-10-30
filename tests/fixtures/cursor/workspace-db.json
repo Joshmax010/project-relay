@@ -1,0 +1,1 @@
+{"ItemTable":{},"_fixture_note":"合成样本：按社区文档的 cursorDiskKV 形状合成，未经实机验证。","cursorDiskKV":{"composerData:comp-001":{"composerId":"comp-001","createdAt":1760000000000,"fullConversationHeadersOnly":["b-user-1","b-asst-1","b-tool-1","b-think-1","b-user-2","b-missing-1","b-invalid-1"],"lastUpdatedAt":1760003600000,"name":"fixture-session"}}}
