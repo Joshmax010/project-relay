@@ -613,6 +613,24 @@ def assess_gaps(report, goal_state):
     return gaps
 
 
+def _append_submodule_gaps(report, store_dir, toplevel):
+    """Volume 3, 3.6.1: submodule scope exclusion in the fidelity
+    declaration (exact plan wording). Snapshot is read-only; a snapshot
+    failure here must never fail the backfill itself."""
+    try:
+        snap = flow.snapshot_v2(toplevel, store_dir)
+    except Exception:
+        return
+    for g in snap['gaps']:
+        report['gaps'].append({
+            'category': '过程',
+            'item': '子模块 %s 未纳入接力范围，其内部状态不归 relay 管' % g['path'],
+            'impact': '中',
+            'reason': '指纹计算跳过子模块路径（指针 %s）；子模块内部如需接力，须在其仓内单独建档'
+                      % g['pointer'],
+            'options': [{'action': '在子模块仓内单独建档', 'cost': '中'}]})
+
+
 def _fidelity_warnings(matched, per_tool, workbuddy_gap_sessions):
     warnings = []
     for tool, info in per_tool.items():
@@ -746,6 +764,7 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
                                           for t, i in per_tool.items()],
                               'warnings': _fidelity_warnings(matched, per_tool, [])}
         report['gaps'] = assess_gaps(report, relay.goal_status(store, toplevel)[0])
+        _append_submodule_gaps(report, store_dir, toplevel)
         _save_report(store_dir, report)
         return report
     # Excerpt tier: process most recent N (chronological write order).
@@ -798,7 +817,7 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
         anchor_msg = _truncate(user_msgs[-1], 500) if user_msgs else None
         if anchor_msg is not None:
             anchor_msg, _ = flow.redact(anchor_msg)
-        snap = flow.snapshot_v2(toplevel)
+        snap = flow.snapshot_v2(toplevel, store_dir)
         seq = flow._next_seq(store_dir)
         prev = existing[-1] if existing else None
         header = {'version': 1, 'seq': seq, 'captured_at': utc(),
@@ -836,6 +855,7 @@ def backfill(store, toplevel, home=None, tools=None, tier='excerpt',
                            'warnings': _fidelity_warnings(matched, per_tool,
                                                           report['assistant_gap_sessions'])}
     report['gaps'] = assess_gaps(report, relay.goal_status(store, toplevel)[0])
+    _append_submodule_gaps(report, store_dir, toplevel)
     if summarize_after and created:
         semantic = _build_semantic(report, aggregated)
         record = flow.summarize(store, toplevel, source='backfill',

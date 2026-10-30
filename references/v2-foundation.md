@@ -13,6 +13,9 @@
 - 每项目仓六区：`raw/`（采集原料）、`archive/`（正式档案：goal/state/backlog/
   decisions/lessons 五件套）、`state/`（游标、草案、暂定记录等机器状态）、
   `tx/`（事务日志）、`backups/`（不可变备份）、`receipts/`（目标确认收据）。
+- **子模块排除（卷三 3.6.1）**：指纹计算跳过子模块路径（mode 160000 的
+  gitlink），缺口记在快照 `gaps`；子模块内部不在本仓档案范围内，想接力
+  须在子模块仓内单独建档。缺口标注位置见 `references/v2-boundaries.md`。
 - 全部档案为纯文本（JSON 规范序列化、Markdown 文档），不引入数据库引擎。
 - **写入纪律（评审红线）**：全部写入必须经 `atomic()`（同目录临时文件 →
   fsync → os.replace，新文件 0644、已有文件保原 mode）。任何直接 open 写

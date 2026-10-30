@@ -37,6 +37,7 @@ when deriving the store root. Production never sets it.
 import argparse
 import difflib
 import importlib.util
+import shutil
 import json
 import tempfile
 import os
@@ -236,13 +237,176 @@ def remote_key(url):
 
 
 def local_key(toplevel):
-    """Weak key for remote-less projects: hash of the resolved top-level path."""
-    return digest(str(toplevel).encode('utf-8'))[:16]
+    """Weak key for remote-less projects (plan 3.6.3): hash of the resolved
+    top-level path plus the root-commit hash. Repos with no commits yet
+    fall back to the path hash alone. Rows created under the old
+    path-only formula keep their key: register() finds rows by path first
+    and never re-keys a local row to another local key (grandfathered)."""
+    roots = git(toplevel, 'rev-list', '--max-parents=0', 'HEAD', check=False)
+    root_shas = sorted(l.strip() for l in roots.stdout.decode().splitlines() if l.strip())
+    return digest((str(toplevel) + '\0' + ','.join(root_shas)).encode('utf-8'))[:16]
+
+
+# Volume 3, 3.6.3: the archive-header weak-identity line. It lives in
+# state.md OUTSIDE the managed block, so summarize rewrites never wipe
+# it; migration strips exactly this line (matched by the marker prefix).
+WEAK_IDENTITY_MARKER = '身份：弱身份'
+WEAK_IDENTITY_LINE = ('身份：弱身份（无 git remote；键为路径哈希 + 首提交哈希；'
+                       '加 remote 后可迁移，见 relay migrate-key）')
+
+
+def _ensure_weak_identity_line(store_dir):
+    """Append the weak-identity line to state.md if absent (init only).
+    Idempotent; never touches the managed block or user content."""
+    p = store_path(store_dir, 'archive', 'state.md')
+    if not p.exists():
+        return False
+    text = p.read_text(encoding='utf-8')
+    if WEAK_IDENTITY_MARKER in text:
+        return False
+    atomic(p, (text.rstrip('\n') + '\n\n' + WEAK_IDENTITY_LINE + '\n').encode('utf-8'))
+    return True
+
+
+def _strip_weak_identity_line(store_dir):
+    """Remove exactly the weak-identity line after a migration."""
+    p = store_path(store_dir, 'archive', 'state.md')
+    if not p.exists():
+        return False
+    lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
+    kept = [l for l in lines if WEAK_IDENTITY_MARKER not in l]
+    if len(kept) == len(lines):
+        return False
+    atomic(p, ''.join(kept).encode('utf-8'))
+    return True
+
+
+def _migrate_row_to_remote(store, registry, row, key, canonical):
+    """Weak -> strong migration (plan 1.3 ORIGINAL, shared by register()
+    and the explicit `relay migrate-key` command, plan 3.6.3). Renames
+    the store dir (or quarantines to trash on collision), appends a
+    tombstone row, records migrated_from, and strips the weak-identity
+    header line from the migrated archive. Returns notes."""
+    notes = []
+    old_key, old_slug = row['key'], row['slug']
+    old_dir = store / 'projects' / (old_key + '-' + old_slug)
+    new_dir = store / 'projects' / (key + '-' + row['slug'])
+    if old_dir.exists() and not new_dir.exists():
+        old_dir.rename(new_dir)
+        notes.append('项目键已迁移：本地键 %s -> remote 键 %s，记忆仓已改名' % (old_key, key))
+        _strip_weak_identity_line(new_dir)
+    elif old_dir.exists():
+        target = store / 'trash' / (old_key + '-' + utc().replace(':', '-'))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        old_dir.rename(target)
+        notes.append('旧仓已移入 trash（%s），内容未自动合并，请人工核对' % target)
+    else:
+        notes.append('项目键已迁移：本地键 %s -> remote 键 %s（旧仓不存在，无需改名）' % (old_key, key))
+    tombstone = dict(row)
+    tombstone.update({'status': 'migrated', 'migrated_to': key,
+                      'paths': list(row.get('paths', []))})
+    row.update({'key': key, 'key_type': 'remote', 'remote': canonical,
+                'migrated_from': [*row.get('migrated_from', []), old_key],
+                'last_active': utc()})
+    registry['projects'].append(tombstone)
+    save_registry(store, registry)
+    return notes
+
+
+def pending_key_migration(store, toplevel):
+    """Plan 3.6.3: detect a weak -> remote migration waiting at pack time.
+    Read-only; never migrates by itself. Returns None or a dict with
+    old_key/new_key/remote, for pack to prompt (not auto-migrate)."""
+    try:
+        toplevel = git_toplevel(toplevel)
+        registry = load_registry(store)
+        row = find_row_by_path(registry, toplevel)
+        if row is None or row.get('key_type') != 'local':
+            return None
+        remote_url = origin_remote(toplevel)
+        canonical = normalize_remote(remote_url) if remote_url else None
+        key = remote_key(remote_url) if canonical else None
+        if not key or key == row['key']:
+            return None
+        return {'old_key': row['key'], 'new_key': key, 'remote': canonical,
+                'slug': row['slug']}
+    except Exception:
+        return None
+
+
+def migrate_key(store, toplevel):
+    """Explicit weak -> remote migration (plan 3.6.3). Refuses unless a
+    migration is actually pending; the rename + tombstone + migrated_from
+    trail makes it auditable and re-checkable."""
+    toplevel = git_toplevel(toplevel)
+    registry = load_registry(store)
+    row = find_row_by_path(registry, toplevel)
+    require(row is not None, '未登记，先运行 relay init')
+    require(row.get('key_type') == 'local', '当前已是 remote 键，无需迁移')
+    pending = pending_key_migration(store, toplevel)
+    require(pending is not None, '尚无 remote 或键已一致，无法迁移')
+    notes = _migrate_row_to_remote(store, registry, row,
+                                   pending['new_key'], pending['remote'])
+    return {'old_key': pending['old_key'], 'new_key': pending['new_key'],
+            'remote': pending['remote'], 'notes': notes}
 
 
 def slug_for(name):
     slug = re.sub(r'[^a-z0-9._-]+', '-', name.lower()).strip('-.')
     return (slug[:40] or 'project')
+
+
+def split_archive(store, toplevel, scope, name):
+    """Explicit monorepo split (plan 3.6.6). The parent archive is cloned
+    at split time: baseline + last-summary are copied, so the child's
+    first post-split summary takes its based_on from the parent's latest
+    summary (the split point, 3.3 chain semantics) with no new pointer
+    format. The child then evolves independently; the parent is untouched.
+    The child row carries key_type 'split' and a split_from audit trail.
+    Addressing note: path lookup still resolves the parent row (first
+    match wins); the child is addressed by key (relay where --key)."""
+    toplevel = git_toplevel(toplevel)
+    scope = scope.strip().strip('/')
+    require(bool(scope) and scope != '.' and '..' not in Path(scope).parts,
+            '范围必须是仓内子目录（拒绝 . 与越界）')
+    scope_path = toplevel / scope
+    require(scope_path.is_dir(), '范围目录不存在：' + scope)
+    slug = slug_for(name)
+    require(bool(slug), '拆分名无效')
+    row, parent_dir = resolve_store_dir(store, toplevel)
+    child_key = digest((row['key'] + '\0' + scope).encode('utf-8'))[:16]
+    registry = load_registry(store)
+    require(find_row_by_key(registry, child_key) is None,
+            '该范围已拆分过（子键 %s）' % child_key)
+    child_dir = store / 'projects' / (child_key + '-' + slug)
+    require(not child_dir.exists(), '目标分仓已存在：' + str(child_dir))
+    last_path = parent_dir / 'state' / 'last-summary.json'
+    split_seq = None
+    if last_path.exists():
+        try:
+            _last = read_json(last_path)
+            split_seq = _last.get('seq', _last.get('summary_seq'))
+        except Exception:
+            split_seq = None
+    split_summary_id = ('sum-%04d' % split_seq) if isinstance(split_seq, int) else None
+    shutil.copytree(parent_dir, child_dir, symlinks=True)
+    split_from = {'parent_key': row['key'], 'parent_slug': row['slug'],
+                  'scope': scope, 'split_seq': split_seq,
+                  'split_summary_id': split_summary_id}
+    cfg_path = child_dir / 'state' / 'config.json'
+    cfg = read_json(cfg_path) if cfg_path.exists() else {}
+    cfg.update({'scope': scope, 'split_from': split_from})
+    save(cfg_path, cfg)
+    child_row = {'key': child_key, 'slug': slug, 'display_name': name,
+                 'paths': [str(toplevel)], 'remote': row.get('remote'),
+                 'created_at': utc(), 'last_active': utc(),
+                 'key_type': 'split', 'status': 'active', 'migrated_from': [],
+                 'scope': scope, 'split_from': split_from}
+    registry['projects'].append(child_row)
+    save_registry(store, registry)
+    return {'parent_key': row['key'], 'child_key': child_key, 'slug': slug,
+            'child_dir': child_dir, 'scope': scope, 'split_seq': split_seq,
+            'split_summary_id': split_summary_id, 'split_from': split_from}
 
 
 def git_toplevel(path):
@@ -299,28 +463,8 @@ def register(store, toplevel):
         if row['key'] == key:
             return row, False, notes
         if row.get('key_type') == 'local' and key_type == 'remote':
-            # Weak -> strong migration (plan 1.3 ORIGINAL).
-            old_key, old_slug = row['key'], row['slug']
-            old_dir = store / 'projects' / (old_key + '-' + old_slug)
-            new_dir = store / 'projects' / (key + '-' + row['slug'])
-            if old_dir.exists() and not new_dir.exists():
-                old_dir.rename(new_dir)
-                notes.append('项目键已迁移：本地键 %s -> remote 键 %s，记忆仓已改名' % (old_key, key))
-            elif old_dir.exists():
-                target = store / 'trash' / (old_key + '-' + utc().replace(':', '-'))
-                target.parent.mkdir(parents=True, exist_ok=True)
-                old_dir.rename(target)
-                notes.append('旧仓已移入 trash（%s），内容未自动合并，请人工核对' % target)
-            else:
-                notes.append('项目键已迁移：本地键 %s -> remote 键 %s（旧仓不存在，无需改名）' % (old_key, key))
-            tombstone = dict(row)
-            tombstone.update({'status': 'migrated', 'migrated_to': key,
-                              'paths': list(row.get('paths', []))})
-            row.update({'key': key, 'key_type': 'remote', 'remote': canonical,
-                        'migrated_from': [*row.get('migrated_from', []), old_key],
-                        'last_active': utc()})
-            registry['projects'].append(tombstone)
-            save_registry(store, registry)
+            # Weak -> strong migration (plan 1.3 ORIGINAL, shared helper).
+            notes.extend(_migrate_row_to_remote(store, registry, row, key, canonical))
             return row, True, notes
         notes.append('remote 已变化但沿用既有项目键，不降级为本地键')
         return row, False, notes
@@ -459,6 +603,9 @@ def init(store, toplevel):
         atomic(dest, template)
     if repaired:
         notes.append('骨架截断已修复：' + '、'.join(repaired))
+    # Volume 3, 3.6.3: weak-identity header line for remote-less projects.
+    if row.get('key_type') == 'local' and _ensure_weak_identity_line(store_dir):
+        notes.append('档案头已标注弱身份（无 git remote）')
     preview = legacy_preview(toplevel)
     return {'store_dir': store_dir, 'key': row['key'], 'row': row,
             'registered_changed': changed, 'notes': notes, 'preview': preview,
@@ -749,6 +896,10 @@ def _parser():
                    help='记忆仓根目录（默认 ~/.project-relay；测试用）')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
+    sub.add_parser('migrate-key')
+    sp = sub.add_parser('split')
+    sp.add_argument('--scope', required=True, help='仓内子目录（相对仓根，如 pkg/a）')
+    sp.add_argument('--name', required=True, help='子项目名（作分仓 slug）')
     w = sub.add_parser('where')
     w.add_argument('--key')
     w.add_argument('--path')
@@ -1043,6 +1194,21 @@ def main(argv=None):
                 print('注：' + note)
             for line in result['preview']:
                 print(line)
+        elif a.command == 'migrate-key':
+            result = migrate_key(store, a.root)
+            print('身份迁移完成：%s -> %s（remote %s）'
+                  % (result['old_key'], result['new_key'], result['remote']))
+            for note in result['notes']:
+                print('注：' + note)
+        elif a.command == 'split':
+            result = split_archive(store, a.root, a.scope, a.name)
+            print('拆分完成：父键 %s，子键 %s（%s），范围 %s'
+                  % (result['parent_key'], result['child_key'], result['slug'],
+                     result['scope']))
+            print('拆分点：%s' % result['split_summary_id'])
+            print('子仓：' + str(result['child_dir']))
+            print('注：子仓首个汇总的 based_on 指向拆分点；按路径寻址仍返回父行，'
+                  '子仓请按项目键寻址（relay where --key %s）' % result['child_key'])
         elif a.command == 'where':
             result = where(store, path=a.path or a.root, key=a.key)
             if result['found']:
@@ -1193,6 +1359,13 @@ def main(argv=None):
                             print('注：已覆盖上一份未还原的快照')
                     elif wip.get('status') == 'skipped':
                         print('快照未推送：' + wip.get('reason', ''))
+                    # Volume 3, 3.6.3: pack-time migration prompt (never auto).
+                    prompt = result.get('key_migration_prompt')
+                    if prompt:
+                        print('身份迁移待确认：本项目当前为弱身份键 %s，检测到 remote %s，'
+                              '可迁移至 %s；迁移请运行 relay migrate-key'
+                              '（分仓目录改名 + 索引更新，全程留痕），本次 pack 仍用弱身份键，未自动迁移'
+                              % (prompt['old_key'], prompt['remote'], prompt['new_key']))
                 elif a.command == 'unpack':
                     try:
                         _top = git_toplevel(a.root)
@@ -1507,6 +1680,16 @@ def main(argv=None):
                          len(c['renamed']), m['lines']['added'], m['lines']['deleted']))
                 for g in m['snapshot']['gaps']:
                     print('缺口：子模块 %s 未深入（指针 %s）' % (g['path'], g['pointer']))
+                t = m['snapshot'].get('timing') or {}
+                print('指纹耗时 %.2fs（文件 %d 个，缓存命中 %d / 未命中 %d）'
+                      % (t.get('elapsed_s', 0.0), t.get('files', 0),
+                         t.get('cache_hits', 0), t.get('cache_misses', 0)))
+                if t.get('exceeded'):
+                    print('指纹耗时超过阈值（%.1fs），可配置排除目录：'
+                          'state/config.json 的 fingerprint_excludes，'
+                          '排除项写入保真度声明' % t.get('threshold_s', 30.0))
+                for e in m['snapshot'].get('excluded', []):
+                    print('已排除：%s' % e)
             elif a.command == 'scales':
                 rec = flow.scales(store, root, session=a.session)
                 for row in rec['rows']:

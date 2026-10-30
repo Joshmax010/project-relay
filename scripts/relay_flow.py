@@ -178,6 +178,11 @@ DEFAULT_CONFIG = {
     'exclude_globs': [],
     'chain_compress_threshold': 200,
     'chain_compress_keep': 10,
+    # Volume 3, 3.6.5: incremental fingerprint cache + cost guard.
+    'fingerprint_excludes': [],
+    'fingerprint_threshold_s': 30.0,
+    # Volume 3, 3.6.6: archive coverage scope; None = whole repo.
+    'scope': None,
 }
 ARCHIVE_BUDGETS = {
     'state.md': (100, 8000),
@@ -329,7 +334,7 @@ def capture(store, toplevel, tool=None, session=None, message=None,
     toplevel = relay.git_toplevel(toplevel)
     seq = _next_seq(store_dir)
     try:
-        snap = snapshot_v2(toplevel)
+        snap = snapshot_v2(toplevel, store_dir)
         entries = list_entries(store_dir)
         prev = entries[-1] if entries else None
         prev_code = prev['header']['fingerprint']['code'] if prev else {}
@@ -351,6 +356,9 @@ def capture(store, toplevel, tool=None, session=None, message=None,
             fact_lines += ['', '- 缺口：']
             fact_lines += ['  子模块 %s 未深入（指针 %s），其内部变化不可见'
                            % (g['path'], g['pointer']) for g in snap['gaps']]
+        if snap.get('excluded'):
+            fact_lines += ['', '- 已排除（指纹排除配置，不计入指纹）：']
+            fact_lines += ['  ' + e for e in snap['excluded']]
         fact = '\n'.join(fact_lines) + '\n'
         # Dedup key: the repo state itself (anchor + code + gaps), NOT the
         # rendered fact text — the "changed vs previous entry" line is
@@ -409,7 +417,7 @@ def capture(store, toplevel, tool=None, session=None, message=None,
     except Exception as exc:  # degraded entry, then fail loudly (plan 1.6)
         try:
             try:
-                snap = snapshot_v2(toplevel)
+                snap = snapshot_v2(toplevel, store_dir)
                 anch = snap['anchor']
             except Exception:
                 anch = {'head': None, 'branch': None}
@@ -542,14 +550,60 @@ def archive_summarized(store_dir, keep_latest=True):
 
 
 # ---------------------------------------------------------------- fingerprint (1.10)
-def snapshot_v2(toplevel):
+def _fingerprint_cache_path(store_dir):
+    return store_dir / 'state' / 'fingerprint-cache.json'
+
+
+def _load_fingerprint_cache(store_dir):
+    path = _fingerprint_cache_path(store_dir)
+    if not path.exists():
+        return {}, False
+    try:
+        value = read_json(path)
+    except Exception:
+        return {}, False
+    if not isinstance(value, dict) or not isinstance(value.get('entries'), dict):
+        return {}, False
+    return value['entries'], True
+
+
+def snapshot_v2(toplevel, store_dir=None, threshold_s=None):
     """Whole-repo fingerprint, mirroring old snapshot()'s algorithm with two
     plan-mandated adaptations (deviation D1): no .agent coupling, and gitlink
     entries are skipped with a gap declaration instead of raising.
 
-    Returns {'anchor', 'code': {rel: entry|None}, 'gaps': [{path, pointer}]}.
+    Volume 3, 3.6.5 (incremental cache): when store_dir is given, per-file
+    hashes are cached in state/fingerprint-cache.json keyed by lstat
+    (mtime_ns, ctime_ns, ino, size) plus the symlink target; only files
+    whose stat changed are re-hashed. The executable bit is always read
+    fresh from stat (cheap) and never cached. A same-size overwrite that
+    also preserves all stat fields is missed until stat changes -- the
+    same tradeoff git's own racy-clean logic makes, documented in
+    references/v2-boundaries.md. Config key 'fingerprint_excludes' (list
+    of posix path prefixes, state/config.json) skips paths from hashing;
+    skipped paths are reported in 'excluded', never silently dropped.
+
+    Returns {'anchor', 'code': {rel: entry|None}, 'gaps': [{path, pointer}],
+    'excluded': [rel], 'timing': {elapsed_s, files, cache_hits,
+    cache_misses, threshold_s, exceeded, first_snapshot}}.
     Code entries mirror the old shape: {sha256, kind, executable?}."""
+    import stat as _stat
+    import time as _time
+    _t0 = _time.monotonic()
     toplevel = relay.git_toplevel(toplevel)
+    cfg = {}
+    if store_dir is not None:
+        try:
+            cfg = load_config(store_dir)
+        except Exception:
+            cfg = {}
+    if threshold_s is None:
+        threshold_s = cfg.get('fingerprint_threshold_s', 30.0)
+    excludes = [e for e in (cfg.get('fingerprint_excludes') or [])
+                if isinstance(e, str) and e]
+    cache, cache_existed = ({}, False)
+    if store_dir is not None:
+        cache, cache_existed = _load_fingerprint_cache(store_dir)
     stages = git(toplevel, 'ls-files', '--stage', '-z', check=False).stdout.split(b'\0')
     cached_modes = {}
     gaps = []
@@ -571,11 +625,16 @@ def snapshot_v2(toplevel):
     # to the store directory only; the old three-direction tests still apply).
     filemode = git(toplevel, 'config', '--get', 'core.filemode', check=False).stdout.strip() != b'false'
     code = {}
+    excluded = []
     gap_paths = {g['path'] for g in gaps}
-    import stat as _stat
+    hits = misses = 0
+    new_cache = {}
     for rel in sorted(paths):
         # The gitlink entry itself (and anything under it) is a gap, not code.
         if any(rel == g or rel.startswith(g + '/') for g in gap_paths):
+            continue
+        if any(rel == e or rel.startswith(e.rstrip('/') + '/') for e in excludes):
+            excluded.append(rel)
             continue
         p = toplevel / rel
         for parent in p.parents:
@@ -583,16 +642,45 @@ def snapshot_v2(toplevel):
                 break
             require(not parent.is_symlink(), '代码路径经过符号链接目录: ' + rel)
         if p.is_symlink():
-            value = {'sha256': digest(os.fsencode(os.readlink(p))), 'kind': 'symlink'}
-        elif not p.exists():
-            value = None
+            target = os.readlink(p)
+            value = {'sha256': digest(os.fsencode(target)), 'kind': 'symlink'}
+            code[rel] = value
+            continue
+        if not p.exists():
+            code[rel] = None
+            continue
+        require(p.is_file(), '快照中出现非普通文件: ' + rel)
+        st = os.lstat(p)
+        cached = cache.get(rel) if store_dir is not None else None
+        if (cached is not None and cached.get('kind') == 'file'
+                and cached.get('mtime_ns') == st.st_mtime_ns
+                and cached.get('ctime_ns') == st.st_ctime_ns
+                and cached.get('ino') == st.st_ino
+                and cached.get('size') == st.st_size):
+            sha = cached['sha256']
+            hits += 1
         else:
-            require(p.is_file(), '快照中出现非普通文件: ' + rel)
-            value = {'sha256': digest(p.read_bytes()), 'kind': 'file',
-                     'executable': bool(p.stat().st_mode & _stat.S_IXUSR) if filemode
+            sha = digest(p.read_bytes())
+            misses += 1
+        if store_dir is not None:
+            new_cache[rel] = {'mtime_ns': st.st_mtime_ns, 'ctime_ns': st.st_ctime_ns,
+                              'ino': st.st_ino, 'size': st.st_size,
+                              'sha256': sha, 'kind': 'file'}
+        code[rel] = {'sha256': sha, 'kind': 'file',
+                     'executable': bool(st.st_mode & _stat.S_IXUSR) if filemode
                                    else cached_modes.get(rel, b'100644') == b'100755'}
-        code[rel] = value
-    return {'anchor': anchor(toplevel), 'code': code, 'gaps': gaps}
+    if store_dir is not None:
+        # Prune entries for paths no longer listed; excluded paths are
+        # dropped too (they re-hash if un-excluded later -- correct).
+        save(_fingerprint_cache_path(store_dir),
+             {'version': 1, 'entries': new_cache})
+    elapsed = _time.monotonic() - _t0
+    return {'anchor': anchor(toplevel), 'code': code, 'gaps': gaps,
+            'excluded': excluded,
+            'timing': {'elapsed_s': elapsed, 'files': len(code),
+                       'cache_hits': hits, 'cache_misses': misses,
+                       'threshold_s': threshold_s, 'exceeded': elapsed > threshold_s,
+                       'first_snapshot': not cache_existed}}
 
 
 def diff_counts(before, after):
@@ -677,7 +765,7 @@ def measure_change(store, toplevel):
     """Current snapshot vs the last successful summary baseline (plan 1.10)."""
     _row, store_dir = relay.resolve_store_dir(store, toplevel)
     toplevel = relay.git_toplevel(toplevel)
-    snap = snapshot_v2(toplevel)
+    snap = snapshot_v2(toplevel, store_dir)
     base = load_baseline(store_dir)
     if base is None:
         return {'snapshot': snap, 'counts': diff_counts({'code': {}}, snap),
@@ -1622,7 +1710,7 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         return {'noop': True, 'note': '游标之后无 pending 原料，无需汇总',
                 'trigger': trigger}
     seq = _next_summary_seq(store_dir)
-    snap = snapshot_v2(toplevel)
+    snap = snapshot_v2(toplevel, store_dir)
     numbers_path = store_dir / 'state' / 'numbers.json'
     whitelist_values = []
     if numbers_path.exists():
@@ -2111,6 +2199,7 @@ def make_handoff(store, toplevel):
         last = read_json(last_path)
     measure = measure_change(store, toplevel)
     gaps = ['子模块 %s 未深入' % g['path'] for g in measure['snapshot']['gaps']]
+    gaps += ['已排除 %s（指纹排除配置）' % e for e in measure['snapshot'].get('excluded', [])]
     queue = queue_status(store_dir, repair=False)
     if queue['stale_summarizing']:
         gaps.append('队列异常：summarizing 超时条目 %s' % queue['stale_summarizing'])
@@ -2256,15 +2345,36 @@ def resume(store, toplevel, tool=None):
         # project (it has a remote) with no local store most likely left
         # its archive on the old device. A purely local project (no
         # remote) is just new, so no hint there.
+        # Volume 3, 3.6.2: zero-archive start hands the choice to the
+        # user WITH a read-only assessment (the缺料评估 step): git
+        # history depth + legacy .agent presence. Still zero writes.
         try:
             has_remote = relay.origin_remote(toplevel) is not None
         except Exception:
             has_remote = False
+        try:
+            _cnt = git(toplevel, 'rev-list', '--count', 'HEAD', check=False)
+            commits = int(_cnt.stdout.decode().strip()) if _cnt.returncode == 0 else 0
+        except Exception:
+            commits = 0
+        legacy = (toplevel / '.agent').is_dir()
+        if legacy or commits > 0:
+            advice = '评估建议：走回溯建档（有可回溯的材料：%s）。' % (
+                '、'.join(x for x in [
+                    '旧 .agent 目录' if legacy else '',
+                    '%d 个提交' % commits if commits > 0 else ''] if x))
+        else:
+            advice = '评估建议：空仓且无旧材料，从零 init 更合适。'
+        assessment = {'has_remote': has_remote, 'commits': commits,
+                      'legacy_agent': legacy, 'advice': advice}
         message = ('无档案：本项目尚未建仓。二选一：走回溯建档（relay backfill，卷一 1.15）'
                    '或从零 init（relay init）。选定前本命令只做只读速览，不写任何东西。')
         if has_remote:
             message += '若这是新设备上 clone 下来的项目：此项目的档案可能还在旧设备上，请回旧设备执行 pack。'
-        return {'no_archive': True, 'message': message, 'sections': []}
+        message += ('缺料评估：提交 %d 个，旧 .agent 目录：%s。%s'
+                    % (commits, '有' if legacy else '无', advice))
+        return {'no_archive': True, 'message': message, 'sections': [],
+                'assessment': assessment}
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     cfg = load_config(store_dir)
     # Batch 3.4: the handoff row's "previous summarize" is the latest
@@ -2291,7 +2401,7 @@ def resume(store, toplevel, tool=None):
     sec1 = ('一段·档案摘要\n目标状态：%s\n%s\n未闭环待办：%d 条'
             % (gstate_display, top, open_count))
     # Section 2: reconcile against the live repo (status quo wins).
-    snap = snapshot_v2(toplevel)
+    snap = snapshot_v2(toplevel, store_dir)
     base = load_baseline(store_dir)
     lines2 = ['二段·对账结果']
     if base is not None:

@@ -3302,12 +3302,18 @@ def pack(store, toplevel, remote=None, device_name=None, carrier=None,
     cfg = load_sync_config(store)
     c = _carrier_of(store, cfg, carrier)
     if c == 'folder':
-        return pack_folder(store, toplevel, device_name=device_name)
-    if c == 'server':
-        return pack_server(store, toplevel, device_name=device_name)
-    return _pack_git(store, toplevel, remote=remote, device_name=device_name,
-                     overwrite_unconsumed=overwrite_unconsumed,
-                     trust_unsigned=trust_unsigned, repin=repin)
+        result = pack_folder(store, toplevel, device_name=device_name)
+    elif c == 'server':
+        result = pack_server(store, toplevel, device_name=device_name)
+    else:
+        result = _pack_git(store, toplevel, remote=remote, device_name=device_name,
+                           overwrite_unconsumed=overwrite_unconsumed,
+                           trust_unsigned=trust_unsigned, repin=repin)
+    # Volume 3, 3.6.3: pack-time prompt, never auto-migration. A weak-key
+    # project that gained a remote is reported here; the pack itself still
+    # uses the weak key until the user runs `relay migrate-key`.
+    result['key_migration_prompt'] = relay.pending_key_migration(store, toplevel)
+    return result
 
 
 # ---------------------------------------------------------------- unpack
