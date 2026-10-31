@@ -10,8 +10,14 @@ def initialize(root):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError('项目根目录必须已经存在且为目录')
-    result = subprocess.run(['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
-                            capture_output=True, text=True, timeout=60)
+    # Batch 3, A2: decode git output as UTF-8 explicitly. With the locale
+    # default (cp936 on a Chinese Windows install), a non-ASCII project
+    # path comes back mojibake and the resolve() comparison below fails
+    # closed with a misleading "not a git project" error.
+    result = subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(root),
+                             'rev-parse', '--show-toplevel'],
+                            capture_output=True, text=True, encoding='utf-8',
+                            timeout=60)
     if result.returncode or Path(result.stdout.strip()).resolve() != root:
         raise ValueError('本版仅支持 Git 代码项目；请指定 Git 仓库根目录，不自动运行 git init')
     target = root / '.agent'

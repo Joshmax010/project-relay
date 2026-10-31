@@ -117,8 +117,24 @@ def read_json(path):
     return json.loads(path.read_text(encoding='utf-8'))
 
 
-def git(root, *args, check=True, input_data=None):
-    result = subprocess.run(['git', '-C', str(root), *args], stdout=subprocess.PIPE,
+def git(root, *args, check=True, input_data=None, honor_autocrlf=False):
+    # Batch 3, A1: every git invocation through this wrapper pins
+    # core.autocrlf=false for the process only. Relay hashes working-tree
+    # bytes itself, so a checkout-time LF->CRLF conversion (Windows with
+    # autocrlf=true) silently breaks bundle hashes, Ed25519 pack
+    # signatures and store checkouts. The flag is per-process: the user's
+    # global/system autocrlf is never read for writing and never changed.
+    # Carve-out (honor_autocrlf): commit_check and resume() compare
+    # content the USER staged with their own git against the worktree.
+    # The index blob was produced under the repo's own autocrlf setting,
+    # so those three comparisons must use the same semantics, or a
+    # Windows user with the default autocrlf=true gets a false
+    # 'worktree differs from index' on every CRLF file they staged
+    # correctly. Relay-operated repos (sync store) never take this path:
+    # relay stages there too, so forced-false stays self-consistent.
+    cmd = ['git'] + ([] if honor_autocrlf else ['-c', 'core.autocrlf=false'])
+    cmd += ['-C', str(root), *args]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, input=input_data, timeout=60)
     if check:
         require(result.returncode == 0, 'Git 操作失败: ' + ' '.join(args))
@@ -147,20 +163,34 @@ def anchor(root):
 
 
 def snapshot(root):
-    """Cover tracked/deleted and nonignored untracked code, and all formal docs."""
+    """Cover tracked/deleted and nonignored untracked code, and all formal docs.
+
+    Volume 3, 3.6.1 (submodule downgrade): a gitlink entry (mode 160000)
+    no longer refuses the whole repo. It is skipped like v2's snapshot_v2
+    and recorded in 'gaps'; the submodule's interior is out of relay's
+    scope unless archived inside the submodule repo itself. The gaps list
+    is deterministic (ls-files --stage order) so snapshot equality checks
+    in commit_check still hold.
+    """
     stages = git(root, 'ls-files', '--stage', '-z').stdout.split(b'\0')
     cached_modes = {}
+    gaps = []
     for entry in filter(None, stages):
         metadata, name = entry.split(b'\t', 1)
-        mode, _, stage = metadata.split()
+        mode, obj, stage = metadata.split()
         require(stage == b'0', '存在尚未解决的 Git 合并冲突')
-        require(mode != b'160000', '本版提交检查暂不支持 Git 子模块')
-        cached_modes[os.fsdecode(name)] = mode
+        name = os.fsdecode(name)
+        if mode == b'160000':
+            gaps.append({'path': name, 'pointer': os.fsdecode(obj)})
+            continue
+        cached_modes[name] = mode
+    gap_paths = {g['path'] for g in gaps}
     paths = set(os.fsdecode(p) for p in git(root, 'ls-files', '--cached', '--others',
                 '--exclude-standard', '-z').stdout.split(b'\0') if p)
     if anchor(root)['head']:
         paths.update(os.fsdecode(p) for p in git(root, 'ls-tree', '-r', '--name-only', '-z', 'HEAD').stdout.split(b'\0') if p)
-    paths = {p for p in paths if not leftover(p)}
+    paths = {p for p in paths if not leftover(p)
+             and not any(p == g or p.startswith(g + '/') for g in gap_paths)}
     filemode = git(root, 'config', '--get', 'core.filemode', check=False).stdout.strip() != b'false'
     # Walk every .agent asset, not only Markdown. When a repository or global ignore
     # rule hides .agent/, Git lists none of it, yet the first commit must stage
@@ -199,7 +229,7 @@ def snapshot(root):
                                    else cached_modes.get(rel, b'100644') == b'100755'}
         dest = memory if ar is not None and ar.endswith('.md') and not ar.startswith(('tools/', 'archive/')) else code
         dest[rel] = value
-    return {'anchor': anchor(root), 'code': code, 'memory': memory}
+    return {'anchor': anchor(root), 'code': code, 'memory': memory, 'gaps': gaps}
 
 
 def changed(before, after):
@@ -380,7 +410,8 @@ def commit_check(root, agent):
     all_files = {**receipt['snapshot']['code'], **receipt['snapshot']['memory']}
     require(all(p in tracked for p, val in all_files.items() if val is not None),
             '存在未暂存的新文件；只允许提交完整的已审核快照')
-    require(git(root, 'diff', '--quiet', '--', check=False).returncode == 0,
+    require(git(root, 'diff', '--quiet', '--', check=False,
+                honor_autocrlf=True).returncode == 0,
             '工作区与暂存区不同；请重新核对并暂存已批准内容')
     # Git diff can hide working edits behind assume-unchanged / skip-worktree.
     # Compare actual index blobs and modes, using Git's configured clean filters.
@@ -400,7 +431,8 @@ def commit_check(root, agent):
             data = p.read_bytes()
             mode = b'100755' if value['executable'] else b'100644'
             filters = ['--path=' + rel]
-        sha = git(root, 'hash-object', *filters, '--stdin', input_data=data).stdout.strip()
+        sha = git(root, 'hash-object', *filters, '--stdin', input_data=data,
+                  honor_autocrlf=True).stdout.strip()
         require(entries.get(rel) == (mode, sha), '实际暂存内容或模式与获批文件不同: ' + rel)
     staged = git(root, 'diff', '--cached', '--name-only', '-z',
                  *(['HEAD'] if receipt['snapshot']['anchor']['head'] else [])).stdout
@@ -424,7 +456,8 @@ def resume(root, agent):
         print(p.read_text(encoding='utf-8') if p.exists() else '缺失')
     print('\nGit 工作区（必须与正式记录核对）：')
     sys.stdout.flush()
-    print(os.fsdecode(git(root, 'status', '--short').stdout))
+    print(os.fsdecode(git(root, 'status', '--short',
+                            honor_autocrlf=True).stdout))
     print('隔离草稿：未经审核，只能作为核对线索。')
     for p in sorted(safe(agent, 'inbox').glob('*/batch.json')):
         safe(agent, p.relative_to(agent).as_posix())
@@ -458,7 +491,7 @@ def lint(root, agent):
                 errors.append('断链: ' + rel + ' → ' + target)
     if safe(agent, '.local/transaction.json').exists():
         errors.append('存在未恢复的应用事务')
-    snapshot(root)  # Refuse unresolved merges, unsupported submodules, unsafe memory paths.
+    snapshot(root)  # Refuse unresolved merges and unsafe memory paths; submodules are skipped with gaps (3.6.1).
     for item in errors:
         print('ERROR ' + item)
     for item in warnings:

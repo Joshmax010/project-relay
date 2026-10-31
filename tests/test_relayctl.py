@@ -32,10 +32,10 @@ class Workflow(unittest.TestCase):
         subprocess.run([sys.executable, str(SKILL / 'scripts/init_project.py'), str(self.root)],
                        check=True, capture_output=True)
         self.agent = self.root / '.agent'
-        (self.root / 'app.py').write_text('value = 1\n')
+        (self.root / 'app.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git('add', '.')
         self.git('commit', '-m', 'Previously reviewed baseline fixture')
-        (self.root / 'app.py').write_text('value = 2\n')
+        (self.root / 'app.py').write_bytes('value = 2\n'.encode('utf-8'))
 
     def git(self, *args):
         r = subprocess.run(['git', '-C', str(self.root), *args], capture_output=True, check=True)
@@ -104,7 +104,7 @@ class Workflow(unittest.TestCase):
         # reviewed path for the edit to reach a commit, while commit-check
         # blocks smuggling it in through another batch.
         content = '# Unreviewed decision\nMade directly in the working tree.\n'
-        (self.agent / 'decisions.md').write_text(content)
+        (self.agent / 'decisions.md').write_bytes(content.encode('utf-8'))
         mapping = dict(self.mapping(), **{'decisions.md': content})
         bid = self.call(relay.draft, mapping, 'formalize existing edit')
         self.call(relay.review, bid, approve=list(mapping), reviewer='human fixture')
@@ -122,7 +122,7 @@ class Workflow(unittest.TestCase):
         # HEAD blob holds LF. A byte compare would admit this true no-op, and
         # staging it later would produce no change, so commit-check could
         # never see the required state.md in the cached diff.
-        (self.root / '.gitattributes').write_text('*.md text eol=crlf\n')
+        (self.root / '.gitattributes').write_bytes('*.md text eol=crlf\n'.encode('utf-8'))
         committed = (self.agent / 'state.md').read_bytes()
         crlf = committed.replace(b'\n', b'\r\n')
         (self.agent / 'state.md').write_bytes(crlf)
@@ -134,15 +134,15 @@ class Workflow(unittest.TestCase):
 
     def test_old_draft_cannot_overwrite_new_state(self):
         bid = self.call(relay.draft, self.mapping(), 'old')
-        (self.agent / 'state.md').write_text('# New externally verified state\n')
+        (self.agent / 'state.md').write_bytes('# New externally verified state\n'.encode('utf-8'))
         with self.assertRaises(relay.RelayError):
             self.call(relay.review, bid, approve=list(self.mapping()), reviewer='human')
-        self.assertIn('externally verified', (self.agent / 'state.md').read_text())
+        self.assertIn('externally verified', (self.agent / 'state.md').read_text(encoding='utf-8'))
 
     def test_code_changes_before_apply_invalidate_approval(self):
         bid = self.call(relay.draft, self.mapping(), 'test')
         self.call(relay.review, bid, approve=list(self.mapping()), reviewer='human')
-        (self.root / 'app.py').write_text('value = 3\n')
+        (self.root / 'app.py').write_bytes('value = 3\n'.encode('utf-8'))
         with self.assertRaises(relay.RelayError):
             self.call(relay.apply, bid)
 
@@ -160,7 +160,7 @@ class Workflow(unittest.TestCase):
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
         self.git('add', 'app.py')
-        (self.root / 'app.py').write_text('value = 4\n')
+        (self.root / 'app.py').write_bytes('value = 4\n'.encode('utf-8'))
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
 
@@ -181,20 +181,20 @@ class Workflow(unittest.TestCase):
 
     def test_new_file_after_approval_blocks(self):
         self.prepare()
-        (self.root / 'new.py').write_text('print(1)\n')
+        (self.root / 'new.py').write_bytes('print(1)\n'.encode('utf-8'))
         self.git('add', '.')
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
 
     def test_formal_edit_after_approval_blocks(self):
         self.prepare()
-        (self.agent / 'decisions.md').write_text('# Unreviewed decision\n')
+        (self.agent / 'decisions.md').write_bytes('# Unreviewed decision\n'.encode('utf-8'))
         self.git('add', '.')
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
 
     def test_unreviewed_formal_change_before_draft_is_not_silently_committed(self):
-        (self.agent / 'decisions.md').write_text('# Unreviewed decision\n')
+        (self.agent / 'decisions.md').write_bytes('# Unreviewed decision\n'.encode('utf-8'))
         self.prepare()
         self.git('add', '.')
         with self.assertRaises(relay.RelayError):
@@ -243,13 +243,13 @@ class Workflow(unittest.TestCase):
     def test_code_symlink_parent_cannot_change_read_scope(self):
         directory = self.root / 'src'
         directory.mkdir()
-        (directory / 'module.py').write_text('value = 1\n')
+        (directory / 'module.py').write_bytes('value = 1\n'.encode('utf-8'))
         self.git('add', 'src')
         (directory / 'module.py').unlink()
         directory.rmdir()
         outside = Path(self.temp.name) / 'external-src'
         outside.mkdir()
-        (outside / 'module.py').write_text('external data\n')
+        (outside / 'module.py').write_bytes('external data\n'.encode('utf-8'))
         directory.symlink_to(outside, target_is_directory=True)
         with self.assertRaises(relay.RelayError):
             self.call(relay.draft, self.mapping(), 'unsafe code tree')
@@ -258,7 +258,7 @@ class Workflow(unittest.TestCase):
         self.prepare()
         p = self.agent / 'conversations/raw/example.txt'
         p.parent.mkdir(parents=True)
-        p.write_text('Exact exported visible messages, fixture only.')
+        p.write_bytes('Exact exported visible messages, fixture only.'.encode('utf-8'))
         self.git('add', '.')
         self.call(relay.commit_check)
         self.assertNotIn('conversations/raw', self.git('ls-files').decode())
@@ -301,10 +301,10 @@ class Workflow(unittest.TestCase):
         with patch.object(relay, 'atomic', side_effect=fail):
             with self.assertRaises(OSError):
                 self.call(relay.apply, bid)
-        (self.agent / 'state.md').write_text('# External change\n')
+        (self.agent / 'state.md').write_bytes('# External change\n'.encode('utf-8'))
         with self.assertRaises(relay.RelayError):
             self.call(relay.recover)
-        self.assertEqual('# External change\n', (self.agent / 'state.md').read_text())
+        self.assertEqual('# External change\n', (self.agent / 'state.md').read_text(encoding='utf-8'))
         self.assertTrue((self.agent / '.local/transaction.json').exists())
 
     @unittest.skipIf(os.name == 'nt', 'POSIX file modes are not portable to Windows')
@@ -324,7 +324,7 @@ class Workflow(unittest.TestCase):
         # An interrupted apply (SIGKILL, power loss) can leave mkstemp output behind.
         # It is not memory and must not count as a repository change, or apply and
         # commit-check would reject the approved batch and recovery would not help.
-        (self.agent / '.relay-abandoned').write_text('partial bytes')
+        (self.agent / '.relay-abandoned').write_bytes('partial bytes'.encode('utf-8'))
         self.call(relay.apply, bid)
         self.git('add', '.')
         self.call(relay.commit_check)
@@ -335,7 +335,7 @@ class Workflow(unittest.TestCase):
         # so Git lists none of it. The assets the first commit must stage (.gitignore,
         # tools/relayctl.py) still belong to the snapshot; otherwise the documented
         # forced staging shrinks the approved snapshot and forces a second review.
-        (self.root / '.gitignore').write_text('.agent/\n')
+        (self.root / '.gitignore').write_bytes('.agent/\n'.encode('utf-8'))
         self.git('rm', '-r', '--cached', '--quiet', '.agent')
         self.git('add', '.gitignore')
         self.git('commit', '-m', 'Hide .agent before its first commit')
@@ -351,7 +351,7 @@ class Workflow(unittest.TestCase):
         # and let its content and mode reach a commit without stale-review detection.
         source = self.root / 'src/.relay-config.py'
         source.parent.mkdir()
-        source.write_text('value = 1\n')
+        source.write_bytes('value = 1\n'.encode('utf-8'))
         self.git('add', '.')
         self.git('commit', '-m', 'Track a source file sharing the temporary prefix')
         snapshot = relay.snapshot(self.root)
@@ -359,7 +359,7 @@ class Workflow(unittest.TestCase):
         self.prepare()
         self.git('add', '.')
         self.call(relay.commit_check)
-        source.write_text('value = 2\n')
+        source.write_bytes('value = 2\n'.encode('utf-8'))
         self.git('add', '.')
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
@@ -368,7 +368,7 @@ class Workflow(unittest.TestCase):
         self.prepare()
         self.git('add', '.')
         self.call(relay.commit_check)
-        (self.agent / '.relay-forced').write_text('partial bytes')
+        (self.agent / '.relay-forced').write_bytes('partial bytes'.encode('utf-8'))
         self.git('add', '-f', '.agent/.relay-forced')
         with self.assertRaises(relay.RelayError):
             self.call(relay.commit_check)
@@ -411,11 +411,11 @@ class Workflow(unittest.TestCase):
                 self.call(relay.draft, {target: 'bad'}, 'bad path')
         if os.name != 'nt':
             out = Path(self.temp.name) / 'outside.md'
-            out.write_text('original')
+            out.write_bytes('original'.encode('utf-8'))
             (self.agent / 'linked.md').symlink_to(out)
             with self.assertRaises(relay.RelayError):
                 self.call(relay.draft, {'linked.md': 'changed'}, 'bad link')
-            self.assertEqual('original', out.read_text())
+            self.assertEqual('original', out.read_text(encoding='utf-8'))
 
     def test_resume_separates_pending_and_formal_without_mutation(self):
         bid = self.call(relay.draft, self.mapping(), 'pending line of inquiry')
@@ -432,7 +432,7 @@ class Workflow(unittest.TestCase):
         r = subprocess.run([sys.executable, str(runtime), '--root', str(self.root), 'commit-check'], capture_output=True)
         self.assertEqual(1, r.returncode)
         mapping = Path(self.temp.name) / 'proposal.json'
-        mapping.write_text(json.dumps(self.mapping(), ensure_ascii=False), encoding='utf-8')
+        mapping.write_bytes(json.dumps(self.mapping(), ensure_ascii=False).encode('utf-8'))
         r = subprocess.run([sys.executable, str(runtime), '--root', str(self.root), 'draft', '--file', str(mapping), '--title', 'CLI测试'], capture_output=True)
         self.assertEqual(0, r.returncode, r.stderr)
         self.call(relay.lint)
