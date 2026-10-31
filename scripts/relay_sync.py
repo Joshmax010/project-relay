@@ -293,7 +293,7 @@ def _save_pins(pins, store=None):
 
 
 def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
-                            repin=False, store=None):
+                            repin=False, store=None, dry_run=False):
     """Verify a git sync-manifest's signature against recomputed hashes.
 
     Returns a verification dict (status: verified / tofu-pinned /
@@ -306,7 +306,13 @@ def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
     accepts it. An unsigned bundle is refused unless --trust-unsigned
     explicitly allows it. A manifest without a device_id can still be
     cryptographically verified, but there is nothing to pin it to, so
-    it verifies without pinning (status verified-no-pin)."""
+    it verifies without pinning (status verified-no-pin).
+    Codex PR #5 rounds 7-12, item 4: dry_run=True (a dry-run unpack,
+    no --confirm) verifies read-only and NEVER persists a pin: a first
+    sight reports tofu-would-pin and a repin reports repin-would-apply,
+    so a dry run cannot let an untrusted remote claim the device id
+    before the legitimate key arrives. "First confirmed import wins"
+    is the TOFU semantic; dry runs do not count as first sight."""
     sig = manifest.get('signature')
     device_id = manifest.get('source_device_id')
     if not isinstance(sig, dict) or sig.get('algorithm') != 'ed25519' \
@@ -336,6 +342,10 @@ def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
     pins = _load_pins(store)
     pinned = pins.get(device_id)
     if pinned is None:
+        if dry_run:
+            return {'status': 'tofu-would-pin', 'device_id': device_id,
+                    'key_id': key_id,
+                    'note': '干跑预览：首次见该设备签名公钥，确认导入时才会钉死（TOFU）'}
         pins[device_id] = {'key_id': key_id, 'public_key': sig['public_key'],
                            'first_seen': utc(),
                            'source_device': manifest.get('source_device')}
@@ -345,6 +355,10 @@ def verify_bundle_signature(manifest, file_hashes, trust_unsigned=False,
     if pinned.get('public_key') != sig['public_key']:
         if repin:
             prev = pinned.get('key_id')
+            if dry_run:
+                return {'status': 'repin-would-apply', 'device_id': device_id,
+                        'key_id': key_id, 'previous_key_id': prev,
+                        'note': '干跑预览：签名公钥已变更，确认导入时才会以 --repin 接受新公钥'}
             pins[device_id] = {'key_id': key_id, 'public_key': sig['public_key'],
                                'first_seen': pinned.get('first_seen'),
                                'repinned_at': utc(), 'previous_key_id': prev,
@@ -1889,10 +1903,33 @@ def import_bundle(bundle_dir, store, confirm=False):
             if confirm:
                 dest = _contained_unclaimed_dir(store, proj['key'], proj['slug'])
                 preserved = []
+                repaired = []
                 for rel, data in files_in.items():
                     p = dest / rel
                     p.parent.mkdir(parents=True, exist_ok=True)
                     if rel in conflict_rels:
+                        # Codex PR #5 rounds 7-12, item 11: a truncated
+                        # existing file is damage, not a first device's
+                        # payload. A raw entry that fails the same
+                        # parse + id gate the incoming scan applies is
+                        # repaired in place (atomically) instead of
+                        # being preserved as a conflicting version; a
+                        # valid but different file keeps the C6
+                        # preserve behavior. All three write sites in
+                        # this branch are atomic, so a future
+                        # interruption can no longer leave a half file
+                        # for the next retry to mistake for a payload.
+                        if rel.startswith('raw/') and rel.endswith('.md'):
+                            try:
+                                _h, _b = _parse_entry_text(
+                                    p.read_bytes().decode('utf-8'))
+                                _damaged = not _verify_entry_id(_h)
+                            except Exception:
+                                _damaged = True
+                            if _damaged:
+                                atomic(p, data)
+                                repaired.append(rel)
+                                continue
                         cdir = dest / '_conflicts'
                         cdir.mkdir(parents=True, exist_ok=True)
                         base = '%s--%s-%s' % (rel.replace('/', '__'),
@@ -1903,7 +1940,7 @@ def import_bundle(bundle_dir, store, confirm=False):
                         while cpath.exists():
                             cpath = cdir / ('%s-%d' % (base, n))
                             n += 1
-                        cpath.write_bytes(data)
+                        atomic(cpath, data)
                         preserved.append({'file': rel,
                                           'preserved': 'unclaimed/%s-%s/_conflicts/%s'
                                                        % (proj['key'], proj['slug'],
@@ -1911,12 +1948,12 @@ def import_bundle(bundle_dir, store, confirm=False):
                         continue
                     if p.exists():
                         continue  # identical bytes: idempotent re-import
-                    p.write_bytes(data)
+                    atomic(p, data)
                 qdir = dest / '_quarantine'
                 for rel, data in scan_quarantined.items():
                     p = qdir / rel.replace('/', '__')
                     p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_bytes(data)
+                    atomic(p, data)
                 claim = {'key': proj['key'], 'slug': proj['slug'],
                          'display_name': proj.get('display_name'),
                          'remote': proj.get('remote'), 'key_type': proj.get('key_type'),
@@ -1933,6 +1970,9 @@ def import_bundle(bundle_dir, store, confirm=False):
                     # what must never be overwritten).
                     claim['unclaimed_conflicts'] = preserved
                     entry['unclaimed_conflicts'] = preserved
+                if repaired:
+                    claim['repaired'] = sorted(repaired)
+                    entry['repaired'] = sorted(repaired)
                 save(dest / '_claim.json', claim)
                 index_path = store / 'unclaimed' / '_index.json'
                 index = read_json(index_path) if index_path.exists() else {'claims': []}
@@ -2154,7 +2194,7 @@ def _read_remote_bundle(clone_dir, key):
 
 
 def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
-                           repin=False, store=None):
+                           repin=False, store=None, dry_run=False):
     """Materialize a verifiable bundle dir from a remote clone.
 
     The import pipeline only ever reads bundles, never the clone itself,
@@ -2209,7 +2249,8 @@ def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
     # verification never trusts that field, only disk bytes.
     verification = verify_bundle_signature(manifest, file_hashes,
                                            trust_unsigned=trust_unsigned,
-                                           repin=repin, store=store)
+                                           repin=repin, store=store,
+                                           dry_run=dry_run)
     if verification.get('status') == 'repinned' and store is not None:
         receipt = {'at': utc(), 'kind': 'repin',
                    'source_device': manifest.get('source_device'),
@@ -3052,7 +3093,21 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
         staging = Path(tmp) / 'bundle'
         manifest = export_bundle(store, [toplevel], staging, device, device_id,
                                  pack_seqs={key: seq})
-        manifest_path = store / 'sync-manifests' / ('%s-%04d.json' % (key, seq))
+        # Codex PR #5 rounds 7-12, item 3 (P1): the manifest name used
+        # to be <key>-<per-device-seq>.json, so two devices that read
+        # the same remote tip and packed next both wrote <key>-0001.json
+        # and _converge_history (-X ours) kept only the later one, hiding
+        # the earlier bundle (its project files survived under a
+        # per-slug dir, but no manifest listed them). The name now
+        # carries device identity + slug, so concurrent devices can
+        # never collide; the per-device seq still orders one device's
+        # own packs. Old <key>-NNNN.json manifests keep matching the
+        # '<key>-*.json' glob in _read_remote_bundle and unpack as
+        # before (backward compatible).
+        dev_seg = re.sub(r'[^A-Za-z0-9._-]', '_', device_id or 'unknown')
+        slug_seg = re.sub(r'[^A-Za-z0-9._-]', '_', slug)
+        manifest_path = store / 'sync-manifests' / (
+            '%s-%s-%s-%04d.json' % (key, dev_seg, slug_seg, seq))
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         project_manifest = manifest['projects'][0]
         # Provenance for the next device: the per-project entry is what
@@ -3360,7 +3415,8 @@ def _unpack_git(store, remote=None, confirm=False, project_keys=None,
                 continue
             bundle = _bundle_dir_from_clone(clone_dir, key, tmp,
                                             trust_unsigned=trust_unsigned,
-                                            repin=repin, store=store)
+                                            repin=repin, store=store,
+                                            dry_run=not confirm)
             if bundle is None:
                 reports.append({'key': key, 'status': 'skipped',
                                 'note': '远端无本项目清单'})

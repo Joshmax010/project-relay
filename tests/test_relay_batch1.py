@@ -152,7 +152,11 @@ class TestA1HookCwdGate(Batch1Base):
                              input=b'{"session_id": "s-x"}')
         self.assertEqual(2, out.returncode)
         self.assertEqual(1, len(self.entries(root_a)))
-        self.assertIn('补填采集条目', out.stdout.decode('utf-8'))
+        # Rounds 7-12, item 6: the exit-2 block reason goes to stderr --
+        # Claude Code takes it from stderr, while stdout is not promoted
+        # to context on Stop. stdout keeps only the capture line.
+        self.assertIn('补填采集条目', out.stderr.decode('utf-8'))
+        self.assertNotIn('补填采集条目', out.stdout.decode('utf-8'))
 
 
 class TestA3BackfillRedaction(Batch1Base):

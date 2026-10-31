@@ -836,8 +836,23 @@ def goal_decline(store, toplevel):
                 p.unlink(missing_ok=True)
             for p in receipts.glob('goal-*.md'):
                 p.unlink(missing_ok=True)
-    store_path(store_dir, 'state', 'goal-tentative.md').unlink(missing_ok=True)
-    store_path(store_dir, 'state', 'goal-tentative.json').unlink(missing_ok=True)
+    # Codex PR #5 rounds 7-12, item 9: a tentative goal has no receipt,
+    # so the receipt-only archive above skips it and the cleanup below
+    # used to delete it permanently. Archive the tentative text (and
+    # its metadata, when present) under a distinct tentative-declined
+    # name BEFORE deleting, so a declined tentative goal is recoverable
+    # from archive/goal-history/ like any declined confirmed goal.
+    tentative_md = store_path(store_dir, 'state', 'goal-tentative.md')
+    tentative_json = store_path(store_dir, 'state', 'goal-tentative.json')
+    if tentative_md.exists() and tentative_md.read_bytes().strip():
+        history = store_path(store_dir, 'archive', 'goal-history')
+        stem = 'tentative-declined-%s' % utc().replace('-', '').replace(
+            ':', '').replace('.', '').replace('+', '')
+        atomic(history / (stem + '.md'), tentative_md.read_bytes())
+        if tentative_json.exists():
+            atomic(history / (stem + '.json'), tentative_json.read_bytes())
+    tentative_md.unlink(missing_ok=True)
+    tentative_json.unlink(missing_ok=True)
     text = '状态：未建\n\n用户于 %s 决定不建目标档案。\n' % utc()
     atomic(_goal_file(store_dir), text.encode('utf-8'))
     store_path(store_dir, 'state', 'goal-draft.md').unlink(missing_ok=True)

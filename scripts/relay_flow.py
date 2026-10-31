@@ -272,10 +272,46 @@ def _parse_entry(path):
     return header, body
 
 
-def _write_entry(store_dir, header, body, filename_tag=None):
-    text = json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2) + BODY_DELIM + body
-    atomic(_entry_path(store_dir, header['seq'], filename_tag),
-           text.encode('utf-8'))
+def _write_entry(store_dir, header, body, filename_tag=None, reserve=False):
+    """Write one raw entry file. Returns (path, final_seq).
+
+    Default is a single atomic replace. reserve=True (capture path
+    only, Codex PR #5 rounds 7-12 item 2): two concurrent captures used
+    to read the same max sequence and atomically replace the same
+    cap-NNNN.md, silently losing one entry. With reserve, the file is
+    created O_EXCL; on collision the sequence is bumped, the header and
+    the body's first-line title are patched to the final sequence, and
+    the write retried. The header seq is the authority everywhere
+    (list_entries, dedup, cursor, stats); the title patch only keeps
+    the human-readable heading from lying. Other callers keep replace
+    semantics: they rewrite an existing entry by design (queue repair,
+    state transition, enforce, backfill) and must not bump the seq."""
+    store_dir = Path(store_dir)
+    _raw_dir(store_dir).mkdir(parents=True, exist_ok=True)
+    seq = header['seq']
+    if not reserve:
+        text = json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2) + BODY_DELIM + body
+        path = _entry_path(store_dir, seq, filename_tag)
+        atomic(path, text.encode('utf-8'))
+        return path, seq
+    mode = _ctl.DOC_MODE if _ctl is not None else 0o644
+    while True:
+        path = _entry_path(store_dir, seq, filename_tag)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            seq += 1
+            header['seq'] = seq
+            body = re.sub(r'^# 采集条目 cap-\d+',
+                          '# 采集条目 cap-%04d' % seq, body, count=1)
+            continue
+        text = json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2) + BODY_DELIM + body
+        try:
+            os.write(fd, text.encode('utf-8'))
+        finally:
+            os.close(fd)
+        os.chmod(path, mode)
+        return path, seq
 
 
 def list_entries(store_dir, include_archived=False):
@@ -393,7 +429,8 @@ def capture(store, toplevel, tool=None, session=None, message=None,
                   'user_message': message}
         if correction_of is not None:
             header['correction_of'] = correction_of
-        _write_entry(store_dir, header, body, filename_tag=filename_tag)
+        _, seq = _write_entry(store_dir, header, body,
+                              filename_tag=filename_tag, reserve=True)
         _check_limits(store_dir)
         info = {'seq': seq, 'deduped': False,
                 'path': str(_entry_path(store_dir, seq, filename_tag))}
@@ -429,7 +466,7 @@ def capture(store, toplevel, tool=None, session=None, message=None,
                       'degraded': True, 'error': repr(exc), 'user_message': None}
             body = ('# 采集条目 cap-%04d（降级）\n\n采集过程出错，本条仅记录失败原因与尽力快照：\n\n'
                     % seq + repr(exc) + '\n')
-            _write_entry(store_dir, header, body)
+            _, seq = _write_entry(store_dir, header, body, reserve=True)
         except Exception:
             pass
         _record_stats_safe(_stats_module().record_capture, store_dir,
@@ -1014,8 +1051,9 @@ def _hook_command(store, toplevel, kind):
     `python -c` wrapper that calls the hook_* gate above with the cwd the
     hook actually runs in (os.getcwd() at hook time). The store root is
     baked at install time, as the project path already was; reinstall
-    after moving the store. Session id for enforce comes from the hook
-    payload on stdin, mirroring relay._session_from_stdin (finding 4).
+    after moving the store. Session id for capture and enforce comes
+    from the hook payload on stdin, mirroring relay._session_from_stdin
+    (finding 4); the stop body reads stdin once, at the top.
     Returns a single shell word list string; every embedded path is a
     JSON string literal inside the quoted -c argument, so spaces, $,
     backticks and quotes in paths cannot split or execute (A4)."""
@@ -1053,16 +1091,26 @@ def _hook_command(store, toplevel, kind):
         # took its no-entry pass path and never re-checked the
         # placeholder the later capture left. Sequencing inside one
         # handler is the guarantee; separate handlers cannot give it.
-        body = ('_r = _hook_flow.hook_capture(%s, %s, tool=\'claude-code\')\n'
-                'print(_r[\'note\'] if _r.get(\'skipped\') else '
-                '\'采集条目：cap-%%04d（%%s）\' %% (_r[\'seq\'], _r.get(\'path\', \'\')))\n'
-                '_sid = None\ntry:\n'
+        # Rounds 7-12, item 8: stdin is read ONCE at the top and the
+        # session id is passed to capture too -- the old body captured
+        # without a session (entry recorded session=None) and only read
+        # stdin for enforce, so a later no-change conversation deduped
+        # against the previous entry. Item 6: the block reason goes to
+        # stderr -- Claude Code takes the exit-2 block reason from
+        # stderr, while stdout is not promoted to context on Stop, so
+        # the model used to be blocked without ever seeing the remedy.
+        # The PASS note stays on stdout (unchanged, informational).
+        body = ('_sid = None\ntry:\n'
                 '    _raw = sys.stdin.read() if not sys.stdin.isatty() else \'\'\n'
                 '    _d = json.loads(_raw) if _raw.strip() else None\n'
                 '    _sid = _d.get(\'session_id\') if isinstance(_d, dict) else None\n'
                 'except Exception:\n    _sid = None\n'
+                '_r = _hook_flow.hook_capture(%s, %s, tool=\'claude-code\', session=_sid)\n'
+                'print(_r[\'note\'] if _r.get(\'skipped\') else '
+                '\'采集条目：cap-%%04d（%%s）\' %% (_r[\'seq\'], _r.get(\'path\', \'\')))\n'
                 '_r = _hook_flow.hook_enforce(%s, %s, tool=\'claude-code\', session=_sid)\n'
-                'print(_r.get(\'instruction\') or (\'PASS：\' + _r.get(\'note\', \'\')))\n'
+                '_msg = _r.get(\'instruction\') or (\'PASS：\' + _r.get(\'note\', \'\'))\n'
+                'print(_msg, file=sys.stderr) if _r.get(\'action\') == \'block\' else print(_msg)\n'
                 'sys.exit(2 if _r.get(\'action\') == \'block\' else 0)\n'
                 % (store_lit, root_lit, store_lit, root_lit))
     else:  # pragma: no cover - install_claude only passes the four kinds
@@ -1098,6 +1146,18 @@ def install_codebuddy(store, toplevel, target_root, flavor='codebuddy'):
     skill_dir = Path(target_root).expanduser() / ('.codebuddy' if flavor == 'codebuddy'
                                                   else '.workbuddy') / 'skills' / 'relay'
     skill_dir.mkdir(parents=True, exist_ok=True)
+    # Codex PR #5 rounds 7-12, item 10: the old code overwrote SKILL.md
+    # unconditionally, destroying a user-authored skill file the user
+    # had written there before relay arrived. A differing existing file
+    # now refuses the install (the user moves or backs it up first);
+    # identical content proceeds (idempotent reinstall). RELAY-RECIPE.md
+    # is relay's own file, so it keeps its existing overwrite behavior.
+    existing_skill = skill_dir / 'SKILL.md'
+    if existing_skill.exists() \
+            and existing_skill.read_bytes() != RELAY_SKILL_TEXT.encode('utf-8'):
+        raise RelayError(
+            '已有用户自写 SKILL.md，拒绝覆盖（文件无损）：%s；请先人工移走或备份'
+            '该文件，再重新安装 relay 配方' % existing_skill)
     atomic(skill_dir / 'SKILL.md', RELAY_SKILL_TEXT.encode('utf-8'))
     note = ('弱档配方：本路线无生命周期 hooks，采集与执法全部靠 Agent 自觉执行。'
             if flavor == 'codebuddy'
@@ -1604,9 +1664,16 @@ def _recover_incomplete_tx(store, toplevel, store_dir):
     - all files at after-bytes + record missing => crashed mid-flight
       (the record is written last) => recover() rolls archive, cursor,
       baseline, last-summary and entry queues back to before-state.
-    - mixed before/after-or-evolved => partial application => recover()
+    - mixed before/after (no 'other') => partial application => recover()
       (its preflight fails closed on externally-evolved files, aborting
       this summarize with an actionable error instead of duplicating).
+    - any file at 'other' bytes in a RECORD-LESS (truly incomplete)
+      transaction => this summarize aborts fail-closed with an
+      actionable error; entries stay pending and nothing is
+      re-appended. (Rounds 7-12 item 1.) If the summary record for
+      this seq exists, the transaction completed and the file merely
+      evolved afterwards (a legitimate between-summarizes edit), so
+      the retry proceeds normally.
     - all files at before-bytes => the log was written but the files
       never applied; the retry recomputes from current bytes and its
       own newer log supersedes this stale one, so leave it.
@@ -1659,6 +1726,32 @@ def _recover_incomplete_tx(store, toplevel, store_dir):
     if any(s == 'before' for s in states) and any(s != 'before' for s in states):
         info = recover(store, toplevel)
         return '已回滚部分应用的汇总事务 %s，本次汇总从事务前重新计算' % info.get('recovered')
+    # Codex PR #5 rounds 7-12, item 1: an 'other' state (file edited so
+    # it matches neither before nor after bytes) in a TRULY INCOMPLETE
+    # transaction is fail-closed. The old code fell through to None
+    # here for after-plus-other and other-only mixtures, so the retry
+    # reselected the still-pending entries and appended the same
+    # decisions/todos a second time. An 'other' file cannot be restored
+    # to either side without destroying the edit (the tx log keeps
+    # before bytes + after hash only, not after bytes), so the only
+    # safe action is to abort this summarize: entries stay pending and
+    # the log is kept for a manual recover once the edit is dealt with.
+    # This mirrors recover()'s own preflight, which aborts on 'other'
+    # files for before-mixtures.
+    # The gate is the summary record (written last): if it exists, the
+    # transaction COMPLETED and the file simply evolved afterwards --
+    # a legitimate between-summarizes edit (sync-accept Act 2 appends
+    # to backlog.md exactly this way) -- so the retry proceeds as
+    # before. Only a record-less transaction is incomplete.
+    if any(s == 'other' for s in states):
+        record = store_dir / 'state' / 'summaries' / ('%04d.json' % seq) \
+            if isinstance(seq, int) else None
+        if record is None or not record.exists():
+            evolved = [name for name, s in zip(files, states) if s == 'other']
+            raise RelayError(
+                '汇总事务未完成且含外部改动文件（%s）：本次汇总已中止，条目保持 '
+                'pending，不会重复追加；请先处理外部改动（恢复为事务前或事务后'
+                '内容），再运行 relay recover' % '、'.join(evolved))
     return None
 
 

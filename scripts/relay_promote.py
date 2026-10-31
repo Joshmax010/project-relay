@@ -166,13 +166,27 @@ def _list_raw_entries(store_dir):
     out = []
     if not raw.is_dir():
         return out
-    for path in sorted(raw.glob('cap-*.md')):
+    # Codex PR #5 rounds 7-12, item 5: also scan raw/archived/ -- a
+    # correction that was already summarized (and therefore archived by
+    # the lifecycle move) used to drop out of the count and miss the
+    # >= 2 trigger. Archiving moves files, so a seq should appear at
+    # most once, but duplicates are still collapsed by seq defensively
+    # so a stray copy can never double-count.
+    paths = sorted(raw.glob('cap-*.md'))
+    archived = raw / 'archived'
+    if archived.is_dir():
+        paths += sorted(archived.glob('cap-*.md'))
+    seen = set()
+    for path in paths:
         try:
             text = path.read_text(encoding='utf-8')
             header_text, _, _ = text.partition(BODY_DELIM)
             header = json.loads(header_text)
         except (ValueError, OSError):
             continue
+        if header.get('seq') in seen:
+            continue
+        seen.add(header.get('seq'))
         out.append({'seq': header.get('seq'), 'correction_of': header.get('correction_of'),
                     'user_message': header.get('user_message'),
                     'session': header.get('session'), 'path': path})

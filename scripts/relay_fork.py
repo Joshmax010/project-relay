@@ -621,6 +621,14 @@ def adjudicate(store_dir, fork_id, winner, note):
     log.append({'fork': fork_id, 'winner': winner, 'note': note,
                 'decided_at': utc()})
     save(log_path, log)
+    # Codex PR #5 rounds 7-12, item 7: adjudication rewrites
+    # archive/state.md, which is inside the checksum manifest's scope
+    # (archive/**), so the manifest must be refreshed here -- otherwise
+    # the next resume reports a manifest mismatch for state.md and
+    # blocks automatic summarization until repaired. The adjudication
+    # log itself (state/fork-adjudications.json) is outside manifest
+    # scope and needs no refresh.
+    relay.update_checksum_manifest(store_dir)
     return {'fork': fork_id, 'winner': winner, 'note': note}
 
 
