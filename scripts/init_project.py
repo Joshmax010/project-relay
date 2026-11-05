@@ -46,7 +46,13 @@ def initialize(root):
         dest = target / source.relative_to(templates)
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with dest.open('x', encoding='utf-8') as output:
+            # Batch 5 (step-3 Windows re-run): newline='' pins LF.
+            # Text mode without it translates \n to \r\n on Windows,
+            # so the committed .agent templates (state.md included)
+            # came out CRLF while draft proposals read back LF --
+            # draft's filtered-hash no-op check then never matched
+            # and a true no-op was admitted as a change.
+            with dest.open('x', encoding='utf-8', newline='') as output:
                 output.write(source.read_text(encoding='utf-8'))
             print(f'创建 {dest.relative_to(root)}')
         except FileExistsError:

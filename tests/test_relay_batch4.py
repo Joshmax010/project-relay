@@ -321,7 +321,13 @@ class TestStopHook(Batch4Base):
         cmd = flow._hook_command(self.store, root, 'stop')
         cap_pos = cmd.find('hook_capture')
         self.assertNotEqual(cap_pos, -1)
-        self.assertIn('session=_sid', cmd[cap_pos:cap_pos + 200])
+        # Batch 5 (step-3 Windows re-run): the old 200-char window
+        # assumed short POSIX temp paths. Windows temp paths
+        # (C:\Users\...\Temp\relay-batch4-...) are long enough that
+        # the window cut off mid-token ("sess"). Search the whole
+        # tail instead; the check's intent (the session id reaches
+        # capture) is unchanged.
+        self.assertIn('session=_sid', cmd[cap_pos:])
         self.assertLess(cmd.find('sys.stdin.read'), cap_pos)
         self.assertIn('file=sys.stderr', cmd)
 
@@ -330,9 +336,19 @@ class TestStopHook(Batch4Base):
         sd = self.store_dir(root)
         self.change(root, 'value = 2\n')
         cmd = flow._hook_command(self.store, root, 'stop')
+        if os.name == 'nt':
+            # Batch 5 (step-3 Windows re-run): the installed command
+            # is a POSIX-shell-quoted `python -c` line; cmd.exe cannot
+            # run it (it failed there with exit 1 -- the single quotes
+            # do not group under cmd, so python got a fragment).
+            # Claude Code runs hooks through Git Bash, or PowerShell
+            # when Git Bash is absent -- never cmd.exe. Same guard as
+            # test_relay_batch1's hook tests; shell execution is
+            # covered on POSIX.
+            return
         proc = subprocess.run(cmd, shell=True, cwd=str(root),
                               input=json.dumps({'session_id': 'sess-stop'}),
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(proc.returncode, 2)
         self.assertIn('补填', proc.stderr)
         self.assertNotIn('补填', proc.stdout)

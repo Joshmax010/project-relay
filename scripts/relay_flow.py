@@ -295,10 +295,17 @@ def _write_entry(store_dir, header, body, filename_tag=None, reserve=False):
         atomic(path, text.encode('utf-8'))
         return path, seq
     mode = _ctl.DOC_MODE if _ctl is not None else 0o644
+    # Batch 5 (step-3 Windows re-run): os.open defaults to text mode
+    # on Windows, so os.write below translated \n to \r\n and the
+    # entry no longer matched the LF-only BODY_DELIM when the sync
+    # rescan re-read it by bytes -- 14 Windows test failures, all
+    # "format damaged, refuse to pack". O_BINARY forces binary mode;
+    # POSIX has no O_BINARY, so the getattr fallback is 0 (no-op).
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
     while True:
         path = _entry_path(store_dir, seq, filename_tag)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            fd = os.open(path, flags, mode)
         except FileExistsError:
             seq += 1
             header['seq'] = seq

@@ -349,11 +349,16 @@ class TestForkCli(ForkBase):
         root = self.init()
         self.work(root, 2, '做了甲')
         self.summarize(root, source='test')
+        # Batch 5 (step-3 Windows re-run): encoding must be explicit.
+        # text=True without it decodes with the locale codec (GBK on
+        # a Chinese Windows install); the child prints UTF-8, the
+        # parent's reader thread dies on the first undecodable byte,
+        # and proc.stdout stays None even though the child exited 0.
         proc = subprocess.run(
             [sys.executable, str(SKILL / 'scripts/relay.py'),
              '--root', str(root), '--store-root', str(self.store),
              'fork', 'list'],
-            capture_output=True, text=True)
+            capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn('分叉清单', proc.stdout)
 

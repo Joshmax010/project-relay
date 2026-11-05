@@ -541,8 +541,12 @@ def _redact_entry_text(text, flow):
     in full; in the header, verification inputs are passed through
     untouched and every other string leaf is redacted. The head is
     re-serialized with the same settings capture uses, so a zero-hit
-    entry round-trips byte-identical. Raises ValueError on a malformed
-    entry (caller converts to a fail-closed RelayError)."""
+    LF entry round-trips byte-identical. A CRLF entry is normalized
+    to LF first (batch 5, step-3 Windows re-run -- see
+    _parse_entry_text): the rescan then succeeds and repairs the
+    local file to LF via _fix_local_redactions. Raises ValueError on
+    a malformed entry (caller converts to a fail-closed RelayError)."""
+    text = text.replace('\r\n', '\n')
     head, body = text.split(BODY_DELIM, 1)
     header = json.loads(head)
     new_header, head_hits = _redact_header_value(header, flow)
@@ -832,7 +836,16 @@ BODY_DELIM = '\n---relay-body---\n'
 
 
 def _parse_entry_text(text):
-    """Parse one cap file. Raises RelayError on any structural problem."""
+    """Parse one cap file. Raises RelayError on any structural problem.
+
+    Batch 5 (step-3 Windows re-run): a cap file may hold CRLF newlines
+    (a text-mode writer on Windows, or any outside tool). Normalize
+    CRLF to LF before splitting: the BODY_DELIM is LF-only, and the
+    header/body contents are newline-insensitive here. Without this,
+    a CRLF entry fails the split and every reader of it -- export,
+    import, verify -- reports it as format-damaged.
+    """
+    text = text.replace('\r\n', '\n')
     require(BODY_DELIM.strip() in text, '采集条目格式损坏')
     head, body = text.split(BODY_DELIM, 1)
     try:
