@@ -10,8 +10,14 @@ def initialize(root):
     root = Path(root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError('项目根目录必须已经存在且为目录')
-    result = subprocess.run(['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
-                            capture_output=True, text=True, timeout=60)
+    # Batch 3, A2: decode git output as UTF-8 explicitly. With the locale
+    # default (cp936 on a Chinese Windows install), a non-ASCII project
+    # path comes back mojibake and the resolve() comparison below fails
+    # closed with a misleading "not a git project" error.
+    result = subprocess.run(['git', '-c', 'core.autocrlf=false', '-C', str(root),
+                             'rev-parse', '--show-toplevel'],
+                            capture_output=True, text=True, encoding='utf-8',
+                            timeout=60)
     if result.returncode or Path(result.stdout.strip()).resolve() != root:
         raise ValueError('本版仅支持 Git 代码项目；请指定 Git 仓库根目录，不自动运行 git init')
     target = root / '.agent'
@@ -40,7 +46,13 @@ def initialize(root):
         dest = target / source.relative_to(templates)
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with dest.open('x', encoding='utf-8') as output:
+            # Batch 5 (step-3 Windows re-run): newline='' pins LF.
+            # Text mode without it translates \n to \r\n on Windows,
+            # so the committed .agent templates (state.md included)
+            # came out CRLF while draft proposals read back LF --
+            # draft's filtered-hash no-op check then never matched
+            # and a true no-op was admitted as a change.
+            with dest.open('x', encoding='utf-8', newline='') as output:
                 output.write(source.read_text(encoding='utf-8'))
             print(f'创建 {dest.relative_to(root)}')
         except FileExistsError:
