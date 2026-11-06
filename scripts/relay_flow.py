@@ -62,6 +62,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -278,14 +279,17 @@ def _write_entry(store_dir, header, body, filename_tag=None, reserve=False):
     Default is a single atomic replace. reserve=True (capture path
     only, Codex PR #5 rounds 7-12 item 2): two concurrent captures used
     to read the same max sequence and atomically replace the same
-    cap-NNNN.md, silently losing one entry. With reserve, the file is
-    created O_EXCL; on collision the sequence is bumped, the header and
-    the body's first-line title are patched to the final sequence, and
-    the write retried. The header seq is the authority everywhere
-    (list_entries, dedup, cursor, stats); the title patch only keeps
-    the human-readable heading from lying. Other callers keep replace
-    semantics: they rewrite an existing entry by design (queue repair,
-    state transition, enforce, backfill) and must not bump the seq."""
+    cap-NNNN.md, silently losing one entry. With reserve, the entry is
+    written whole to a temp file and published with os.link, which
+    atomically creates the final path and fails if it already exists;
+    on collision the sequence is bumped, the header and the body's
+    first-line title are patched to the final sequence, and the write
+    retried -- so the final path appears only complete or not at all.
+    The header seq is the authority everywhere (list_entries, dedup,
+    cursor, stats); the title patch only keeps the human-readable
+    heading from lying. Other callers keep replace semantics: they
+    rewrite an existing entry by design (queue repair, state
+    transition, enforce, backfill) and must not bump the seq."""
     store_dir = Path(store_dir)
     _raw_dir(store_dir).mkdir(parents=True, exist_ok=True)
     seq = header['seq']
@@ -295,29 +299,40 @@ def _write_entry(store_dir, header, body, filename_tag=None, reserve=False):
         atomic(path, text.encode('utf-8'))
         return path, seq
     mode = _ctl.DOC_MODE if _ctl is not None else 0o644
-    # Batch 5 (step-3 Windows re-run): os.open defaults to text mode
-    # on Windows, so os.write below translated \n to \r\n and the
-    # entry no longer matched the LF-only BODY_DELIM when the sync
-    # rescan re-read it by bytes -- 14 Windows test failures, all
-    # "format damaged, refuse to pack". O_BINARY forces binary mode;
-    # POSIX has no O_BINARY, so the getattr fallback is 0 (no-op).
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+    # Batch 9 (Codex PR #5 2026-11-06 review): the old reserve path
+    # wrote straight to the final cap file (O_EXCL + os.write), so a
+    # crash mid-write left a truncated entry that _parse_entry refuses
+    # and list_entries then blocks all later capture/summarize. The
+    # final path must appear only complete or not at all: write the
+    # full bytes to a temp file in the same directory, then publish
+    # with os.link, which atomically creates the final path and fails
+    # if it already exists -- the link IS the sequence reservation
+    # (same directory, so same filesystem; os.link works on NTFS too).
+    # Bytes go through 'wb', so the batch-5 LF-only behaviour stays:
+    # no CRLF translation on Windows. The temp name never matches the
+    # cap-*.md glob and pack's payload filter, so a crashed temp is
+    # invisible to list_entries and to bundles.
     while True:
         path = _entry_path(store_dir, seq, filename_tag)
-        try:
-            fd = os.open(path, flags, mode)
-        except FileExistsError:
-            seq += 1
-            header['seq'] = seq
-            body = re.sub(r'^# 采集条目 cap-\d+',
-                          '# 采集条目 cap-%04d' % seq, body, count=1)
-            continue
         text = json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2) + BODY_DELIM + body
+        fd, tmp = tempfile.mkstemp(prefix='.relay-cap-', dir=str(_raw_dir(store_dir)))
         try:
-            os.write(fd, text.encode('utf-8'))
+            with os.fdopen(fd, 'wb') as out:
+                out.write(text.encode('utf-8'))
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(tmp, mode)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                seq += 1
+                header['seq'] = seq
+                body = re.sub(r'^# 采集条目 cap-\d+',
+                              '# 采集条目 cap-%04d' % seq, body, count=1)
+                continue
         finally:
-            os.close(fd)
-        os.chmod(path, mode)
+            if os.path.exists(tmp):
+                os.unlink(tmp)
         return path, seq
 
 
@@ -1852,12 +1867,20 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
     whitelist_values += [entries[0]['header']['seq'], entries[-1]['header']['seq'],
                          len(entries)]
     # Semantic increment.
+    redacted_semantic = 0
     if semantic_text is None:
         semantic_text = ('## 已验证\n- 本次汇总覆盖原料条目 %d 条，改动文件 %d 个（来源：确定性拼装）。\n'
                          % (len(entries), len(digest_doc['files_changed'])))
         model_calls = 0
     else:
         model_calls = 0 if semantic_auto else 1
+        # Batch 9 (Codex PR #5 2026-11-06 review): caller-supplied
+        # semantic text bypasses capture-time redaction, so redact it
+        # here -- the single choke point before it is parsed into the
+        # formal archives. The auto-generated default above carries
+        # only counts and needs no redaction. Backfill's _build_semantic
+        # already redacts; re-running redact here is idempotent.
+        semantic_text, redacted_semantic = redact(semantic_text)
     sections = _semantic_parse(semantic_text)
     # Three-column demotion: verified lines without evidence markers drop a
     # column, with an event recorded (plan 1.12).
@@ -1969,6 +1992,7 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
                 'mismatches': mismatches,
                 'entry_range': [entries[0]['header']['seq'], entries[-1]['header']['seq']],
                 'trigger': trigger,
+                'redacted_semantic': redacted_semantic,
                 'note': '汇总基线在写入前被改动，产物已作为新支 %s 写入，未覆盖主支'
                         % branch['id']}
     # Transaction log first, then atomic writes (old substrate pattern).
@@ -2020,6 +2044,7 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
               'appended_lessons': appended_lessons,
               'appended_backlog': appended_backlog,
               'rejected_lessons': rejected_lessons,
+              'redacted_semantic': redacted_semantic,
               'model_calls': model_calls,
               # Batch 3.4 stats inputs (additive keys; old readers ignore
               # them). Assembled vs LLM split: when the tool made no

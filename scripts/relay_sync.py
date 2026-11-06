@@ -31,6 +31,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -2708,7 +2709,13 @@ class SftpBackend:
             target = Path(tmp) / 'file'
             target.write_bytes(data)
             parent = '%s/%s' % (self.base, '/'.join(rel.split('/')[:-1]))
-            self._ssh('mkdir -p %s' % parent)
+            # Batch 9 (Codex PR #5 2026-11-06 review, P1): _ssh hands
+            # the script to a remote shell, so an unquoted path lets a
+            # crafted filename (spaces, ;, $()) run extra commands on
+            # the SFTP host. Quote every remote path argument here and
+            # in rename/remove_tree. The argv-form calls (exists,
+            # list_dir, get) need no quoting.
+            self._ssh('mkdir -p %s' % shlex.quote(parent))
             self._rsync(str(target), self._remote(rel))
 
     def list_dir(self, rel):
@@ -2717,10 +2724,11 @@ class SftpBackend:
         return _text(r.stdout).splitlines() if r.returncode == 0 else []
 
     def rename(self, src, dst):
-        self._ssh('mv %s/%s %s/%s' % (self.base, src, self.base, dst))
+        self._ssh('mv %s %s' % (shlex.quote('%s/%s' % (self.base, src)),
+                                 shlex.quote('%s/%s' % (self.base, dst))))
 
     def remove_tree(self, rel):
-        self._ssh('rm -rf %s/%s' % (self.base, rel))
+        self._ssh('rm -rf %s' % shlex.quote('%s/%s' % (self.base, rel)))
 
 
 def _server_backend(store, cfg):
