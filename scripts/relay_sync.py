@@ -783,20 +783,85 @@ def write_bundle_zip(bundle_dir, zip_path):
 
 
 def read_bundle_zip(zip_path, dest_dir):
-    """Unpack a bundle zip, rejecting absolute/escaping/symlink entries."""
+    """Unpack a bundle zip, rejecting absolute/escaping/symlink entries.
+
+    Batch 7 (manual folder carrier): every entry is validated BEFORE
+    anything is written -- the old code checked-and-wrote one entry at
+    a time, so a bad entry late in the list left earlier entries on
+    disk. Directory entries are skipped (our writer never emits them);
+    duplicate names are refused."""
     dest = Path(dest_dir)
     require(not dest.exists() or not any(dest.iterdir()), '解包目标目录非空：' + str(dest))
     dest.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
-            name = info.filename
-            _jail_check(name)
+        infos = [info for info in zf.infolist()
+                 if not info.is_dir() and not info.filename.endswith('/')]
+        names = [info.filename for info in infos]
+        require(len(set(names)) == len(names), '包内有重名条目，拒绝解包')
+        for info in infos:
+            _jail_check(info.filename)
             if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                raise RelayError('包内含符号链接条目：' + name)
-            target = dest / name
+                raise RelayError('包内含符号链接条目：' + info.filename)
+        for info in infos:
+            target = dest / info.filename
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(info))
     return dest
+
+
+def _zip_device(store, device_name=None, device_id=None):
+    """Device identity for a manual zip export. Sync config, when
+    present, supplies it; a manual export must NOT require sync-setup,
+    so without config it falls back to the hostname (name) and '' (id),
+    like pack_folder's device fallback."""
+    cfg = load_sync_config(store)
+    name = device_name or (cfg.get('device_name') if cfg else None) \
+        or socket.gethostname()
+    did = device_id or (cfg.get('device_id') if cfg else None) or ''
+    return name, did
+
+
+def export_zip(store, toplevel, zip_path, device_name=None, device_id=None):
+    """Manual folder carrier, export half (plan 2.3 by hand): build a
+    2.1 bundle for one project and pack it into a zip file.
+
+    The zip holds exactly the bundle directory (manifest + project
+    files); device-local config and keys never enter the bundle --
+    export_bundle only ships _is_payload_file files out of the project
+    store dir, and the sync config / key files live at the store root,
+    outside any project dir. An existing target zip is refused, never
+    silently overwritten. Returns a summary dict."""
+    store = Path(store)
+    zip_path = Path(zip_path)
+    require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
+    name, did = _zip_device(store, device_name, device_id)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='relay-export-zip-') as tmp:
+        bundle_dir = Path(tmp) / 'bundle'
+        manifest = export_bundle(store, [toplevel], bundle_dir, name, did)
+        write_bundle_zip(bundle_dir, zip_path)
+    return {'zip': str(zip_path), 'source_device': name,
+            'source_device_id': did,
+            'entry_count': manifest['entry_count'],
+            'file_count': len(manifest['files']),
+            'redacted_count': manifest['redacted_count']}
+
+
+def import_zip(store, zip_path, confirm=False):
+    """Manual folder carrier, import half: unzip and run the full
+    import_bundle pipeline (manifest + hash verification, redact
+    re-scan, matched merge or unclaimed landing, truncated repair).
+
+    Dry-run (confirm=False) writes NOTHING persistent: the zip is
+    extracted to a throwaway temp dir and import_bundle itself is
+    pure without confirm. Returns {'landed', 'report', 'zip'}."""
+    store = Path(store)
+    zip_path = Path(zip_path)
+    require(zip_path.is_file(), 'zip 不存在：' + str(zip_path))
+    with tempfile.TemporaryDirectory(prefix='relay-import-zip-') as tmp:
+        bundle_dir = read_bundle_zip(zip_path, Path(tmp) / 'bundle')
+        report = import_bundle(bundle_dir, store, confirm=confirm)
+    return {'landed': confirm, 'report': report, 'zip': str(zip_path)}
 
 
 # ---------------------------------------------------------------- verify

@@ -1044,6 +1044,15 @@ def _parser():
                     help='放行无签名的 Git 包（B1 兜底，需明示；收据留痕）')
     un.add_argument('--repin', action='store_true',
                     help='接受 Git 包签名公钥变更并重新钉死（B1，需明示；收据留痕）')
+    # --- volume-3 slice 5 (batch 7: manual folder carrier) ---------------
+    # Zip export/import: the same 2.1 bundle as the three carriers,
+    # carried by hand (export -> zip -> copy -> unzip -> import). No
+    # sync-setup required: device identity falls back to the hostname.
+    ez = sub.add_parser('export-zip')
+    ez.add_argument('--zip', required=True)
+    iz = sub.add_parser('import-zip')
+    iz.add_argument('--zip', required=True)
+    iz.add_argument('--confirm', action='store_true')
     ss = sub.add_parser('sync-setup')
     ss.add_argument('--remote')
     ss.add_argument('--device-name')
@@ -1322,7 +1331,7 @@ def main(argv=None):
                 return 1
         elif a.command in ('pack', 'unpack', 'sync-setup', 'sync-claim',
                            'sync-rollback', 'sync-status', 'sync-resolve',
-                           'sync-accept'):
+                           'sync-accept', 'export-zip', 'import-zip'):
             # relay_sync's RelayError is a different class from this
             # module's (importlib double-load), so the sync branch wraps
             # its own errors instead of relying on main()'s except.
@@ -1430,6 +1439,22 @@ def main(argv=None):
                             elif rest.get('status') not in ('none', 'already-consumed'):
                                 print('快照还原：%s' % rest.get('status'))
                         print('回执：' + result['receipt_path'])
+                elif a.command == 'export-zip':
+                    result = sync.export_zip(store, a.root, a.zip)
+                    print('导出完成：%s' % result['zip'])
+                    print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
+                          % (result['entry_count'], result['file_count'],
+                             result['redacted_count']))
+                elif a.command == 'import-zip':
+                    result = sync.import_zip(store, a.zip, confirm=a.confirm)
+                    if not result['landed']:
+                        print('干跑预览（未写入任何内容）：')
+                    else:
+                        print('导入已落盘：%s' % result['zip'])
+                    for entry in result['report']['projects']:
+                        _print_sync_project(entry)
+                        if entry.get('repaired'):
+                            print('  修复：' + '、'.join(entry['repaired']))
                 elif a.command == 'sync-setup':
                     carrier = a.carrier
                     if a.folder and not a.store_root:
