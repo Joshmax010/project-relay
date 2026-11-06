@@ -659,6 +659,22 @@ def save_sync_config(store, cfg):
     save(store / 'sync-config.json', cfg)
 
 
+def _require_sync_config(store):
+    """Sync config, or a clear setup prompt instead of a bare AttributeError.
+
+    Batch 6 (step-4 follow-up): `pack --carrier git` without sync-setup
+    used to die on cfg.get with "'NoneType' object has no attribute
+    'get'". The guard lives here, not in _carrier_of: an explicit
+    --carrier legitimately bypasses that check (a mocked/attached pack
+    must still run, pinned by test_weak_init_...), so each backend that
+    dereferences the config guards it at its own entry.
+    """
+    cfg = load_sync_config(store)
+    if cfg is None:
+        raise RelayError('未运行 sync-setup：请先运行 relay sync-setup 配置同步载体')
+    return cfg
+
+
 def _device(store, cfg):
     return cfg.get('device_name') or 'device', cfg.get('device_id') or ''
 
@@ -2219,9 +2235,10 @@ def _bundle_dir_from_clone(clone_dir, key, workdir, trust_unsigned=False,
     rebuilt bundle manifest ('signature_verification') so import reports
     and receipts carry the trace; a --repin acceptance additionally
     writes a dedicated repin receipt under the store when known."""
-    manifest, dirname = _read_remote_bundle(clone_dir, key)
-    if manifest is None:
+    manifest_result = _read_remote_bundle(clone_dir, key)
+    if manifest_result is None:
         return None
+    manifest, dirname = manifest_result
     src = clone_dir / 'projects' / dirname
     if not src.is_dir():
         return None
@@ -3039,7 +3056,7 @@ def _pack_git(store, toplevel, remote=None, device_name=None,
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     key = row['key']
     slug = row['slug']
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     remote = remote or cfg.get('remote')
     device = device_name or cfg.get('device_name') or socket.gethostname()
     device_id = cfg.get('device_id')
@@ -3209,7 +3226,7 @@ def pack_folder(store, toplevel, device_name=None):
     Any step failure stops the pack with an actionable message."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     key, slug = row['key'], row['slug']
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     device = device_name or cfg.get('device_name') or socket.gethostname()
     device_id = cfg.get('device_id') or ''
     steps = []
@@ -3279,7 +3296,7 @@ def pack_server(store, toplevel, device_name=None, backend=None):
     credentials never)."""
     row, store_dir = relay.resolve_store_dir(store, toplevel)
     key, slug = row['key'], row['slug']
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     backend = backend or _server_backend(store, cfg)
     device = device_name or cfg.get('device_name') or socket.gethostname()
     device_id = cfg.get('device_id') or ''
@@ -3399,7 +3416,7 @@ def _unpack_git(store, remote=None, confirm=False, project_keys=None,
     worktree AFTER the archive merge; a refused/failed restore never
     bricks the already-landed archive merge (it is reported, not raised).
     Folder/server unpacks have no snapshot channel and never restore."""
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     remote = remote or cfg.get('remote')
     with tempfile.TemporaryDirectory(prefix='relay-unpack-') as tmp:
         clone_dir = _clone(remote, tmp, checkout=_git_branch(store))
@@ -3513,7 +3530,7 @@ def unpack_folder(store, confirm=False, project_keys=None):
     read-only reconcile notes, and apply the readiness gate. The
     `confirm` flag is accepted for CLI symmetry and ignored (nothing
     here needs confirmation because nothing is merged)."""
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     scan = scan_folder_conflicts(store, isolate=True)
     registry = relay.load_registry(store)
     rows = [r for r in registry.get('projects', [])
@@ -3553,7 +3570,7 @@ def unpack_server(store, confirm=False, project_keys=None, backend=None):
     results are NOT committed anywhere (the server carrier has no git
     semantics); a read-only reconcile + readiness gate follows, and
     only a passed gate is announced as ready by the caller."""
-    cfg = load_sync_config(store)
+    cfg = _require_sync_config(store)
     backend = backend or _server_backend(store, cfg)
     registry = relay.load_registry(store)
     rows = [r for r in registry.get('projects', [])

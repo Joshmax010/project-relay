@@ -558,15 +558,44 @@ def _age_seconds(earlier_iso, later_iso):
     return (parse(later_iso) - parse(earlier_iso)).total_seconds()
 
 
+def _filename_tag_of(path):
+    """Device tag embedded in an entry filename, or None for a plain name.
+
+    Folder carrier (plan 2.3.3): degraded-mode captures are named
+    cap-NNNN-<device8>.md so two devices' same-seq entries can coexist
+    in one raw/ after an external sync merge. A queue transition must
+    write each entry back to its own file.
+    """
+    name = Path(path).name
+    if not name.startswith('cap-') or not name.endswith('.md'):
+        return None
+    stem = name[len('cap-'):-len('.md')]
+    parts = stem.split('-', 1)
+    return parts[1] if len(parts) == 2 else None
+
+
 def _set_queue(store_dir, seq, state, extra=None):
-    entries = {e['header']['seq']: e for e in list_entries(store_dir)}
-    require(seq in entries, '找不到采集条目：cap-%04d' % seq)
-    header = dict(entries[seq]['header'])
-    header['queue'] = state
-    if extra:
-        header.update(extra)
-    _write_entry(store_dir, header, entries[seq]['body'])
-    return header
+    entries = [e for e in list_entries(store_dir)
+               if e['header']['seq'] == seq]
+    require(entries, '找不到采集条目：cap-%04d' % seq)
+    updated = None
+    for entry in entries:
+        header = dict(entry['header'])
+        header['queue'] = state
+        if extra:
+            header.update(extra)
+        # Batch 6 (Codex PR #5 2026-11-06 review): the old code collapsed
+        # same-seq entries into one dict entry ({seq: entry}) and rewrote
+        # it without a filename tag, so a folder-merged duplicate lost
+        # its device suffix -- and the other copy stayed pending forever
+        # once the cursor passed their shared seq. Update every entry
+        # sharing the seq, each back to its own file. The write still
+        # goes through _write_entry (reserve=False) -> atomic() binary
+        # rewrite, so the step-4 CRLF normalization side effect stays.
+        _write_entry(store_dir, header, entry['body'],
+                     filename_tag=_filename_tag_of(entry['path']))
+        updated = header
+    return updated
 
 
 def archive_summarized(store_dir, keep_latest=True):
@@ -1803,7 +1832,12 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
         if not consumed:
             raise RelayError('锚点缺失：游标指向的条目 cap-%04d 已不存在，汇总中止' % cursor['entry_seq'])
         if cursor.get('anchor_message') is not None and \
-                consumed[0]['header'].get('user_message') != cursor['anchor_message']:
+                not any(e['header'].get('user_message') == cursor['anchor_message']
+                        for e in consumed):
+            # Batch 6: the anchor came from the LAST entry summarized at
+            # this seq, but same-seq entries can share the cursor seq
+            # (folder-merged duplicates with different messages). Match
+            # any of them; consumed[0] alone would false-abort.
             raise RelayError('锚点不匹配：游标锚点消息与条目 cap-%04d 不一致，汇总中止'
                              % cursor['entry_seq'])
     if not entries:
