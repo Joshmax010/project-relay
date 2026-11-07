@@ -26,7 +26,7 @@ Gemini CLI、Copilot 和 Cline 暂未接入，留待后续。仅 Git 代码项�
 
 ## 安装
 
-先把 skill 装进你的 agent。装法按你手边有什么选一个，装完都一样用。需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay。 `find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
+先把 skill 装进你的 agent。装法按你手边有什么选一个，装完都一样用。需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay  `find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
 
 skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面以 Claude Code 为例，Codex 把 `-a` 后面换成 `codex`。结尾的 `-y` 是跳过安装确认，别省）：
 
