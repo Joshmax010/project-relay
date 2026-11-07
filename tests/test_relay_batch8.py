@@ -62,7 +62,7 @@ class TestSkillConsistency(unittest.TestCase):
 
     def test_root_skill_covers_v2_procedures_not_v1(self):
         root = (SKILL / 'SKILL.md').read_text(encoding='utf-8')
-        for proc in ('relay init', 'goal confirm', 'relay summarize',
+        for proc in ('从零 init', 'goal confirm', 'relay summarize',
                      'export-zip', 'import-zip', 'recipe install',
                      '只有项目目标需要人确认'):
             self.assertIn(proc, root,

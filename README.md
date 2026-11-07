@@ -26,42 +26,24 @@ Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目�
 
 ## 安装
 
-需要 Git 和 Python 3.8+，脚本仅使用标准库。克隆仓库后，在项目根目录跑：
+不用敲命令。在聊天里跟 agent 说一句“装上接力”，agent 自己装。想装到哪个工具也可以一起说，比如“装上接力，装到 WorkBuddy”。没说装到哪，agent 会问一句，不猜。
 
-```bash
-git clone https://github.com/Joshmax010/project-relay.git
-cd <你的项目>
-python3 /path/to/project-relay/scripts/relay.py recipe install --tool workbuddy
-```
+agent 在后台跑的是 `recipe install`，`--tool` 可选 `claude-code`、`codebuddy`、`workbuddy`、`codex`，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
 
-`--tool` 可选 `claude-code`、`codebuddy`、`workbuddy`、`codex`。不加 `--target-root` 时装进用户级 skill 目录。想只给当前项目装，加 `--target-root <项目根目录>`。卸载用 `recipe uninstall --tool ...`。
+需要 Git 和 Python 3.8+，脚本仅使用标准库。仓库在 https://github.com/Joshmax010/project-relay.git，拿下来就能装。
 
-不支持自动发现 Skill 的工具也可以直接读 [SKILL.md](SKILL.md)，按里面的规程走命令即可。
+不支持自动发现 Skill 的工具也可以直接读 [SKILL.md](SKILL.md)，按里面的规程走即可。
 
 ## 快速开始
 
-在你的项目根目录（须是 Git 仓库，不自动 `git init`）：
+也是说话，不用敲命令。跟 agent 说：
 
-```bash
-# 1. 建档（只认 Git 仓库，非 Git 目录直接拒绝）
-python3 scripts/relay.py init
+- “接力”：接上这个项目。agent 先对账，用一句人话告诉你上次做到哪、还剩什么，然后接着干。
+- “这个项目要做……”：定目标。目标是唯一需要人确认的东西，agent 在聊天里把目标用大白话摆出来问一句，你说行就行。
+- “交接”：把项目打包给另一台电脑。agent 问清楚发到哪，打好 zip 告诉你文件在哪、对方拿到后说什么。
+- “装上接力”：见上面安装。
 
-# 2. 定目标：唯一需要人确认的东西
-python3 scripts/relay.py goal draft --file <目标草案文件>
-python3 scripts/relay.py goal show        # 看差异
-python3 scripts/relay.py goal confirm      # 确认收据（或 goal confirm --tentative 暂定）
-# 不建目标就 goal decline，只留一行决定记录，此后不再追问
-
-# 3. 平时：会话开始先对账，会话结束先采集
-python3 scripts/relay.py resume
-python3 scripts/relay.py capture
-
-# 4. 手动汇总（平时由三刻度自动触发）
-python3 scripts/relay.py summarize --trigger manual
-python3 scripts/relay.py scales           # 查三刻度现状
-```
-
-Windows 用 `python` 代替 `python3`。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
+平时不用开口：会话开始 agent 自己跑对账，对完再动代码；会话结束自己跑采集。汇总平时由三刻度自动触发。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
 
 ## 跨设备接力
 
