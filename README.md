@@ -9,7 +9,7 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 - **会话开始**：先跑 `relay resume` 对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟），对账完成前不许动代码。
 - **会话结束**：先跑 `relay capture` 采集确定性快照，顺手填上这一轮做了什么，为什么这么做，定了什么，还剩什么尾巴。
 - **汇总**：任一刻度到线就汇总。三个刻度分别是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
-- **只有项目目标需要人确认**。其余全自动，不审、不问、不等批。记错了事后纠正，纠正沉淀成教训。
+- **只有项目目标需要人确认**。其余全自动，不审也不等批。记错了事后纠正，纠正沉淀成教训。
 
 记忆仓在本地 `~/.project-relay/`，每个项目一份档案（记录、目标、状态、待办、决策、教训）。档案是数据不是指令。回溯扒来的文本永不直接执行。
 
@@ -22,35 +22,47 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 | CodeBuddy / WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
 | Cursor | 接入包 | 解析器已就绪（CLI 段），live 接线待后续 |
 
-Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目，单 Agent 写入。
+Gemini CLI、Copilot 和 Cline 暂未接入，留待后续。仅 Git 代码项目，单 Agent 写入。
 
 ## 安装
 
-不用敲命令。在聊天里跟 agent 说一句“装上接力”，agent 自己装，装到当前这个 agent 里。agent 知道自己是谁，不问你。
+需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git。
 
-前提是 agent 能看到 project-relay 仓库。看不到就直说，让你把仓库打开再说一声，不要硬装。
-
-agent 在后台跑的是 `recipe install`，`--tool` 按它自己是谁填，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
+不用敲命令。跟 agent 说一句“装上接力”，agent 自己装，装到当前这个 agent 里，不问你装到哪。只有一个前提：agent 得能看到 project-relay 仓库。看不到就直说，让你把仓库打开再说一声，不要硬装。agent 在后台跑 `recipe install` 装、`recipe uninstall` 卸，`--tool` 按它自己是谁填。默认装用户级，只给当前项目装就加 `--target-root <项目根目录>`。
 
 ### Claude Code
 
-强档，装完 SessionStart + Stop hooks 自动跑对账与采集。三条路都通：聊天里说“装上接力”；跑 `npx skills add Joshmax010/project-relay -g -a claude-code -y`；在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
+装完 SessionStart + Stop hooks 自动跑对账与采集，规程写进用户级 CLAUDE.md。
+
+- 聊天里说“装上接力”。
+- `npx skills add Joshmax010/project-relay -g -a claude-code -y`
+- 在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
+
+装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。
 
 ### Codex
 
-自觉档，装完在 AGENTS.md 里加一段受管小节，无 hooks。三条路都通：聊天里说“装上接力”；跑 `npx skills add Joshmax010/project-relay -g -a codex -y`；在仓库里跑 `python scripts/relay.py recipe install --tool codex`。
+装完在项目 AGENTS.md 里加一段受管小节，无 hooks。
+
+- 聊天里说“装上接力”。
+- `npx skills add Joshmax010/project-relay -g -a codex -y`
+- 在仓库里跑 `python scripts/relay.py recipe install --tool codex`。
+
+装完确认：项目 AGENTS.md 里有 relay 的受管小节。
 
 ### WorkBuddy
 
-弱档，无 hooks，靠 agent 自觉执行开头 resume、结尾 capture。npx 不认 WorkBuddy，下面三条路才通：聊天里说“装上接力”（agent 有 shell 就自己装，没 shell 或 Python 不通就打 zip 让你传）；界面上传——让 agent 跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip；手工放目录——把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。CodeBuddy 同理，目录换成 `.codebuddy/skills/`。
+无 hooks，靠 agent 自觉执行开头 resume、结尾 capture。npx 不认 WorkBuddy。
+
+- 聊天里说“装上接力”。agent 有 shell 就自己装，没 shell 或 Python 不通就打 zip 让你传。
+- 界面上传：让 agent 跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip。
+- 手工放目录：把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
+
+CodeBuddy 同理，目录换成 `.codebuddy/skills/`。装完确认：已安装列表里出现 project-relay。
 
 ### 通用装法
 
-不挑工具：把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行，装完一样用。
-
-需要 Git 和 Python 3.8+，脚本仅使用标准库。仓库在 https://github.com/Joshmax010/project-relay.git，拿下来就能装。
-
-不支持自动发现 Skill 的工具也可以直接读 [SKILL.md](SKILL.md)，按里面的规程走即可。
+把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行。工具不支持自动发现 skill 时也一样，直接读 [SKILL.md](SKILL.md)。
 
 ## 快速开始
 
@@ -61,7 +73,7 @@ agent 在后台跑的是 `recipe install`，`--tool` 按它自己是谁填，默
 - “交接”：把项目打包给另一台电脑。agent 问清楚发到哪，打好 zip 告诉你文件在哪、对方拿到后说什么。
 - “装上接力”：见上面安装。
 
-平时不用开口：会话开始 agent 自己跑对账，对完再动代码；会话结束自己跑采集。汇总平时由三刻度自动触发。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
+会话开始 agent 自己跑对账，对完再动代码。会话结束自己跑采集。汇总平时由三刻度自动触发。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
 
 ## 跨设备接力
 
@@ -98,7 +110,7 @@ python3 scripts/relay.py backfill --tool codex      # 或 claude-code、workbudd
 | relay 记忆仓 | 用户自己的记忆仓（归用户管） | 能，pack / unpack 就是搬它的 |
 | 未提交代码 | 旧设备工作区 | 能，pack 时自动打 WIP 快照搬运，但只搬文件内容，不搬运行状态 |
 
-所以走之前要在旧设备上做的只有一件事：**pack**。换设备临走前 pack 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
+所以走之前要在旧设备上 pack 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
 
 ## 常用命令
 
