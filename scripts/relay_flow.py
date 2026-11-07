@@ -55,6 +55,7 @@ Environment override (tests only): PROJECT_RELAY_HOME is honored by relay.py
 (home_dir); relay_flow never computes a store root on its own.
 """
 import difflib
+import hashlib
 import importlib.util
 import json
 import os
@@ -938,6 +939,10 @@ def managed_remove(path, marker):
     return True, '已移除受管小节 ' + marker
 
 
+def _sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
 def _recipe_state_path(store_dir, tool, project_key):
     # Codex PR #5 finding 3: the old global/recipes/{tool}.json was shared
     # by every project, so a second project's install overwrote the first
@@ -1211,16 +1216,16 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 | 接力、接上这个项目、继续做、接着干 | 跑 resume 对账，用一句人话告诉用户上次做到哪、还剩什么，然后接着干 |
 | 交接、打包、发到另一台电脑 | 问清楚发到哪（不清楚就问），打 zip，告诉用户文件在哪、对方拿到后说什么 |
 | 接上另一台电脑的项目 | 解开对方发来的包，跑 resume 对账，确认能看到对方的记录再接着做 |
-| 装上接力、把接力装到 WorkBuddy / Claude Code / Codex | 跑 recipe install 装到他说的工具，没说装到哪就问一句，不要猜；装好用人话确认，不贴命令 |
-| 目标是……、这个项目要做…… | 走目标流程（见下），在聊天里问，不要让用户敲命令 |
+| 装上接力 | 跑 recipe install，装到你当前这个工具里 |
+| 目标是……、这个项目要做…… | 走目标流程（见下），在聊天里问 |
 
 会话开始和结束不用用户开口：开头自己跑 resume 对账，对完再动代码；结尾自己跑 capture 采集，语义占位段填好再收尾。
 
 ## 怎么跟用户说话
 
-- 说人话，不用术语。命令永远不要让用户敲，你自己在后台跑；只报结果，不报命令。
+- 说人话，不用术语。命令只在文末命令参考里出现，你自己跑，不展示给用户。
 - 唯一需要用户确认的是项目目标。把目标用大白话摆出来问一句，这样行吗。用户说行，你自己去确认；用户说不行，改了再问。
-- 对账、采集、汇总、打包这些事，做完用一句人话报结果。不要把命令、路径、哈希贴给用户。
+- 对账、采集、汇总、打包这些事，做完用一句人话报结果。
 
 ## 会话开始：先对账
 
@@ -1232,7 +1237,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 ## 目标
 
-目标是唯一需要人确认的东西。`relay goal draft --file <草案文件>` 起草 → `relay goal show` 看差异 → `relay goal confirm` 确认收据（或 `--tentative` 暂定）。不建目标就 `goal decline`，只留一行决定记录，此后不再追问。目标确认后有哈希收据；目标被改动时注入停止，只展示上一版已确认目标的只读副本并摆出差异。以上命令你自己跑，用户只在聊天里说行或不行。
+目标是唯一需要人确认的东西。`relay goal draft --file <草案文件>` 起草 → `relay goal show` 看差异 → `relay goal confirm` 确认收据（或 `--tentative` 暂定）。不建目标就 `goal decline`，只留一行决定记录，此后不再追问。目标确认后有哈希收据；目标被改动时注入停止，只展示上一版已确认目标的只读副本并摆出差异。
 
 ## 汇总
 
@@ -1248,7 +1253,9 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 ## 安装
 
-用户说装上接力，你来装：`relay recipe install --tool claude-code|codebuddy|workbuddy|codex`。Claude Code 是强档（SessionStart + Stop hooks 自动跑对账与采集）；CodeBuddy / WorkBuddy 是弱档，本路线无生命周期 hooks，靠你自觉执行开头 resume、结尾 capture；Codex 是自觉档（AGENTS.md 受管小节，无 hooks）。卸载用 `recipe uninstall --tool ...`。无论哪档，会话开始 resume、会话结束 capture 这两条规程不变。安装命令你自己跑，不要让用户敲。
+用户说装上接力，你来装，装到你当前这个工具里。如果提示项目未建仓，先跑 relay init 再装。你知道你是谁，`--tool` 参数按你是谁填，别问用户装到哪。Claude Code 是强档（SessionStart + Stop hooks 自动跑对账与采集）；CodeBuddy / WorkBuddy 是弱档，本路线无生命周期 hooks，靠你自觉执行开头 resume、结尾 capture；Codex 是自觉档（AGENTS.md 受管小节，无 hooks）。卸载用 `recipe uninstall`。无论哪档，会话开始 resume、会话结束 capture 这两条规程不变。
+
+这一步的前提是你能看到 project-relay 仓库。看不到就直说，让用户把仓库打开再说一声，不要硬装。
 
 ## 边界
 
@@ -1258,7 +1265,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 - 接力的活一律走 `scripts/relay.py`，不走项目内 `.agent/tools/relayctl.py`，那是旧版流程的工具。旧版 `.agent/` 代码与文档保留，旧流程退役另议。
 - 仅 Git 代码项目；子模块内部状态不归 relay 管；拆分寻址目前经 key 不经路径。
 
-## 命令参考（你自己跑，不要让用户敲）
+## 命令参考
 
 命令一律在项目根目录跑 `python3 scripts/relay.py ...`（Windows 用 `python`）。记忆仓在 `~/.project-relay/`，每个项目一份档案（记录、目标、状态、待办、决策、教训）。深规格见 `references/v2-foundation.md`、`references/v2-flow.md`、`references/v2-sync.md`。
 '''
@@ -1281,12 +1288,24 @@ def install_codebuddy(store, toplevel, target_root, flavor='codebuddy'):
     # now refuses the install (the user moves or backs it up first);
     # identical content proceeds (idempotent reinstall). RELAY-RECIPE.md
     # is relay's own file, so it keeps its existing overwrite behavior.
+    # Batch 12 fix: "differing" alone no longer proves user-authored.
+    # The SHA256 of the text install wrote is recorded in the recipe
+    # state, so an existing file whose hash matches the record is
+    # relay's own older version and may be upgraded in place. A state
+    # with no recorded hash (pre-fix install) never guesses: a
+    # differing file is still refused.
     existing_skill = skill_dir / 'SKILL.md'
-    if existing_skill.exists() \
-            and existing_skill.read_bytes() != RELAY_SKILL_TEXT.encode('utf-8'):
-        raise RelayError(
-            '已有用户自写 SKILL.md，拒绝覆盖（文件无损）：%s；请先人工移走或备份'
-            '该文件，再重新安装 relay 配方' % existing_skill)
+    if existing_skill.exists():
+        existing = existing_skill.read_bytes()
+        current = RELAY_SKILL_TEXT.encode('utf-8')
+        recorded = None
+        state = _load_recipe_state(store_dir, flavor, _row['key'])
+        if state is not None:
+            recorded = state.get('skill_sha256')
+        if existing != current and _sha256_hex(existing) != recorded:
+            raise RelayError(
+                '已有用户自写 SKILL.md，拒绝覆盖（文件无损）：%s；请先人工移走或备份'
+                '该文件，再重新安装 relay 配方' % existing_skill)
     atomic(skill_dir / 'SKILL.md', RELAY_SKILL_TEXT.encode('utf-8'))
     note = ('弱档配方：本路线无生命周期 hooks，采集与执法全部靠 Agent 自觉执行。'
             if flavor == 'codebuddy'
@@ -1294,7 +1313,8 @@ def install_codebuddy(store, toplevel, target_root, flavor='codebuddy'):
     atomic(skill_dir / 'RELAY-RECIPE.md', (note + '\n').encode('utf-8'))
     _save_recipe_state(store_dir, flavor, _row['key'],
                        {'tool': flavor, 'tier': 'weak', 'skill_dir': str(skill_dir),
-                        'hooks': [], 'installed_at': utc(), 'note': note})
+                        'hooks': [], 'installed_at': utc(), 'note': note,
+                        'skill_sha256': _sha256_hex(RELAY_SKILL_TEXT.encode('utf-8'))})
     return {'skill_dir': str(skill_dir), 'note': note}
 
 
@@ -1314,7 +1334,13 @@ def uninstall_codebuddy(store, toplevel, flavor='codebuddy'):
     # untouched.
     managed = {'SKILL.md', 'RELAY-RECIPE.md'}
     foreign = []
-    if (skill_dir / 'SKILL.md').read_bytes() != RELAY_SKILL_TEXT.encode('utf-8'):
+    # Batch 12 fix: SKILL.md counts as relay's own when it matches the
+    # current text OR the hash recorded at install time (an older
+    # relay-installed version). A state with no recorded hash (pre-fix
+    # install) only accepts the current text, never guesses.
+    skill_bytes = (skill_dir / 'SKILL.md').read_bytes()
+    if skill_bytes != RELAY_SKILL_TEXT.encode('utf-8') \
+            and _sha256_hex(skill_bytes) != state.get('skill_sha256'):
         foreign.append('SKILL.md（内容已被外部改动）')
     for path in sorted(skill_dir.rglob('*')):
         rel = path.relative_to(skill_dir).as_posix()

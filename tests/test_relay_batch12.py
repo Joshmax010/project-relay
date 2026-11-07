@@ -205,3 +205,47 @@ class TestTriggerEvalsKeywordCoverageOnly(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestBatch12FixCurrentAgentInstall(unittest.TestCase):
+    """Batch 12 fix: install targets the current agent, no nagging.
+
+    The user corrected three things after reviewing batch 12: (1) the
+    "don't make the user type commands" line was repeated all over the
+    skill text -- a skill should say it once; (2) the install target is
+    always the agent the user is already talking to, never ask which
+    tool; (3) semantic install only works when the agent can see the
+    project-relay repo, otherwise say so plainly instead of forcing it.
+    """
+
+    def test_install_targets_current_agent(self):
+        text = flow.RELAY_SKILL_TEXT
+        self.assertIn('装到你当前这个工具里', text,
+                      'install must target the current agent')
+        self.assertIn('别问用户装到哪', text,
+                      'skill must not ask which tool to install to')
+
+    def test_install_requires_visible_repo(self):
+        text = flow.RELAY_SKILL_TEXT
+        self.assertIn('看不到就直说', text,
+                      'skill must say plainly when the repo is not visible')
+
+    def test_install_init_prerequisite(self):
+        text = flow.RELAY_SKILL_TEXT
+        self.assertIn('如果提示项目未建仓，先跑 relay init 再装', text,
+                      'fresh clone needs init before install')
+
+    def test_no_repeated_no_commands_nagging(self):
+        text = flow.RELAY_SKILL_TEXT
+        self.assertNotIn('不要让用户敲', text,
+                         'repeated no-commands nagging is still in the text')
+
+    def test_readme_install_targets_current_agent(self):
+        readme = (SKILL / 'README.md').read_text(encoding='utf-8')
+        self.assertNotIn('想装到哪个工具也可以一起说', readme,
+                         'README still asks which tool to install to')
+        self.assertIn('装到当前这个 agent 里', readme,
+                      'README install must target the current agent')
+        self.assertIn('看不到就直说', readme,
+                      'README install must state the visible-repo '
+                      'prerequisite')

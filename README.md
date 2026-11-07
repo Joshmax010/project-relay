@@ -26,9 +26,11 @@ Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目�
 
 ## 安装
 
-不用敲命令。在聊天里跟 agent 说一句“装上接力”，agent 自己装。想装到哪个工具也可以一起说，比如“装上接力，装到 WorkBuddy”。没说装到哪，agent 会问一句，不猜。
+不用敲命令。在聊天里跟 agent 说一句“装上接力”，agent 自己装，装到当前这个 agent 里。agent 知道自己是谁，不问你。
 
-agent 在后台跑的是 `recipe install`，`--tool` 可选 `claude-code`、`codebuddy`、`workbuddy`、`codex`，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
+前提是 agent 能看到 project-relay 仓库。看不到就直说，让你把仓库打开再说一声，不要硬装。
+
+agent 在后台跑的是 `recipe install`，`--tool` 按它自己是谁填，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
 
 需要 Git 和 Python 3.8+，脚本仅使用标准库。仓库在 https://github.com/Joshmax010/project-relay.git，拿下来就能装。
 
