@@ -88,19 +88,16 @@ class TestSkillDescriptionTriggers(unittest.TestCase):
 
 
 class TestSkillBodySync(unittest.TestCase):
-    """Root SKILL.md and RELAY_SKILL_TEXT are one body, one name apart."""
+    """Root SKILL.md and RELAY_SKILL_TEXT are the same text (batch 13:
+    the name is unified to project-relay, so there is no longer a
+    one-name-apart difference between the two)."""
 
-    def test_root_body_matches_installed_body_except_name(self):
+    def test_root_matches_installed_text(self):
         root = (SKILL / 'SKILL.md').read_text(encoding='utf-8')
         self.assertTrue(root.startswith('---\nname: project-relay\n'),
                         'root SKILL.md frontmatter name changed')
-        lines = root.splitlines(keepends=True)
-        for i, line in enumerate(lines):
-            if line.startswith('name:'):
-                lines[i] = 'name: relay\n'
-                break
-        self.assertEqual(''.join(lines), flow.RELAY_SKILL_TEXT,
-                         'root SKILL.md body differs from installed text')
+        self.assertEqual(root, flow.RELAY_SKILL_TEXT,
+                         'root SKILL.md differs from installed text')
 
     def test_installed_text_is_conversational_not_command_list(self):
         text = flow.RELAY_SKILL_TEXT
@@ -154,7 +151,7 @@ class TestSemanticInstall(unittest.TestCase):
                      '--target-root', str(home)],
                     capture_output=True, text=True, cwd=str(SKILL))
                 self.assertEqual(out.returncode, 0, out.stderr)
-                skill = (home / '.workbuddy' / 'skills' / 'relay'
+                skill = (home / '.workbuddy' / 'skills' / 'project-relay'
                          / 'SKILL.md')
                 self.assertTrue(skill.is_file(), 'installed SKILL.md missing')
                 installed = skill.read_bytes()

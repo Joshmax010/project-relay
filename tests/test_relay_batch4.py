@@ -403,7 +403,7 @@ class TestCodebuddyGuard(Batch4Base):
 
     def test_user_skill_refuses_and_identical_reinstalls(self):
         root = self.init()
-        skill_dir = root / '.codebuddy' / 'skills' / 'relay'
+        skill_dir = root / '.codebuddy' / 'skills' / 'project-relay'
         skill_dir.mkdir(parents=True)
         (skill_dir / 'SKILL.md').write_text('我自己的 skill\n', encoding='utf-8')
         with self.assertRaises(FlowRelayError):

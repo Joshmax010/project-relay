@@ -1028,6 +1028,9 @@ def _parser():
     ru.add_argument('--tool', required=True, choices=['claude-code', 'codebuddy', 'workbuddy', 'codex'])
     ru.add_argument('--target-root')
     ru.add_argument('--home')
+    rp = rsub.add_parser('package')
+    rp.add_argument('--tool', required=True, choices=['workbuddy'])
+    rp.add_argument('--out')
     sub.add_parser('precompress')
     sub.add_parser('fingerprint')
     sc = sub.add_parser('scales')
@@ -1725,29 +1728,34 @@ def main(argv=None):
                 if info['action'] == 'block':
                     return 2
             elif a.command == 'recipe':
-                home = Path(a.home).expanduser() if a.home else None
-                target = Path(a.target_root).expanduser() if a.target_root else Path.home()
-                if a.recipe_command == 'install':
-                    if a.tool == 'claude-code':
-                        info = flow.install_claude(store, root, home_dir=home)
-                        print('\n'.join(info['notes']))
-                    elif a.tool in ('codebuddy', 'workbuddy'):
-                        info = flow.install_codebuddy(store, root, target, flavor=a.tool)
-                        print('skill 目录：' + info['skill_dir'])
-                        print(info['note'])
-                    else:
-                        info = flow.install_codex(store, root)
-                        print(info['note'])
+                if a.recipe_command == 'package':
+                    info = flow.package_workbuddy(root, out=a.out)
+                    print('技能包：' + info['zip_path'])
+                    print('文件 %d 个' % len(info['files']))
                 else:
-                    if a.tool == 'claude-code':
-                        info = flow.uninstall_claude(store, root, home_dir=home)
-                        print('\n'.join(info['notes']))
-                    elif a.tool in ('codebuddy', 'workbuddy'):
-                        info = flow.uninstall_codebuddy(store, root, flavor=a.tool)
-                        print('已移除：' + info['removed'])
+                    home = Path(a.home).expanduser() if a.home else None
+                    target = Path(a.target_root).expanduser() if a.target_root else Path.home()
+                    if a.recipe_command == 'install':
+                        if a.tool == 'claude-code':
+                            info = flow.install_claude(store, root, home_dir=home)
+                            print('\n'.join(info['notes']))
+                        elif a.tool in ('codebuddy', 'workbuddy'):
+                            info = flow.install_codebuddy(store, root, target, flavor=a.tool)
+                            print('skill 目录：' + info['skill_dir'])
+                            print(info['note'])
+                        else:
+                            info = flow.install_codex(store, root)
+                            print(info['note'])
                     else:
-                        info = flow.uninstall_codex(store, root)
-                        print(info['note'])
+                        if a.tool == 'claude-code':
+                            info = flow.uninstall_claude(store, root, home_dir=home)
+                            print('\n'.join(info['notes']))
+                        elif a.tool in ('codebuddy', 'workbuddy'):
+                            info = flow.uninstall_codebuddy(store, root, flavor=a.tool)
+                            print('已移除：' + info['removed'])
+                        else:
+                            info = flow.uninstall_codex(store, root)
+                            print(info['note'])
             elif a.command == 'precompress':
                 doc = flow.precompress(store, root)
                 print('整理稿：条目区间 %s，改动文件 %d 个，失败样本 %d 个'

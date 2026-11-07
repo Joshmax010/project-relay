@@ -32,6 +32,8 @@ Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目�
 
 agent 在后台跑的是 `recipe install`，`--tool` 按它自己是谁填，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
 
+WorkBuddy 也可以不走命令行：① 界面上传——让 agent 跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip；② 手工放目录——把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
+
 需要 Git 和 Python 3.8+，脚本仅使用标准库。仓库在 https://github.com/Joshmax010/project-relay.git，拿下来就能装。
 
 不支持自动发现 Skill 的工具也可以直接读 [SKILL.md](SKILL.md)，按里面的规程走即可。

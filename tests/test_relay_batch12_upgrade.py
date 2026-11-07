@@ -143,7 +143,7 @@ class TestRecipeUpgrade(UpgradeBase):
         # current text nor any recorded hash -- must still be refused,
         # byte-for-byte untouched.
         root = self.init()
-        skill_dir = self.target() / '.codebuddy' / 'skills' / 'relay'
+        skill_dir = self.target() / '.codebuddy' / 'skills' / 'project-relay'
         skill_dir.mkdir(parents=True, exist_ok=True)
         user_text = '---\nname: relay\n---\n\nMy own skill notes, do not touch.\n'
         (skill_dir / 'SKILL.md').write_bytes(user_text.encode('utf-8'))

@@ -146,12 +146,12 @@ class TestWorkbuddyInstallE2E(Batch8Base):
                         'recipe', 'install', '--tool', 'workbuddy',
                         '--target-root', str(home))
         self.assertEqual(out.returncode, 0, out.stderr)
-        skill = home / '.workbuddy' / 'skills' / 'relay' / 'SKILL.md'
+        skill = home / '.workbuddy' / 'skills' / 'project-relay' / 'SKILL.md'
         self.assertTrue(skill.is_file(), 'installed SKILL.md missing')
         self.assertEqual(skill.read_bytes(),
                          flow.RELAY_SKILL_TEXT.encode('utf-8'),
                          'installed skill is not the v2 recipe text')
-        self.assertTrue((home / '.workbuddy' / 'skills' / 'relay'
+        self.assertTrue((home / '.workbuddy' / 'skills' / 'project-relay'
                          / 'RELAY-RECIPE.md').is_file())
         # Session work, then the installed skill's end-of-session rule.
         self.goal(store_a, repo_a, '# 目标\n\n演示。\n')
