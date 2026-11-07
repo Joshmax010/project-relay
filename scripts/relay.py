@@ -294,7 +294,15 @@ def _migrate_row_to_remote(store, registry, row, key, canonical):
     if old_dir.exists() and not new_dir.exists():
         old_dir.rename(new_dir)
         notes.append('项目键已迁移：本地键 %s -> remote 键 %s，记忆仓已改名' % (old_key, key))
-        _strip_weak_identity_line(new_dir)
+        # Batch 9 (Codex PR #5 2026-11-06 review): stripping the
+        # weak-identity line rewrites archive/state.md, which is inside
+        # the checksum manifest's scope (archive/**), so the manifest
+        # must be refreshed when the strip actually changed the file --
+        # otherwise the next resume reports a manifest mismatch for
+        # state.md and blocks automatic summarization (same class as
+        # the fork-adjudication refresh in relay_fork.py).
+        if _strip_weak_identity_line(new_dir):
+            update_checksum_manifest(new_dir)
     elif old_dir.exists():
         target = store / 'trash' / (old_key + '-' + utc().replace(':', '-'))
         target.parent.mkdir(parents=True, exist_ok=True)
