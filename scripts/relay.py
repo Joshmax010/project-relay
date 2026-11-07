@@ -730,6 +730,30 @@ def goal_show(store, toplevel):
         fromfile='goal.md:current', tofile='goal.md:proposed'))
 
 
+def _check_draft_base(store_dir):
+    """Codex PR #5, batch 10: a draft is only confirmable against the goal
+    it was staged on. goal_draft() records base_hash (the goal's digest
+    when the draft was staged); another session may have confirmed,
+    declined or imported a goal since, so confirming the old draft would
+    silently overwrite the newer goal. A draft staged when there was no
+    goal (base_hash None) is likewise stale once a goal exists. Missing
+    or unreadable goal-draft.json cannot prove freshness, so it is
+    rejected too -- re-draft to get a fresh base. Raises RelayError.
+    """
+    meta_path = store_path(store_dir, 'state', 'goal-draft.json')
+    try:
+        meta = read_json(meta_path)
+        base_hash = meta.get('base_hash')
+    except Exception:
+        raise RelayError('目标草案元数据缺失或损坏，无法确认草案是否仍基于当前目标；'
+                         '请重新起草（relay goal draft）后再确认')
+    current = _goal_bytes(store_dir)
+    current_hash = digest(current) if current is not None else None
+    require(current_hash == base_hash,
+            '目标草案已过期：起草后目标已被另一会话确认/否决/导入；'
+            '请重新起草（relay goal draft）后再确认')
+
+
 def goal_confirm(store, toplevel, channel='cli', tentative=False):
     """Confirm a draft. Normal path: write goal + hash-chained receipt.
     --tentative path: write goal WITHOUT a receipt; the goal counts as
@@ -745,6 +769,11 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
             # freeze: the user has decided this version stands.
             store_path(store_dir, 'state', 'goal-fork.json').unlink(missing_ok=True)
             return {'already': True, 'receipt': receipt}
+        # Batch 10: the already-path above returns first -- a
+        # re-confirmation is not an overwrite, so a base that moved away
+        # and back must not reject it. Every other confirm must prove
+        # the draft is still based on the current goal.
+        _check_draft_base(store_dir)
         seq = (receipt['seq'] + 1) if receipt else 1
         if current is not None and current != _skeleton_bytes() and current != draft:
             history = store_path(store_dir, 'archive', 'goal-history')
@@ -767,6 +796,10 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         store_path(store_dir, 'state', 'goal-fork.json').unlink(missing_ok=True)
         update_checksum_manifest(store_dir)
         return {'already': False, 'receipt': new_receipt}
+    # Batch 10: the tentative path also writes the goal file, so the same
+    # staleness check applies -- a stale draft must not become the goal
+    # just because no receipt is issued.
+    _check_draft_base(store_dir)
     text = draft.decode('utf-8')
     if not GOAL_STATUS_RE.search(text):
         text = '状态：暂定\n\n' + text
