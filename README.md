@@ -26,16 +26,16 @@ Gemini CLI、Copilot 和 Cline 暂未接入，留待后续。仅 Git 代码项�
 
 ## 安装
 
-先把 skill 装进你的 agent。装法按你手边有什么选一个，装完都一样用。需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay  `find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
+先把 skill 装进你的 agent。装法按你手边有什么选一个，装完都一样用。需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git。skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay，收录是自动的，靠真实安装数据。`find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
 
-skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面以 Claude Code 为例，Codex 把 `-a` 后面换成 `codex`。结尾的 `-y` 是跳过安装确认，别省）：
+skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面以 Claude Code 为例，Codex 把 `-a` 后面换成 `codex`。结尾的 `-y` 是跳过安装确认，别省，脚本里跑、终端不接受输入时没它会弹确认然后取消。`--skill project-relay` 钉住仓库里这一个 skill，也别省）：
 
-- `npx skills add Joshmax010/project-relay -g -a claude-code -y`
-- `bun x skills add Joshmax010/project-relay -g -a claude-code -y`（bunx 同款，本机只验了 `bun x`）
-- `pnpm dlx skills add Joshmax010/project-relay -g -a claude-code -y`
-- `deno run -A npm:skills add Joshmax010/project-relay -g -a claude-code -y`
-- `npm install -g skills` 后跑 `skills add Joshmax010/project-relay -g -a claude-code -y`
-- `yarn dlx skills add Joshmax010/project-relay -g -a claude-code -y`（要 Yarn Berry 才有 dlx。沙箱里没验通，Berry 的网络层过不了本机代理）
+- `npx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
+- `bun x skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`（bunx 同款，本机只验了 `bun x`）
+- `pnpm dlx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
+- `deno run -A npm:skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
+- `npm install -g skills` 后跑 `skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
+- `yarn dlx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`（要 Yarn Berry 才有 dlx。沙箱里没验通，Berry 的网络层过不了本机代理）
 
 ### Claude Code
 
@@ -63,6 +63,12 @@ skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面
 - 手工放目录：把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
 
 CodeBuddy 同理，目录换成 `.codebuddy/skills/`。装完确认：已安装列表里出现 project-relay。
+
+### DeepSeek Harness（DSH）
+
+DSH 不在 skills CLI 的 agent 注册表里（79 个里没有 DeepSeek 也没有 DSH），不能直接 `--agent dsh`。借位装：`npx skills add Joshmax010/project-relay --skill project-relay -g -y --agent kimi-code-cli`，kimi-code-cli 的全局技能目录就是 `~/.agents/skills`，DSH 读的也是这个目录，装完 DSH 的技能列表里就能看到 project-relay。Windows 上实测装完 DSH 已识别，安全评估 Safe。
+
+一次装多家也行，`--agent` 后面跟几个名字：`npx skills add Joshmax010/project-relay --skill project-relay -g -y --agent codex cursor antigravity`。
 
 ### 仓库已经打开了：跟 agent 说一句就行
 

@@ -1276,7 +1276,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 - Claude Code 走插件市场：会话里 `/plugin install project-relay --marketplace Joshmax010/project-relay` 一步到位。shell 里是 `claude plugin marketplace add Joshmax010/project-relay` 再 `claude plugin install project-relay@joshmax010`。插件里自带 hooks，装完就是强档。
 - 没仓库在手边：一键安装脚本，`curl -fsSL https://raw.githubusercontent.com/Joshmax010/project-relay/main/scripts/install.sh | sh -s -- --tool <你是谁>`。不传 --tool 就自动判断。
 - 只有 Python 没有仓库：`pip install git+https://github.com/Joshmax010/project-relay.git` 装引擎，再跑 `relay recipe install --tool <你是谁>`（uv、pipx 同理）。
-- skills 命令行：npx、bun x、pnpm dlx、deno、npm -g 装好的 skills，都是 `skills add Joshmax010/project-relay -g -a <你是谁> -y`，`-y` 别省。yarn dlx 要 Yarn Berry，本机没验通，别主动推。
+- skills 命令行：npx、bun x、pnpm dlx、deno、npm -g 装好的 skills，都是 `skills add Joshmax010/project-relay --skill project-relay -g -a <你是谁> -y`，`-y` 别省，脚本里跑没它会弹确认然后取消。DeepSeek Harness（DSH）不在注册表里，借 `--agent kimi-code-cli` 装，它的全局目录 `~/.agents/skills` 就是 DSH 读的目录。yarn dlx 要 Yarn Berry，本机没验通，别主动推。
 
 这一步的前提是你能看到 project-relay 仓库。看不到就直说，让用户把仓库打开再说一声，不要硬装。
 
