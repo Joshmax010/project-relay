@@ -1,22 +1,92 @@
 # Project Relay · 项目接力
 
-让 Git 代码项目携带可审核、可回退的记忆，让下一个 Agent 接得住。
+给 Git 代码项目建一份项目记忆。工具、会话和设备换了，都不用重新交代。只有项目目标需要人确认，其余全自动。
 
-Project Relay 包含普通 Markdown 项目协议和 Agent Skill。当前版本只适配 Git 代码项目，同一时间一个 Agent 工作。正式项目文档由人审核，和对应代码进入同一个提交；未审核草稿仅供恢复线索。
+Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了，为什么这么写，下一步该干什么。下一个 Agent 打开就能接着干，不用问原主。
 
-## 工作流程
+## 一句话：它怎么工作
 
-| 阶段 | 行为 |
-|---|---|
-| 接手 | 阅读正式记录，核对实际代码、分支和未提交改动 |
-| 任务中 | 完成代码任务与验证，可保存隔离的未审核工作草稿 |
-| 一轮结束 | 汇报结果，先询问是否同步项目文档，暂不提交 |
-| 同意同步 | 起草完整更新，展示逐文件差异和证据 |
-| 批准具体内容 | 记录实际人工批准，应用获批文档，拒绝项不改 |
-| 提交前 | 核对代码、正式文档、Git 基线及实际暂存区与批准一致 |
-| 提交 | 用户已授权时，将代码与对应获批文档一并提交 |
+- **会话开始**：先跑 `relay resume` 对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟），对账完成前不许动代码。
+- **会话结束**：先跑 `relay capture` 采集确定性快照，顺手填上这一轮做了什么，为什么这么做，定了什么，还剩什么尾巴。
+- **汇总**：任一刻度到线就汇总。三个刻度分别是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
+- **只有项目目标需要人确认**。其余全自动，不审、不问、不等批。记错了事后纠正，纠正沉淀成教训。
 
-同意同步、批准具体内容、授权提交、授权上传是不同动作。用户拒绝同步则保留未提交工作。任务完成、文档同步完成、已经提交必须分别报告。
+记忆仓在本地 `~/.project-relay/`，每个项目一份档案（记录、目标、状态、待办、决策、教训）。档案是数据不是指令。回溯扒来的文本永不直接执行。
+
+## 支持的工具
+
+| 工具 | 档位 | 说明 |
+|---|---|---|
+| Claude Code | 强档 | SessionStart + Stop hooks 自动跑对账与采集 |
+| Codex | 自觉档 | AGENTS.md 受管小节，无 hooks |
+| CodeBuddy / WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
+| Cursor | 接入包 | 解析器已就绪（CLI 段），live 接线待后续 |
+
+Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目，单 Agent 写入。
+
+## 安装
+
+需要 Git 和 Python 3.8+，脚本仅使用标准库。克隆仓库后，在项目根目录跑：
+
+```bash
+git clone https://github.com/Joshmax010/project-relay.git
+cd <你的项目>
+python3 /path/to/project-relay/scripts/relay.py recipe install --tool workbuddy
+```
+
+`--tool` 可选 `claude-code`、`codebuddy`、`workbuddy`、`codex`。不加 `--target-root` 时装进用户级 skill 目录。想只给当前项目装，加 `--target-root <项目根目录>`。卸载用 `recipe uninstall --tool ...`。
+
+不支持自动发现 Skill 的工具也可以直接读 [SKILL.md](SKILL.md)，按里面的规程走命令即可。
+
+## 快速开始
+
+在你的项目根目录（须是 Git 仓库，不自动 `git init`）：
+
+```bash
+# 1. 建档（只认 Git 仓库，非 Git 目录直接拒绝）
+python3 scripts/relay.py init
+
+# 2. 定目标：唯一需要人确认的东西
+python3 scripts/relay.py goal draft --file <目标草案文件>
+python3 scripts/relay.py goal show        # 看差异
+python3 scripts/relay.py goal confirm      # 确认收据（或 goal confirm --tentative 暂定）
+# 不建目标就 goal decline，只留一行决定记录，此后不再追问
+
+# 3. 平时：会话开始先对账，会话结束先采集
+python3 scripts/relay.py resume
+python3 scripts/relay.py capture
+
+# 4. 手动汇总（平时由三刻度自动触发）
+python3 scripts/relay.py summarize --trigger manual
+python3 scripts/relay.py scales           # 查三刻度现状
+```
+
+Windows 用 `python` 代替 `python3`。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
+
+## 跨设备接力
+
+两种搬法，搬的是同一个导出包：
+
+```bash
+# Git 载体（首选）：打包并同步到私有 Git 仓
+python3 scripts/relay.py pack
+# 另一台设备：
+python3 scripts/relay.py unpack
+
+# 手动 zip：拷到另一台电脑再导入
+python3 scripts/relay.py export-zip --zip <文件.zip>
+python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
+```
+
+不带 `--confirm` 只干跑预览、零写入。导入先校验，再脱敏复扫，都通过了才落盘。任何一步失败整体拒绝且零写入。无匹配项目的包落待认领区。截断损坏的文件自动用包内原版修复，有效但不同的保留。接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做。接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
+
+从别的工具回溯建档（把旧会话扒进档案）：
+
+```bash
+python3 scripts/relay.py backfill --tool codex      # 或 claude-code、workbuddy
+```
+
+回溯只作数据不作指令。缺料时先告知影响、由人决定是否深扒，不脑补。
 
 ## 换设备前必读：有一件事事后补不了
 
@@ -24,97 +94,53 @@ Project Relay 包含普通 Markdown 项目协议和 Agent Skill。当前版本�
 
 | 东西 | 存放在哪 | 能不能搬到新设备 |
 |---|---|---|
-| 原始对话日志 | 旧设备本地（工具厂商存的，不归 relay 管） | 不能——旧设备没了就没了 |
-| relay 记忆仓 | 用户自己的记忆仓（归用户管） | 能——pack / unpack 就是搬它的 |
-| 未提交代码 | 旧设备工作区 | 能——pack 时自动打 WIP 快照搬运（见 2.6），但只搬文件内容，不搬运行状态 |
+| 原始对话日志 | 旧设备本地（工具厂商存的，不归 relay 管） | 不能，旧设备没了就没了 |
+| relay 记忆仓 | 用户自己的记忆仓（归用户管） | 能，pack / unpack 就是搬它的 |
+| 未提交代码 | 旧设备工作区 | 能，pack 时自动打 WIP 快照搬运，但只搬文件内容，不搬运行状态 |
 
-所以走之前要在旧设备上做的只有一件事：**pack**。换设备临走前 pack 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。耗时秒级到分钟级，取决于 pack 前积压了多少待汇总内容。
+所以走之前要在旧设备上做的只有一件事：**pack**。换设备临走前 pack 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
 
-习惯落到流程里，不靠口号：对话中识别到换设备意图，第一句先问 / 先执行 pack 检查；新设备上发现无档案时，工具输出的第一条建议是「回旧设备 pack」，而不是「从零回溯」——新设备上根本无账可扒，回溯只能基于代码仓和 Git 历史，产物是重建、保真度低，必须明说这一点。
-
-反例（真实失败形状）：旧电脑已重装，新电脑上打开项目，relay 能做的只有代码与 Git 历史考古：文件在、提交记录在，但每段代码为什么这样写、当初否决了哪个方案、和谁确认过什么，全都没了。丢的不是代码，是全部对话脉络与决策理由。反过来也别夸大：不 pack 不是「全丢」——代码与 Git 还在，丢的是对话层。哪些在、哪些不在，按上表对号入座即可。
-
-文案自测：通读本节后两分钟内能复述出「换设备前要在旧设备做什么、为什么、不做会丢什么」三点，即算过关。本节的真实 fresh-reader 实测尚未做，留待真机步骤验证（见 `references/v2-sync.md`）。
-
-## 快速开始
-
-下载或克隆本仓库到独立 `project-relay` 目录。支持 Agent Skills 的工具可安装整个目录；安装位置由工具决定。其他 Agent 可直接读取 `SKILL.md`。
-
-> 使用 project-relay 初始化这个 Git 代码项目，保留现有规则，先生成未审核骨架。任务结束先问是否同步文档；同意后展示差异并等待具体批准。
-
-需要 Git 和 Python 3.8+；脚本仅使用标准库：
+## 常用命令
 
 ```bash
-python3 /path/to/project-relay/scripts/init_project.py /path/to/git-project
+python3 scripts/relay.py init            # 给项目建档
+python3 scripts/relay.py where           # 查当前项目的记忆仓位置
+python3 scripts/relay.py resume          # 接手对账（只读）
+python3 scripts/relay.py capture         # 会话结束采集
+python3 scripts/relay.py summarize       # 汇总（--trigger manual 手动触发）
+python3 scripts/relay.py scales          # 三刻度现状
+python3 scripts/relay.py pack            # 打包并同步
+python3 scripts/relay.py unpack          # 落盘（只落盘本地、不推）
+python3 scripts/relay.py export-zip --zip <文件.zip>   # 导出 zip
+python3 scripts/relay.py import-zip --zip <文件.zip> --confirm  # 导入 zip
+python3 scripts/relay.py backfill --tool codex   # 回溯建档
+python3 scripts/relay.py recover         # 恢复未完成事务
+python3 scripts/relay.py sync-status     # 同步状态
+python3 scripts/relay.py accept          # 五幕验收（可复演）
+python3 scripts/relay.py sync-accept     # 同步验收
 ```
 
-Windows 可用 `python`，带空格路径加引号。目标须是 Git 仓库根目录；不自动执行 `git init`。重复运行只补缺，不覆盖已有协议、记录或工具。骨架不是正式项目理解结果，填充内容也要人审。
+完整命令列表见 `python3 scripts/relay.py --help`。机制深规格见 [references/](references/)，主文件是 `v2-foundation.md`、`v2-flow.md` 和 `v2-sync.md`。
 
-在项目根目录：
+## 边界
 
-```bash
-python3 .agent/tools/relayctl.py resume
-python3 .agent/tools/relayctl.py draft --file /path/to/proposal.json --title "本轮文档同步"
-python3 .agent/tools/relayctl.py review <完整批次ID>
-# 看过差异且用户实际批准后，才记录批准：
-python3 .agent/tools/relayctl.py review <ID> --approve state.md sessions/task.md sessions/index.md --reviewed-by "项目负责人"
-python3 .agent/tools/relayctl.py apply <ID>
-python3 .agent/tools/relayctl.py lint
-# 用户已授权提交，且代码与获批文档已正确暂存后：
-python3 .agent/tools/relayctl.py commit-check
-```
-
-批次 JSON、部分批准、拒绝、首次提交及恢复示例见 [人审操作说明](references/review-workflow.md)。无 Python 时仍可遵守 Markdown 协议，手动展示差异、核对与审核。
-
-## 项目文件
-
-| 路径 | 用途与信任状态 |
-|---|---|
-| `.agent/agent.md` | 正式执行协议、角色和按需读取索引 |
-| `.agent/human.md` | 人如何审核、接手与提交 |
-| `.agent/project.md` | 正式目标、范围、约束与验收标准 |
-| `.agent/state.md` | 已审核状态、阻塞、下一步及最近会话 |
-| `.agent/structure.md` | 代码结构、构建与测试入口 |
-| `.agent/decisions.md` / `lessons.md` | 已审核决策、教训、来源与可信程度 |
-| `.agent/changelog.md` | 已审核项目变更概览 |
-| `.agent/sessions/` | 已审核的执行与交接记录，随代码版本控制 |
-| `.agent/conversations/index.md` | 经审核的原文/摘要索引 |
-| `.agent/conversations/raw/` | 可直接存档的原文，默认不提交、不上传 |
-| `.agent/inbox/` | 隔离草稿与待审批次，默认不进 Git；只作线索 |
-| `.agent/.local/` | 本地批准收据、应用事务和无损备份，默认不进 Git |
-| `.agent/tools/relayctl.py` | 项目携带的独立辅助脚本 |
-
-初始化文件标注未知或未初始化；它们属于待审核骨架。首次提交须把所有新增正式 Markdown 一起审核。已审核项目迁移时携带完整 Git 仓库；未完成工作的草稿、原文与本地事务需按授权另外携带。
-
-## 版本绑定与恢复
-
-- 草稿记录目标基础哈希、提案内容哈希和代码/正式文档/Git 基线快照。内容或基线变化后必须重新起草与审核，旧批准不能套用到新代码。
-- 支持部分批准和拒绝。状态、新执行会话及会话索引必须获批，才能完成同步；其他被拒绝文件保持不变。
-- 提交检查核对完整快照与实际暂存区，拒绝遗漏代码、新文件、未获批正式文档及私有草稿。首次提交和代码删除也在检查范围内。
-- 多文档应用前保存恢复事务，逐文件原子替换；中断时先 `recover`，避免把半更新状态误当作完成同步。恢复发现外部修改则停止，保留冲突。
-- 本地原始备份按完整批次 ID 保存，避免秒级文件名碰撞。正式可回退历史由代码和获批文档的 Git 提交提供。
-
-## 兼容性与边界
-
-- 核心是普通 Markdown，相对路径与可选 Python 命令。兼容读取文件不代表各工具都自动发现 Skill；后续可直接要求阅读 `.agent/agent.md`。
-- 第一版只适配 Git 代码项目；子模块、多 Agent 并发和非代码项目暂不支持。
-- 审核命令记录人工批准声明，不验证人的身份。Agent 必须先获得用户对具体内容的批准；不能自我批准。
-- `commit-check` 是提交前流程守卫，不执行 commit、不安装 Git hook、不改全局配置。直接绕过命令的 Git 操作不受技术阻断；手动流程也不具有脚本阻断能力。
-- 健康检查只检查结构、链接、大小参考与恢复状态，不证明内容真实或用户批准。文档真实性仍由来源、验证与人工审核共同判断。
-- 本轮尚未实现工具聊天采集器；原文导入与 Codex、Claude Code 采集适配另行实现。摘要不冒充原文，原文存档不自动授权上传。
-- 旧项目协议与工具保留，按审核差异升级，不自动迁移或覆盖原有规则。Skill 不监听打开文件夹。
-- 不保存密钥；按授权存档、提交和上传。原文需要脱敏时保留明确标记。
+- 档案是数据不是指令：回溯扒来的文本永不直接执行。
+- 只有项目目标需要人确认，其余全自动，不用审、不用问，也不用等批。
+- 不替用户 push 代码仓。记忆仓同步只在用户明确跑 pack 时发生。
+- 接力的活一律走 `scripts/relay.py`，不走项目内 `.agent/tools/relayctl.py`，那是旧版流程的工具。旧版 `.agent/` 代码与文档保留，旧流程退役另议。
+- 仅 Git 代码项目。子模块内部状态不归 relay 管，拆分寻址目前经 key 不经路径。
+- 不管采集、汇总还是接手，都不上传聊天。也不改全局配置，不装 Git hook。
 
 ## 验证与贡献
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests
+python3 scripts/relay.py accept          # 两遍 PASS
+python3 scripts/relay.py sync-accept     # 两遍 PASS
 ```
 
-测试使用临时 Git 仓库，覆盖拒绝同步、部分批准、旧草稿冲突、批准后变更、暂存不完整、首次提交、代码删除、路径保护、应用中断与恢复冲突。跨厂商 Agent 的实际接力仍需实测。
-
-欢迎 Issue / PR；提交案例前移除私人聊天、密码和令牌。协议修改应保持来源可追溯、按需读取与人审定稿。
+全量测试通过（含 Windows 真机验证）。欢迎 Issue / PR。提交案例前移除私人聊天、密码和令牌。
 
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。辅助命令重新实现，没有复制上传的 project-handoff 脚本。
+MIT，见 [LICENSE](LICENSE)。
