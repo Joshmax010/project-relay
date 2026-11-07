@@ -1128,6 +1128,22 @@ def hook_resume(store, toplevel, tool=None, cwd=None):
     return resume(store, active, tool=tool)
 
 
+def hook_stop(store, toplevel, tool=None, session=None, cwd=None):
+    """Stop-hook entry for the Claude Code plugin (hooks/hooks.json):
+    capture first, then enforce, in one process -- the same sequencing
+    the recipe's installed Stop handler guarantees (batch 3, C2), so
+    enforce sees the entry the capture just wrote. Returns the enforce
+    verdict plus both halves for the caller to print. `cwd` is the
+    session's working directory (defaults to the process cwd, like the
+    other hook_* entries)."""
+    cap = hook_capture(store, toplevel, tool=tool, session=session, cwd=cwd)
+    enf = hook_enforce(store, toplevel, tool=tool, session=session, cwd=cwd)
+    return {'action': enf.get('action'),
+            'instruction': enf.get('instruction'),
+            'note': enf.get('note'),
+            'capture': cap, 'enforce': enf}
+
+
 def _hook_command(store, toplevel, kind):
     """Installed Claude hook command (A1 + A4): a fully shell-quoted
     `python -c` wrapper that calls the hook_* gate above with the cwd the
@@ -1255,6 +1271,12 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 ## 安装
 
 用户说装上接力，你来装，装到你当前这个工具里。如果提示项目未建仓，先跑 relay init 再装。你知道你是谁，`--tool` 参数按你是谁填，别问用户装到哪。Claude Code 是强档（SessionStart + Stop hooks 自动跑对账与采集）；CodeBuddy / WorkBuddy 是弱档，本路线无生命周期 hooks，靠你自觉执行开头 resume、结尾 capture；Codex 是自觉档（AGENTS.md 受管小节，无 hooks）。卸载用 `recipe uninstall`。无论哪档，会话开始 resume、会话结束 capture 这两条规程不变。
+
+别的装法，按用户手边有什么选一个，不用都列出来问：
+- Claude Code 走插件市场：会话里 `/plugin install project-relay --marketplace Joshmax010/project-relay` 一步到位。shell 里是 `claude plugin marketplace add Joshmax010/project-relay` 再 `claude plugin install project-relay@joshmax010`。插件里自带 hooks，装完就是强档。
+- 没仓库在手边：一键安装脚本，`curl -fsSL https://raw.githubusercontent.com/Joshmax010/project-relay/main/scripts/install.sh | sh -s -- --tool <你是谁>`。不传 --tool 就自动判断。
+- 只有 Python 没有仓库：`pip install git+https://github.com/Joshmax010/project-relay.git` 装引擎，再跑 `relay recipe install --tool <你是谁>`（uv、pipx 同理）。
+- skills 命令行：npx、bun x、pnpm dlx、deno、npm -g 装好的 skills，都是 `skills add Joshmax010/project-relay -g -a <你是谁> -y`，`-y` 别省。yarn dlx 要 Yarn Berry，本机没验通，别主动推。
 
 这一步的前提是你能看到 project-relay 仓库。看不到就直说，让用户把仓库打开再说一声，不要硬装。
 

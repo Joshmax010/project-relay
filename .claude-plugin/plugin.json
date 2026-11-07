@@ -1,0 +1,17 @@
+{
+  "author": {
+    "name": "Joshmax010",
+    "url": "https://github.com/Joshmax010"
+  },
+  "description": "Project memory for Git code projects: handover across tools, sessions and machines without re-explaining.",
+  "homepage": "https://github.com/Joshmax010/project-relay",
+  "keywords": [
+    "handover",
+    "project-memory",
+    "relay"
+  ],
+  "license": "MIT",
+  "name": "project-relay",
+  "repository": "https://github.com/Joshmax010/project-relay",
+  "version": "0.1.0"
+}

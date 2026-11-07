@@ -70,6 +70,14 @@ ZONES = ('raw', 'archive', 'state', 'tx', 'backups', 'receipts')
 # never these file names).
 ARCHIVE_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md', 'lessons.md')
 TEMPLATES_DIR = _here.parent / 'assets' / 'template-v2'
+if not TEMPLATES_DIR.is_dir():
+    # pip-installed layout (pyproject.toml data-files): the templates ship
+    # under <prefix>/share/project-relay/template-v2. The checkout layout
+    # above stays the authority; this only triggers when relay.py itself
+    # was installed without the repo around it.
+    _installed_templates = Path(sys.prefix) / 'share' / 'project-relay' / 'template-v2'
+    if _installed_templates.is_dir():
+        TEMPLATES_DIR = _installed_templates
 GOAL_STATUS_RE = re.compile(r'^状态：(.+?)\s*$', re.MULTILINE)
 TENTATIVE_WATERMARK = '【暂定目标】以下目标为暂定状态，不可当作硬约束执行。'
 
@@ -1018,6 +1026,10 @@ def _parser():
     enf = sub.add_parser('enforce')
     enf.add_argument('--tool')
     enf.add_argument('--session')
+    hk = sub.add_parser('hook')
+    hksub = hk.add_subparsers(dest='hook_command', required=True)
+    hksub.add_parser('resume')
+    hksub.add_parser('stop')
     r = sub.add_parser('recipe')
     rsub = r.add_subparsers(dest='recipe_command', required=True)
     ri = rsub.add_parser('install')
@@ -1681,7 +1693,7 @@ def main(argv=None):
             elif a.fork_command == 'flag-goal':
                 fork.flag_goal_fork(store_dir, a.reason)
                 print('目标分叉已标记，注入已冻结；请走 S4 重新确认流程。')
-        elif a.command in ('capture', 'queue', 'enforce', 'recipe', 'precompress',
+        elif a.command in ('capture', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
                            'handoff', 'inject', 'resume'):
             _fspec = importlib.util.spec_from_file_location(
@@ -1727,6 +1739,30 @@ def main(argv=None):
                 print(info.get('instruction') or ('PASS：' + info['note']))
                 if info['action'] == 'block':
                     return 2
+            elif a.command == 'hook':
+                # Project-agnostic entry for the Claude Code plugin hooks
+                # (hooks/hooks.json): the project is the session cwd.
+                # Anything unresolvable fails closed with the skip note.
+                try:
+                    hook_root = git_toplevel(a.root)
+                except Exception:
+                    print('当前目录不属于本项目（注册表无此项目），钩子不对账')
+                    return 0
+                if a.hook_command == 'resume':
+                    r = flow.hook_resume(store, hook_root, tool='claude-code')
+                    print(r['note'] if r.get('skipped') else
+                          (r['message'] if r.get('no_archive') else flow.render_resume(r)))
+                else:
+                    session = _session_from_stdin()
+                    r = flow.hook_stop(store, hook_root, tool='claude-code', session=session)
+                    cap, enf = r['capture'], r['enforce']
+                    print(cap['note'] if cap.get('skipped') else
+                          '采集条目：cap-%04d（%s）' % (cap['seq'], cap.get('path', '')))
+                    msg = enf.get('instruction') or ('PASS：' + enf.get('note', ''))
+                    if enf.get('action') == 'block':
+                        print(msg, file=sys.stderr)
+                        return 2
+                    print(msg)
             elif a.command == 'recipe':
                 if a.recipe_command == 'package':
                     info = flow.package_workbuddy(root, out=a.out)

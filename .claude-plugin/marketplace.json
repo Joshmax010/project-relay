@@ -1,0 +1,16 @@
+{
+  "description": "Plugins by Joshmax010: project-relay, project memory for Git code projects.",
+  "name": "joshmax010",
+  "owner": {
+    "name": "Joshmax010",
+    "url": "https://github.com/Joshmax010"
+  },
+  "plugins": [
+    {
+      "description": "Project memory for Git code projects: handover across tools, sessions and machines without re-explaining.",
+      "name": "project-relay",
+      "source": "./",
+      "version": "0.1.0"
+    }
+  ]
+}

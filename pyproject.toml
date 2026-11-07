@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "project-relay"
+version = "0.1.0"
+description = "Project memory for Git code projects: handover across tools, sessions and machines without re-explaining."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    {name = "Joshmax010"},
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Joshmax010/project-relay"
+Repository = "https://github.com/Joshmax010/project-relay"
+
+[project.scripts]
+relay = "relay:main"
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+py-modules = [
+    "init_project",
+    "relay",
+    "relay_accept",
+    "relay_backfill",
+    "relay_cursor",
+    "relay_flow",
+    "relay_fork",
+    "relay_parser_registry",
+    "relay_promote",
+    "relay_stats",
+    "relay_sync",
+    "relayctl",
+]
+
+# The archive skeletons `relay init` copies (assets/template-v2). Installed
+# under <prefix>/share/project-relay/template-v2; relay.py falls back to
+# that path when the repo checkout is not around the installed module.
+[tool.setuptools.data-files]
+"share/project-relay/template-v2" = [
+    "assets/template-v2/backlog.md",
+    "assets/template-v2/decisions.md",
+    "assets/template-v2/goal.md",
+    "assets/template-v2/handoff.md",
+    "assets/template-v2/lessons.md",
+    "assets/template-v2/state.md",
+]

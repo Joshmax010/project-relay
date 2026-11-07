@@ -26,26 +26,35 @@ Gemini CLI、Copilot 和 Cline 暂未接入，留待后续。仅 Git 代码项�
 
 ## 安装
 
-需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git。
+需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git。skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay，收录是自动的，靠真实安装数据。`find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
 
 不用敲命令。跟 agent 说一句“装上接力”，agent 自己装，装到当前这个 agent 里，不问你装到哪。只有一个前提：agent 得能看到 project-relay 仓库。看不到就直说，让你把仓库打开再说一声，不要硬装。agent 在后台跑 `recipe install` 装、`recipe uninstall` 卸，`--tool` 按它自己是谁填。默认装用户级，只给当前项目装就加 `--target-root <项目根目录>`。
+
+skills 命令行也能装，都是同一条 `skills add`，换个跑它的工具而已。下面以 Claude Code 为例，Codex 把 `-a` 后面换成 `codex`。结尾的 `-y` 是跳过安装确认，别省。
+
+- `npx skills add Joshmax010/project-relay -g -a claude-code -y`
+- `bun x skills add Joshmax010/project-relay -g -a claude-code -y`（bunx 同款，本机只验了 `bun x`）
+- `pnpm dlx skills add Joshmax010/project-relay -g -a claude-code -y`
+- `deno run -A npm:skills add Joshmax010/project-relay -g -a claude-code -y`
+- `npm install -g skills` 后跑 `skills add Joshmax010/project-relay -g -a claude-code -y`
+- `yarn dlx skills add Joshmax010/project-relay -g -a claude-code -y`（要 Yarn Berry 才有 dlx。沙箱里没验通，Berry 的网络层过不了本机代理）
 
 ### Claude Code
 
 装完 SessionStart + Stop hooks 自动跑对账与采集，规程写进用户级 CLAUDE.md。
 
 - 聊天里说“装上接力”。
-- `npx skills add Joshmax010/project-relay -g -a claude-code -y`
+- 插件市场：`claude plugin marketplace add Joshmax010/project-relay`，再 `claude plugin install project-relay@joshmax010`。会话里也可以一步到位：`/plugin install project-relay --marketplace Joshmax010/project-relay`（Claude Code 2.1.275 以上）。
 - 在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
 
-装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。
+装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。插件装完在插件列表里能看到 project-relay，SessionStart + Stop hooks 跟 recipe install 是同一套。
 
 ### Codex
 
 装完在项目 AGENTS.md 里加一段受管小节，无 hooks。
 
 - 聊天里说“装上接力”。
-- `npx skills add Joshmax010/project-relay -g -a codex -y`
+- skills 命令行见上面，`-a` 后面换成 `codex`。
 - 在仓库里跑 `python scripts/relay.py recipe install --tool codex`。
 
 装完确认：项目 AGENTS.md 里有 relay 的受管小节。
@@ -63,6 +72,10 @@ CodeBuddy 同理，目录换成 `.codebuddy/skills/`。装完确认：已安装�
 ### 通用装法
 
 把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行。工具不支持自动发现 skill 时也一样，直接读 [SKILL.md](SKILL.md)。
+
+一键安装脚本，不用先克隆：`curl -fsSL https://raw.githubusercontent.com/Joshmax010/project-relay/main/scripts/install.sh | sh -s -- --tool claude-code`。不传 `--tool` 就按 $HOME 下已有的 agent 配置目录自动判断，判断不出会停下来让你指定。Codex 是按项目装的，装完按提示在你自己的项目里再跑一次。
+
+引擎也能 pip 装：`pip install git+https://github.com/Joshmax010/project-relay.git`，装完就有 `relay` 命令（uv 用 `uv pip install` 或 `uv tool install`，pipx 用 `pipx install`，后面都跟同一个 git 地址）。pip 装的是引擎，不含 skill 文本。装完在你的项目里跑 `relay recipe install --tool <agent>`，项目没建仓先 `relay init`。
 
 ## 快速开始
 

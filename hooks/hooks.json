@@ -1,0 +1,25 @@
+{
+  "description": "project-relay: SessionStart resume + Stop capture-then-enforce. Same behavior as recipe install --tool claude-code; each hook acts only when the session cwd belongs to a registered project.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" hook resume",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay.py\" hook stop",
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}
