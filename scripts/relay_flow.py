@@ -1057,12 +1057,34 @@ def hook_cwd_allowed(store, toplevel, cwd=None):
         return False
 
 
+def _hook_active_toplevel(store, toplevel, cwd=None):
+    """Resolve the checkout the hook session is actually in (Codex PR #5,
+    batch 10). The gate above verified the cwd belongs to this project
+    (same registry key); this resolves WHICH checkout, so capture/resume
+    snapshot the live clone instead of the install-time one -- a second
+    clone of the same remote shares the key but has its own working tree,
+    and snapshotting the install-time clone would miss changes that only
+    exist in the live one. Returns None on any failure: the caller fails
+    closed (skips) rather than capturing the wrong place. Never raises.
+    """
+    try:
+        if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+            return None
+        cwd_path = Path(cwd).expanduser() if cwd is not None else Path.cwd()
+        return relay.git_toplevel(cwd_path)
+    except Exception:
+        return None
+
+
 def hook_capture(store, toplevel, tool=None, session=None, message=None, cwd=None):
-    """Hook entry for capture (A1): no-op unless the cwd is this project."""
-    if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+    """Hook entry for capture (A1): no-op unless the cwd is this project.
+    Snapshots the session's own checkout (batch 10), not the install-time
+    path -- see _hook_active_toplevel."""
+    active = _hook_active_toplevel(store, toplevel, cwd=cwd)
+    if active is None:
         return {'action': 'skipped', 'skipped': True,
                 'note': '当前目录不属于本项目（注册表无此项目），钩子不捕获'}
-    return capture(store, toplevel, tool=tool, session=session, message=message)
+    return capture(store, active, tool=tool, session=session, message=message)
 
 
 def hook_enforce(store, toplevel, tool=None, session=None, cwd=None):
@@ -1075,11 +1097,14 @@ def hook_enforce(store, toplevel, tool=None, session=None, cwd=None):
 
 def hook_resume(store, toplevel, tool=None, cwd=None):
     """Hook entry for resume (A1): resume's section 4 writes, so a foreign
-    cwd must skip it just like capture/enforce, not merely read-only."""
-    if not hook_cwd_allowed(store, toplevel, cwd=cwd):
+    cwd must skip it just like capture/enforce, not merely read-only.
+    Reconciles the session's own checkout (batch 10), not the install-time
+    path -- see _hook_active_toplevel."""
+    active = _hook_active_toplevel(store, toplevel, cwd=cwd)
+    if active is None:
         return {'skipped': True, 'no_archive': False, 'sections': [],
                 'note': '当前目录不属于本项目（注册表无此项目），钩子不对账'}
-    return resume(store, toplevel, tool=tool)
+    return resume(store, active, tool=tool)
 
 
 def _hook_command(store, toplevel, kind):
