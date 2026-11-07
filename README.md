@@ -32,7 +32,21 @@ Gemini CLI、Copilot、Cline 暂未接入，留待后续。仅 Git 代码项目�
 
 agent 在后台跑的是 `recipe install`，`--tool` 按它自己是谁填，默认装进用户级 skill 目录；只给当前项目装就加 `--target-root <项目根目录>`。卸载同样说一声就行，agent 在后台跑 `recipe uninstall`。
 
-WorkBuddy 也可以不走命令行：① 界面上传——让 agent 跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip；② 手工放目录——把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
+### Claude Code
+
+强档，装完 SessionStart + Stop hooks 自动跑对账与采集。三条路都通：聊天里说“装上接力”；跑 `npx skills add Joshmax010/project-relay -g -a claude-code -y`；在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
+
+### Codex
+
+自觉档，装完在 AGENTS.md 里加一段受管小节，无 hooks。三条路都通：聊天里说“装上接力”；跑 `npx skills add Joshmax010/project-relay -g -a codex -y`；在仓库里跑 `python scripts/relay.py recipe install --tool codex`。
+
+### WorkBuddy
+
+弱档，无 hooks，靠 agent 自觉执行开头 resume、结尾 capture。npx 不认 WorkBuddy，下面三条路才通：聊天里说“装上接力”（agent 有 shell 就自己装，没 shell 或 Python 不通就打 zip 让你传）；界面上传——让 agent 跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip；手工放目录——把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。CodeBuddy 同理，目录换成 `.codebuddy/skills/`。
+
+### 通用装法
+
+不挑工具：把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行，装完一样用。
 
 需要 Git 和 Python 3.8+，脚本仅使用标准库。仓库在 https://github.com/Joshmax010/project-relay.git，拿下来就能装。
 
