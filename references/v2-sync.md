@@ -60,6 +60,24 @@ S6 明言不同步），以及仓根的 `registry.json`、`global/`、`trash/`�
    （否则下次 pack 会重新导出未脱敏原文、在对端制造合并冲突）；
    manifest 只记命中数，不记原文。包内永不含明文密钥。
 
+### 导出质量闸门（2026-11-11，batch 9）
+
+`export_bundle` 在写包之前对将要装包的负载做四项只读检查，结果写入
+`manifest.quality_gaps`（`{code, severity, message, files}` 列表），
+`export-zip` 同时把清单打印到标准输出。检查项：
+
+| code | 检查 | 默认级别 |
+|---|---|---|
+| `semantic_pending` | 采集 body 仍是 `<!-- relay:semantic pending -->`；最新条目命中为 block，仅历史条目为 warn | block / warn |
+| `baseline_unreachable` | state 基线 commit 在代码仓本地 `git cat-file -e` 不可解析 | warn |
+| `backlog_field_truncated` | 待办块缺少「- 验证方式：」行，或 Owner 行的验证字段没有句末标点（summarize 正则截断） | warn |
+| `goal_receipt_mismatch` | `receipts/goal-*.json` 的 `goal_hash` 与 `archive/goal.md` 字节不一致 | warn |
+
+默认导出照常完成（兼容既有调用与弱档 harness），只是问题可见；
+`export-zip --strict` 遇到 block 级缺口直接失败、不产出包（临时目录自动
+清理）。`quality_gaps` 是新增可选字段：旧包没有它照常导入，旧工具读到
+它会按次版本兼容规则忽略，因此 `format_minor` 不变。
+
 ## 3. 导入管线（2.1）
 
 `import_bundle(bundle_dir, store, confirm=False)`：

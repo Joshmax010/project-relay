@@ -492,6 +492,135 @@ def _collect_payload(store_dir):
     return out
 
 
+# ---------------------------------------------------------------- export quality gate
+# Batch 9 (2026-11-11 DSH takeover audit): the first real zip handoff
+# shipped with a baseline commit that no longer resolved locally, two
+# captures whose semantic sections were still placeholders, and backlog
+# blocks whose Owner lines had been truncated by the summarize regex.
+# The receiving harness had to rediscover all three by hand. The export
+# side now inspects what it is about to ship and records the gaps in the
+# manifest; --strict turns block-level gaps into a refusal.
+QUALITY_GAP_SEMANTIC = 'semantic_pending'
+QUALITY_GAP_BASELINE = 'baseline_unreachable'
+QUALITY_GAP_BACKLOG = 'backlog_field_truncated'
+QUALITY_GAP_GOAL_RECEIPT = 'goal_receipt_mismatch'
+QUALITY_BLOCK = 'block'
+QUALITY_WARN = 'warn'
+SEMANTIC_PENDING_MARKER = '<!-- relay:semantic pending -->'
+BASELINE_LINE_RE = re.compile(r'当前分支@基线：[^@\s]+@([0-9a-fA-F]{7,40})')
+
+
+def _quality_gap(code, severity, message, files):
+    return {'code': code, 'severity': severity,
+            'message': message, 'files': list(files)}
+
+
+def _export_quality_gaps(toplevel, payload):
+    """Read-only export-side quality gate (batch 9).
+
+    Inspects the exact payload about to be written into a bundle and
+    returns a list of {code, severity, message, files}. Never raises:
+    export_bundle records every gap and only strict refuses a bundle
+    when a block-severity gap is present. Checks are local-only -- no
+    network -- so an offline export still works.
+    """
+    gaps = []
+    # 1. capture entries whose semantic section is still the placeholder.
+    raw_rels = sorted(rel for rel in payload if _is_raw_entry_rel(rel))
+    pending = []
+    for rel in raw_rels:
+        try:
+            _header, body = _parse_entry_text(payload[rel].decode('utf-8'))
+        except Exception:
+            continue
+        if SEMANTIC_PENDING_MARKER in body:
+            pending.append(rel)
+    if pending:
+        latest = raw_rels[-1]
+        severity = QUALITY_BLOCK if latest in pending else QUALITY_WARN
+        names = '、'.join(p.rsplit('/', 1)[-1] for p in pending[:5])
+        gaps.append(_quality_gap(
+            QUALITY_GAP_SEMANTIC, severity,
+            '%d 条采集语义未填%s：%s' % (
+                len(pending),
+                '（含最新条目）' if latest in pending else '（仅历史条目）',
+                names),
+            pending))
+    # 2. state baseline commit must resolve in the code repo.
+    state = payload.get('archive/state.md')
+    if state is not None:
+        match = BASELINE_LINE_RE.search(state.decode('utf-8'))
+        if match:
+            sha = match.group(1)
+            try:
+                check = relay.git(toplevel, 'cat-file', '-e',
+                                  sha + '^{commit}', check=False)
+                reachable = check.returncode == 0
+            except Exception:
+                reachable = True  # git unavailable: not evidence of a gap
+            if not reachable:
+                gaps.append(_quality_gap(
+                    QUALITY_GAP_BASELINE, QUALITY_WARN,
+                    'state 基线 %s 在代码仓本地不可解析（可能未推送或已被重写）'
+                    % sha[:12],
+                    ['archive/state.md']))
+    # 3. backlog blocks must keep their machine-readable fields.
+    backlog = payload.get('archive/backlog.md')
+    if backlog is not None:
+        # Normalize CRLF: a store written on Windows may hand us CRLF
+        # even though the entry parser normalizes cap files. Without
+        # this the block regex silently misses every line.
+        text = backlog.decode('utf-8').replace('\r\n', '\n')
+        for match in re.finditer(r'^## (T-\d+)[ \t]*\n(.*?)(?=\n## |\Z)',
+                                 text, re.S | re.M):
+            tid, block = match.group(1), match.group(2)
+            if not re.search(r'^- 验证方式：', block, re.M):
+                gaps.append(_quality_gap(
+                    QUALITY_GAP_BACKLOG, QUALITY_WARN,
+                    '%s 缺少「- 验证方式：」行' % tid,
+                    ['archive/backlog.md']))
+                continue
+            for line in block.splitlines():
+                stripped = line.strip()
+                if not stripped.startswith('- Owner：'):
+                    continue
+                match = re.search(r'验证：(.*)$', stripped)
+                if not match:
+                    continue
+                verify_text = match.group(1).strip()
+                # summarize()'s regex captures up to the first whitespace,
+                # so a truncated field has no sentence-ending punctuation
+                # (T-001 '在', T-002 'claude', T-005 '远端只剩'). A field
+                # that ends cleanly is the summarize format working as
+                # designed and must not be reported as a gap.
+                if verify_text and verify_text[-1] not in '。！？.!?':
+                    gaps.append(_quality_gap(
+                        QUALITY_GAP_BACKLOG, QUALITY_WARN,
+                        '%s 的 Owner 行验证字段被截断：%s'
+                        % (tid, stripped[:60]),
+                        ['archive/backlog.md']))
+    # 4. goal receipt must still certify the goal bytes.
+    goal = payload.get('archive/goal.md')
+    if goal is not None:
+        goal_sha = _sha256(goal)
+        for rel in sorted(payload):
+            if not (rel.startswith(RECEIPTS_PREFIX + 'goal-')
+                    and rel.endswith('.json')):
+                continue
+            try:
+                receipt = json.loads(payload[rel].decode('utf-8'))
+            except (ValueError, UnicodeDecodeError):
+                continue
+            recorded = receipt.get('goal_hash') if isinstance(receipt, dict) else None
+            if recorded and recorded != goal_sha:
+                gaps.append(_quality_gap(
+                    QUALITY_GAP_GOAL_RECEIPT, QUALITY_WARN,
+                    '%s 记录的 goal_hash 与 archive/goal.md 不一致'
+                    % rel.rsplit('/', 1)[-1],
+                    [rel, 'archive/goal.md']))
+    return gaps
+
+
 # Verification inputs inside a raw entry header. These are evidence, not
 # prose: the peer recomputes fact_hash from them, so redacting them would
 # silently rewrite what the peer verifies. P0 (2026-10-29 e2e): the
@@ -713,7 +842,8 @@ def _receipt_path(store, kind, key):
 
 
 # ---------------------------------------------------------------- export
-def export_bundle(store, toplevels, dest_dir, device_name, device_id, pack_seqs=None):
+def export_bundle(store, toplevels, dest_dir, device_name, device_id, pack_seqs=None,
+                  strict=False):
     """Build a 2.1 export bundle directory. Returns the manifest dict.
 
     dest_dir is created fresh (an existing non-empty directory is refused,
@@ -729,12 +859,14 @@ def export_bundle(store, toplevels, dest_dir, device_name, device_id, pack_seqs=
     projects_meta = []
     entry_count = 0
     redacted_total = 0
+    quality_gaps = []
     for toplevel in toplevels:
         row, store_dir = relay.resolve_store_dir(store, toplevel)
         payload = _collect_payload(store_dir)
         redacted, hits = _redact_payload(payload)
         _fix_local_redactions(store_dir, payload, redacted)
         redacted_total += hits
+        quality_gaps.extend(_export_quality_gaps(toplevel, redacted))
         proj_dir = dest / 'projects' / (row['key'] + '-' + row['slug'])
         for rel in sorted(redacted):
             target = proj_dir / rel
@@ -767,7 +899,19 @@ def export_bundle(store, toplevels, dest_dir, device_name, device_id, pack_seqs=
         # encrypted bundle must set encryption to its scheme name and
         # encryption_salt to the derivation salt (format reserved).
         'encryption': 'none', 'encryption_salt': None,
+        # Optional field (format_minor stays 1.1): old importers ignore
+        # unknown manifest fields, so a bundle with gaps still imports
+        # on either side. The export side is where the gaps become
+        # visible before anyone ships the file.
+        'quality_gaps': quality_gaps,
     }
+    if strict:
+        blocked = [g for g in quality_gaps
+                   if g.get('severity') == QUALITY_BLOCK]
+        if blocked:
+            raise RelayError(
+                '导出前置检查未通过（%d 项阻断）：%s'
+                % (len(blocked), '；'.join(g['message'] for g in blocked)))
     save(dest / 'manifest.json', manifest)
     return manifest
 
@@ -822,7 +966,8 @@ def _zip_device(store, device_name=None, device_id=None):
     return name, did
 
 
-def export_zip(store, toplevel, zip_path, device_name=None, device_id=None):
+def export_zip(store, toplevel, zip_path, device_name=None, device_id=None,
+               strict=False):
     """Manual folder carrier, export half (plan 2.3 by hand): build a
     2.1 bundle for one project and pack it into a zip file.
 
@@ -839,13 +984,15 @@ def export_zip(store, toplevel, zip_path, device_name=None, device_id=None):
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='relay-export-zip-') as tmp:
         bundle_dir = Path(tmp) / 'bundle'
-        manifest = export_bundle(store, [toplevel], bundle_dir, name, did)
+        manifest = export_bundle(store, [toplevel], bundle_dir, name, did,
+                                 strict=strict)
         write_bundle_zip(bundle_dir, zip_path)
     return {'zip': str(zip_path), 'source_device': name,
             'source_device_id': did,
             'entry_count': manifest['entry_count'],
             'file_count': len(manifest['files']),
-            'redacted_count': manifest['redacted_count']}
+            'redacted_count': manifest['redacted_count'],
+            'quality_gaps': manifest.get('quality_gaps', [])}
 
 
 def import_zip(store, zip_path, confirm=False):

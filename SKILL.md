@@ -47,6 +47,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 - Git 载体：`relay pack` 打包并同步到私有 Git 仓，另一台设备 `relay unpack` 落盘。unpack 只落盘本地、不推。
 - 手动 zip：`relay export-zip --zip <文件.zip>` 导出一个 zip，拷到另一台电脑，`relay import-zip --zip <文件.zip> --confirm` 导入（不带 `--confirm` 只干跑预览、零写入）。导入先校验、再脱敏复扫、后落盘，任何一步失败整体拒绝且零写入；无匹配项目的包落待认领区，截断损坏的文件自动用包内原版修复、有效但不同的保留。
+- 导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行；要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
 - 接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
 
 ## 安装

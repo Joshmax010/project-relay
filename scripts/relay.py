@@ -1106,6 +1106,8 @@ def _parser():
     # sync-setup required: device identity falls back to the hostname.
     ez = sub.add_parser('export-zip')
     ez.add_argument('--zip', required=True)
+    ez.add_argument('--strict', action='store_true',
+                    help='导出质量缺口为阻断级时直接失败，不产出包')
     iz = sub.add_parser('import-zip')
     iz.add_argument('--zip', required=True)
     iz.add_argument('--confirm', action='store_true')
@@ -1496,11 +1498,19 @@ def main(argv=None):
                                 print('快照还原：%s' % rest.get('status'))
                         print('回执：' + result['receipt_path'])
                 elif a.command == 'export-zip':
-                    result = sync.export_zip(store, a.root, a.zip)
+                    result = sync.export_zip(store, a.root, a.zip,
+                                             strict=a.strict)
                     print('导出完成：%s' % result['zip'])
                     print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
                           % (result['entry_count'], result['file_count'],
                              result['redacted_count']))
+                    gaps = result.get('quality_gaps') or []
+                    if gaps:
+                        print('质量缺口 %d 项（已写入 manifest.quality_gaps）：'
+                              % len(gaps))
+                        for gap in gaps:
+                            print('  [%s] %s'
+                                  % (gap.get('severity'), gap.get('message')))
                 elif a.command == 'import-zip':
                     result = sync.import_zip(store, a.zip, confirm=a.confirm)
                     if not result['landed']:
