@@ -1282,6 +1282,21 @@ STATE_END = '<!-- relay:state-end -->'
 _TEMPLATE_STATE_VALUES = None
 
 
+def _is_template_state_outside(before, after):
+    """True when the outside-block text is byte-identical to the init
+    template's outside-block text (batch 10). Fail-closed: an unreadable
+    template answers False, so nothing is adopted on a guess."""
+    try:
+        text = (relay.TEMPLATES_DIR / 'state.md').read_text(encoding='utf-8')
+    except (OSError, ValueError):
+        return False
+    if STATE_BEGIN not in text or STATE_END not in text:
+        return False
+    start = text.index(STATE_BEGIN)
+    stop = text.index(STATE_END) + len(STATE_END)
+    return (before or '') == text[:start] and (after or '') == text[stop:]
+
+
 def _template_state_values():
     """Managed-block values of the init template state.md, read from the
     template itself (never guessed). Batch 2, B3: a local section is
@@ -1334,6 +1349,18 @@ def _merge_state_md(local_text, incoming_text):
     incoming_text = incoming_text or ''
     conflicts = []
     notes = []
+    # Batch 10: a fresh-device import used to be noisy. Two leftovers
+    # from that shape are cleaned here, before any merge decision:
+    #   1. 分叉待裁 notes left by a previous import (they describe a
+    #      fork that no longer exists once the archive is adopted);
+    #   2. the whole local file still being the init template, where
+    #      'adopting the incoming block' is the only sensible outcome.
+    # Neither changes the safety rule: real content conflicts still keep
+    # the local value and still produce a fork note.
+    stale_fork = re.compile(r'^- 分叉待裁：.*\n?', re.MULTILINE)
+    if STATE_END in local_text and stale_fork.search(local_text):
+        local_text = stale_fork.sub('', local_text)
+        notes.append('state.md 清理了上一次导入遗留的「分叉待裁」记录')
     if STATE_BEGIN not in local_text or STATE_END not in local_text:
         if local_text != incoming_text:
             conflicts.append({'file': 'archive/state.md',
@@ -1351,15 +1378,24 @@ def _merge_state_md(local_text, incoming_text):
     i_block = incoming_text[i_start:i_stop]
     i_before, i_after = incoming_text[:i_start], incoming_text[i_stop:]
     if (l_before, l_after) != (i_before, i_after):
-        conflicts.append({'file': 'archive/state.md',
-                          'rule': 'outside-block-kept-local',
-                          'note': '块外文本不同，保留本地版本'})
+        # Batch 10: on a fresh device the outside-block text is the init
+        # template's explanatory prose, so 'different' means 'local never
+        # wrote anything here'. Adopting incoming outside text in that
+        # case keeps the takeover report clean and loses nothing (the
+        # template prose is reproduced from the template on demand).
+        if _is_template_state_outside(l_before, l_after):
+            l_before, l_after = i_before, i_after
+            notes.append('state.md 块外文本仍为模板原文，采纳对方内容')
+        else:
+            conflicts.append({'file': 'archive/state.md',
+                              'rule': 'outside-block-kept-local',
+                              'note': '块外文本不同，保留本地版本'})
 
     def parse_block(block):
         order = []
         values = {}
         for line in block.splitlines():
-            m = re.match(r'^- ([^：]+)：(.*)$', line)
+            m = re.match(r'^- ([^：]+)：(.*)$', line.strip())
             if m:
                 order.append(m.group(1))
                 values[m.group(1)] = m.group(2)
@@ -1395,6 +1431,19 @@ def _merge_state_md(local_text, incoming_text):
                     vals.append(v)
             merged_values[key] = '；'.join(vals) if vals else '无'
         else:
+            # Batch 10: adopt when the local value carries no information
+            # (template placeholder or a stale '分叉待裁' value left by an
+            # earlier import). Keeping a known-empty line and stacking a
+            # fork note on it was exactly the fresh-device noise; a real
+            # local value still wins and still gets its note.
+            # The branch line is local measurement (D-sync-3): it must
+            # keep the local value even when that value is the template
+            # '未知', so a fresh device never claims the peer's commit.
+            if key != '当前分支@基线' and (
+                    not l_values[key].strip() or l_values[key] in ('未知', '无')):
+                merged_values[key] = i_values[key]
+                notes.append('state.md 的 %s 本机为空，采纳对方内容' % key)
+                continue
             fork_notes.append('- 分叉待裁：%s（对方）：%s' % (key, i_values[key]))
             conflicts.append({'file': 'archive/state.md', 'key': key,
                               'rule': 'fork-note-kept-local',

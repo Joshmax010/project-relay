@@ -1266,7 +1266,8 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 - Git 载体：`relay pack` 打包并同步到私有 Git 仓，另一台设备 `relay unpack` 落盘。unpack 只落盘本地、不推。
 - 手动 zip：`relay export-zip --zip <文件.zip>` 导出一个 zip，拷到另一台电脑，`relay import-zip --zip <文件.zip> --confirm` 导入（不带 `--confirm` 只干跑预览、零写入）。导入先校验、再脱敏复扫、后落盘，任何一步失败整体拒绝且零写入；无匹配项目的包落待认领区，截断损坏的文件自动用包内原版修复、有效但不同的保留。
-- 接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
+- 导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行；要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
+- 接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。简报除五段之外还会有两块只读补充：**接手对账·交接包指纹**（交接包导出后代码漂移了哪些文件，直接列出来）和**目标对齐·承诺与档案**（目标里提到、但待办/状态没有对应条目或进度记录的承诺）。
 
 ## 安装
 
@@ -1706,6 +1707,23 @@ def _number_check(text, whitelist_values):
     return '\n'.join(out_lines), events
 
 
+def _backlog_has_item(backlog_text, item_text):
+    """True when a backlog block already carries this 事项 (batch 10).
+
+    Re-summarizing the same todo used to append a duplicate T-N each
+    run. Match on the normalized 事项 line, ignoring whitespace and a
+    trailing period, so cosmetic differences do not duplicate."""
+    def norm(s):
+        return re.sub(r'\s+', '', s).rstrip('。')
+    target = norm(item_text)
+    if not target:
+        return True
+    for m in re.finditer(r'^- 事项：(.+)$', backlog_text, re.MULTILINE):
+        if norm(m.group(1)) == target:
+            return True
+    return False
+
+
 def _next_id(archive_text, prefix):
     ids = re.findall(re.escape(prefix) + r'-(\d+)', archive_text)
     return '%s-%03d' % (prefix, (max(int(i) for i in ids) + 1) if ids else 1)
@@ -2111,17 +2129,30 @@ def _summarize_impl(store, toplevel, source, semantic_text=None, session=None, s
                          % (lid, line, seq))
         appended_lessons.append(lid)
     for line in sections.get('待办', []):
-        tid = _next_id(backlog_text, 'T')
+        # Batch 10: the old regexes (\S+ for Owner, (.+)$ for 验证) cut
+        # the fields at the first space / counted the tail of the literal
+        # '验证：' inside an item line, which is how real handoff packages
+        # ended up with '- Owner：用户，验证：在' truncated blocks. Parse
+        # the item line properly: Owner up to the next separator, 验证
+        # from the LAST '验证：' (the item may itself contain one).
+        matter = line.strip()
+        if matter.startswith('- '):
+            matter = matter[2:].strip()
         owner = 'Agent'
-        m = re.search(r'Owner：(\S+)', line)
+        m = re.search(r'Owner：([^，,；;。\s]+)', matter)
         if m:
             owner = m.group(1)
         verify = '未指定'
-        m = re.search(r'验证：(.+)$', line)
-        if m:
-            verify = m.group(1)
+        idx = matter.rfind('验证：')
+        if idx >= 0:
+            verify = matter[idx + len('验证：'):].strip().rstrip('。')
+        item_text = re.split(r'。?Owner：', matter, maxsplit=1)[0].strip()
+        # Same-item dedup: re-summarizing the same todo must not mint T-N+1.
+        if _backlog_has_item(backlog_text, item_text):
+            continue
+        tid = _next_id(backlog_text, 'T')
         backlog_text += ('\n## %s\n- 事项：%s\n- Owner：%s\n- 验证方式：%s\n- 来源：汇总 %d\n- 状态：待启动\n'
-                         % (tid, line, owner, verify, seq))
+                         % (tid, item_text, owner, verify, seq))
         appended_backlog.append(tid)
     # State patch: replace the managed block, verifying markers exist.
     state_text = (archive / 'state.md').read_text(encoding='utf-8')
@@ -2529,6 +2560,142 @@ def enforce_budget(store_dir):
     return moved
 
 
+# ---------------------------------------------------------------- goal alignment
+# Batch 10: the goal is the only thing a human confirms, so a takeover
+# should be able to see whether the archive is actually serving it. The
+# check is deliberately keyword-based and advisory: goals are prose, so
+# a false negative (a promise whose words differ) only costs a hint,
+# never a wrong action. A promise is 'covered' when its key term also
+# appears in backlog/state, so the takeover learns 'goal says X, no
+# todo tracks X' without anyone re-reading 400 lines.
+GOAL_KEY_TERMS = (
+    ('Cursor', ('Cursor',)),
+    ('Gemini', ('Gemini',)),
+    ('Copilot', ('Copilot',)),
+    ('Cline', ('Cline',)),
+    ('晋升通道', ('晋升',)),
+    ('分叉检测', ('分叉',)),
+    ('成本调优', ('成本',)),
+    ('边界补全', ('边界',)),
+)
+GOAL_SWITCH_TERMS = ('换设备', '接力', 'WIP', '三载体')
+
+
+def _goal_alignment_section(store, toplevel):
+    """Advisory goal-vs-archive alignment (batch 10). Read-only.
+
+    Returns (section_text_or_None, info). None when there is no goal, or
+    the goal is not locally confirmed (nothing to align against yet)."""
+    try:
+        gstate, _info = relay.goal_status(store, toplevel)
+        if gstate not in ('confirmed', 'imported'):
+            return None, {'goal_state': gstate, 'checked': False}
+        row, store_dir = relay.resolve_store_dir(store, toplevel)
+        goal_path = store_dir / 'archive' / 'goal.md'
+        if not goal_path.exists():
+            return None, {'goal_state': gstate, 'checked': False}
+        goal_text = goal_path.read_text(encoding='utf-8')
+        backlog_text = (store_dir / 'archive' / 'backlog.md').read_text(encoding='utf-8')
+        state_text = (store_dir / 'archive' / 'state.md').read_text(encoding='utf-8')
+        corpus = backlog_text + '\n' + state_text
+    except Exception as exc:
+        return None, {'error': repr(exc), 'checked': False}
+    missing = []
+    for label, terms in GOAL_KEY_TERMS:
+        if not any(t in goal_text for t in terms):
+            continue          # the goal does not promise this item at all
+        if not any(t in corpus for t in terms):
+            missing.append(label)
+    switch_missing = [t for t in GOAL_SWITCH_TERMS
+                      if t in goal_text and t not in corpus]
+    info = {'goal_state': gstate, 'checked': True,
+            'missing_items': missing, 'missing_switch_terms': switch_missing}
+    if not missing and not switch_missing:
+        return ('目标对齐·承诺与档案\n'
+                '目标里的关键承诺在待办或状态里都有对应（检查项 %d 类）。'
+                % len([1 for _l, ts in GOAL_KEY_TERMS
+                       if any(t in goal_text for t in ts)])), info
+    lines = ['目标对齐·承诺与档案',
+             '目标提到了以下承诺，但待办清单与状态里都找不到对应条目：']
+    for label in missing:
+        lines.append('  - %s（建议在 backlog 登记一条可验收的待办）' % label)
+    for term in switch_missing:
+        lines.append('  - %s（目标要求的接力实绩，档案里没有记录）' % term)
+    lines.append('提醒：不是错误，但接手方会看不出这些承诺的进度；确认后在 backlog 补登记即可。')
+    return '\n'.join(lines), info
+
+
+# ---------------------------------------------------------------- package drift
+PACKAGE_DRIFT_MAX_LINES = 20
+
+
+def _entry_code_fingerprint(store_dir):
+    """Code fingerprint from the newest capture entry, or None.
+
+    Batch 10: the handoff package's own raw entries carry the code
+    fingerprint at capture time (header['fingerprint']['code']), and the
+    export manifest hashes those same bytes. So the newest entry is the
+    package's view of the code as of export -- the anchor a takeover
+    compares against this device's worktree."""
+    entries = list_entries(store_dir)
+    for entry in reversed(entries):
+        fingerprint = entry['header'].get('fingerprint') or {}
+        code = fingerprint.get('code') or {}
+        anchor = fingerprint.get('anchor') or entry['header'].get('anchor') or {}
+        if code:
+            return {'code': code, 'anchor': anchor,
+                    'seq': entry['header'].get('seq')}
+    return None
+
+
+def _package_drift_section(store_dir, toplevel, snap=None):
+    """Render the handoff-package vs worktree drift list (batch 10).
+
+    Returns (section_text_or_None, drift_dict). Never raises and never
+    writes: a takeover must run this read-only. None means there is no
+    package fingerprint to compare (an old package, or a project whose
+    entries carry none), so the section is simply omitted."""
+    try:
+        pkg = _entry_code_fingerprint(store_dir)
+        if pkg is None:
+            return None, {'anchor_seq': None, 'has_fingerprint': False,
+                          'changed': [], 'added': [], 'deleted': []}
+        if snap is None:
+            snap = snapshot_v2(toplevel, store_dir)
+    except Exception as exc:
+        return None, {'anchor_seq': None, 'has_fingerprint': False,
+                      'error': repr(exc), 'changed': [], 'added': [],
+                      'deleted': []}
+    pkg_code = pkg['code']
+    live_code = snap.get('code') or {}
+    changed = sorted(p for p in pkg_code
+                     if p in live_code
+                     and pkg_code[p].get('sha256') != live_code[p].get('sha256'))
+    added = sorted(p for p in live_code if p not in pkg_code)
+    deleted = sorted(p for p in pkg_code if p not in live_code)
+    drift = {'anchor_seq': pkg.get('seq'), 'has_fingerprint': True,
+             'package_head': (pkg.get('anchor') or {}).get('head'),
+             'live_head': (snap.get('anchor') or {}).get('head'),
+             'changed': changed, 'added': added, 'deleted': deleted,
+             'package_files': len(pkg_code), 'live_files': len(live_code)}
+    if not (changed or added or deleted):
+        text = ('接手对账·交接包指纹\n'
+                '交接包指纹与当前工作区一致（%d 个文件，锚点条目 cap-%04d）。'
+                % (len(pkg_code), pkg.get('seq') or 0))
+        return text, drift
+    lines = ['接手对账·交接包指纹',
+             '交接包之后代码已漂移（指纹锚点条目 cap-%04d，包内 %d 文件 / 当前 %d 文件）：'
+             % (pkg.get('seq') or 0, len(pkg_code), len(live_code))]
+    for label, rows in (('修改', changed), ('新增', added), ('删除', deleted)):
+        for rel in rows[:PACKAGE_DRIFT_MAX_LINES]:
+            lines.append('  [%s] %s' % (label, rel))
+        if len(rows) > PACKAGE_DRIFT_MAX_LINES:
+            lines.append('  [%s] ……另有 %d 个未列出'
+                         % (label, len(rows) - PACKAGE_DRIFT_MAX_LINES))
+    lines.append('提醒：档案可能落后于代码，开工前先跑 relay resume 的兜底汇总或人工确认。')
+    return '\n'.join(lines), drift
+
+
 def make_handoff(store, toplevel):
     """Old-side handoff package (plan 1.13): fixed sections, dated archive,
     and an index pointer for new-session auto-discovery."""
@@ -2579,13 +2746,39 @@ def make_handoff(store, toplevel):
     except Exception as exc:
         promotion_section = ('## 晋升提议（待处置）\n\n'
                              '（晋升提议读取失败：%r，见 relay promote list）' % (exc,))
+    # Batch 10: the next-session prompt must name the confirmed goal and
+    # the ACTUAL next steps. Before this, it only said "按待办头三件事",
+    # which read as advice but carried no goal and no ids -- a takeover
+    # could not tell what the project is for, nor which items come first.
+    goal_text = ''
+    goal_path = archive / 'goal.md'
+    if goal_path.exists():
+        body_text = goal_path.read_text(encoding='utf-8').strip()
+        lines = [l.strip() for l in body_text.splitlines()
+                 if l.strip() and not l.strip().startswith('<!--')
+                 and not l.strip().startswith('#')]
+        goal_text = lines[0] if lines else body_text[:120].replace('\n', ' ')
+    open_items = re.findall(r'^## (T-\d+)\n- 事项：([^\n]+)', backlog_text,
+                            re.MULTILINE)
+    if open_items:
+        next_steps = []
+        for tid, item in open_items[:3]:
+            short = item.split('。Owner：')[0].strip()
+            next_steps.append('- %s %s' % (tid, short))
+        next_text = '\n'.join(next_steps)
+    else:
+        next_text = '- （待办清单为空，先与用户确认目标再开工）'
+    prompt = ('项目在 %s。项目目标：%s\n'
+              '目标状态：%s；基线已验：%s。先跑 `relay resume` 对账，再按下列待办开工，'
+              '每件用其验证方式验收：\n%s'
+              % (toplevel, goal_text or '（档案无目标，先与用户确认）',
+                 gstate, '是' if last else '否', next_text))
     body = ('# 交接包 %s\n\n## 状态卷顶部\n\n%s\n\n## 目标现状\n\n目标状态：%s\n\n'
             '## 待办未闭环\n\n%s\n\n## 最近汇总\n\n%s\n\n## 下一会话提示词\n\n'
-            '项目在 %s。基线已验：%s。先跑 `relay resume` 对账，再按待办清单头三件事开工，'
-            '每件用其验证方式验收。\n\n## 原料保真度与缺口\n\n%s\n\n%s\n'
+            '%s\n\n## 原料保真度与缺口\n\n%s\n\n%s\n'
             % (name, top, gstate, backlog_text,
                (last or {}).get('source', '尚无汇总'),
-               toplevel, '是' if last else '否',
+               prompt,
                '\n'.join('- ' + g for g in gaps) or '- 无',
                promotion_section))
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2907,6 +3100,19 @@ def resume(store, toplevel, tool=None):
     except Exception as exc:
         fork_section = ('分叉清单\n\n（分叉检测读取失败：%r，见 relay fork list）' % (exc,))
     sections = [sec1, sec2, sec3, sec4, sec5]
+    # Batch 10: package-vs-worktree drift rides alongside the five
+    # sections (read-only, like the fork list). A package whose entries
+    # carry no code fingerprint yields None and the section is omitted.
+    try:
+        drift_section, drift = _package_drift_section(store_dir, toplevel, snap)
+    except Exception as exc:
+        drift_section, drift = None, {'error': repr(exc), 'has_fingerprint': False,
+                                      'changed': [], 'added': [], 'deleted': []}
+    # Batch 10: goal-vs-archive alignment, advisory and read-only.
+    try:
+        goal_align_section, goal_align = _goal_alignment_section(store, toplevel)
+    except Exception as exc:
+        goal_align_section, goal_align = None, {'error': repr(exc), 'checked': False}
     # Batch 3.4 handoff row: injection layers (same construction as
     # inject(), read-only here), reconcile diffs by class, catch-up
     # count, and the headline total (previous summarize LLM + injection).
@@ -2944,16 +3150,25 @@ def resume(store, toplevel, tool=None):
                      '（晋升提议读取失败：%r，见 relay promote list）' % (exc,))
     return {'no_archive': False, 'banner': banner, 'sections': sections,
             'sick': banner is not None, 'promotion': promotion,
-            'fork_section': fork_section}
+            'fork_section': fork_section, 'drift_section': drift_section,
+            'drift': drift, 'goal_align_section': goal_align_section,
+            'goal_align': goal_align}
 
 
 def render_resume(result):
-    """CLI rendering: the sick banner prints BEFORE section 1 (plan 1.14)."""
+    """CLI rendering: the sick banner prints BEFORE section 1 (plan 1.14).
+    The optional drift section (batch 10) rides between the five sections
+    and the fork list: it compares the handoff package's fingerprint with
+    the live worktree, so a takeover can see what moved after export."""
     out = []
     if result.get('banner'):
         out.append(result['banner'])
         out.append('')
     out.extend(result['sections'])
+    if result.get('drift_section'):
+        out.append(result['drift_section'])
+    if result.get('goal_align_section'):
+        out.append(result['goal_align_section'])
     if result.get('fork_section'):
         out.append(result['fork_section'])
     if result.get('promotion'):
