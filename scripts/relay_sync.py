@@ -1258,7 +1258,7 @@ _FACT_HEADING_RE = re.compile(r'^## 事实\s*$')
 _FACT_LINE_RE = re.compile(r'^- (.+?)：(.*)$')
 _CHANGES_HEADING_RE = re.compile(r'^## 汇总 (\d+)\s*$')
 _AGENT_GOAL_HASH_RE = re.compile(r'^总目标哈希：([0-9a-f]{64})\s*$', re.M)
-_FILELESS_AGENTS = ('deepseek-honeycomb',)
+_FILELESS_AGENTS = ('deepseek-harness',)
 
 
 def _recorded_goal_hash(text):

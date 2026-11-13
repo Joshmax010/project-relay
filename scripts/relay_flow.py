@@ -171,7 +171,7 @@ def cross_agent_check(store_dir, agents=None):
     Read-only.
     """
     if agents is None:
-        agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-honeycomb']
+        agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
     facts = {}
     for agent in agents:
         path = relay.agent_dir(store_dir, agent) / 'memory.md'
@@ -772,7 +772,7 @@ def queue_status(store_dir, agent=None, repair=False):
              'raw_mb': 0, 'stale_summarizing': [], 'over_retries': [],
              'rolled_back': [], 'oldest_pending': None}
     for a in relay.list_agents(store_dir):
-        if a == 'deepseek-honeycomb':
+        if a == 'deepseek-harness':
             continue
         one = _queue_status_dir(store_dir, relay.agent_dir(store_dir, a), cfg, False)
         for key in ('pending', 'summarizing', 'summarized', 'redacted_total', 'raw_mb'):
@@ -1413,7 +1413,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 记忆在项目根目录下的 `.project-relay/`，跟代码住在一起，默认不进 git，换设备只走 zip。外一层是总的：总目标、技术栈、未来预期、共用待办与决定、一张指路表。这层你每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。
 
-各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`，每家有自己的记忆、改动记录、日志、待办。DeepSeek Harness 以后适配，现在只留 `agents/deepseek-honeycomb/` 的位置。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
+各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`，每家有自己的记忆、改动记录、日志、待办。DeepSeek Harness 以后适配，现在只留 `agents/deepseek-harness/` 的位置。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
 
 ## 怎么跟用户说话
 
@@ -2689,7 +2689,7 @@ def _goal_alignment_section(toplevel):
                           'reason': '总目标无哈希（未确认收据）'}
     except Exception as exc:
         return None, {'error': repr(exc), 'checked': False}
-    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-honeycomb']
+    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
     rows = []
     aligned = 0
     for a in agents:
@@ -2742,7 +2742,7 @@ def _entry_code_fingerprint(store_dir):
     best = None
     best_at = ''
     for agent in relay.list_agents(store_dir):
-        if agent == 'deepseek-honeycomb':
+        if agent == 'deepseek-harness':
             continue
         for entry in list_entries(relay.agent_dir(store_dir, agent)):
             fingerprint = entry['header'].get('fingerprint') or {}
@@ -2920,7 +2920,7 @@ def resume(toplevel):
                 'assessment': assessment}
     store_dir = relay.resolve_store_dir(toplevel)
     cfg = load_config(store_dir)
-    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-honeycomb']
+    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
     adirs = {a: relay.agent_dir(store_dir, a) for a in agents}
     _stats = _stats_module()
     _prev_sum = _record_stats_safe(_stats.latest_summarize_row, store_dir)

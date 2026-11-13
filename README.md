@@ -22,7 +22,7 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
   receipts/                                     # 目标确认收据
   agents/
     codex/、claude-code/、workbuddy/            # 各家自己的记忆、改动记录、日志、待办
-    deepseek-honeycomb/                         # 只留位置，适配器以后再做
+    deepseek-harness/                         # 只留位置，适配器以后再做
 ```
 
 外层是总目标与总记忆，要精简：各家 Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。各家各写各的目录，不用一把大锁。同一家开两个会话同时写，用小文件锁排队。resume 的简报里有一段跨 Agent 核对，各家记忆里互相矛盾的地方直接列出来。

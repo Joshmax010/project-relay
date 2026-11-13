@@ -49,6 +49,6 @@
 
 ## DeepSeek Harness（以后适配，现在不做）
 
-- **证据等级：未验证**。档案里只留 `agents/deepseek-honeycomb/` 的目录
+- **证据等级：未验证**。档案里只留 `agents/deepseek-harness/` 的目录
   位置，适配器本身不在本版范围；DSH 的借位装法（`--agent kimi-code-cli`）
   已随范围收紧删除，不再推荐。

@@ -5,3 +5,4 @@ __pycache__/
 project-relay-workbuddy.zip
 build/
 *.egg-info/
+.project-relay/

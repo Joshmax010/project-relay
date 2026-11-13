@@ -37,8 +37,8 @@ class TestInitLayout(V3Base):
                 self.assertTrue((adir / d).is_dir(),
                                 'missing agents/%s/%s/' % (agent, d))
             self.assertTrue((adir / 'log.jsonl').is_file())
-        # deepseek-honeycomb: directory reserved, zero files (adapter later).
-        dh = store / 'agents' / 'deepseek-honeycomb'
+        # deepseek-harness: directory reserved, zero files (adapter later).
+        dh = store / 'agents' / 'deepseek-harness'
         self.assertTrue(dh.is_dir())
         self.assertEqual([], [p for p in dh.rglob('*') if p.is_file()])
         for d in AGENT_DIRS:
@@ -78,7 +78,7 @@ class TestInitLayout(V3Base):
         text = (self.store_dir(root) / 'index.md').read_text(encoding='utf-8')
         for agent in ('codex', 'claude-code', 'workbuddy'):
             self.assertIn('agents/%s/' % agent, text)
-        self.assertIn('deepseek-honeycomb', text)
+        self.assertIn('deepseek-harness', text)
         self.assertIn('预留', text)
 
 

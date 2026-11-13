@@ -9,8 +9,8 @@
   从各家文件里现算）、一张指路表（index.md）。这层各家 Agent 每轮不许
   直接写，只在目标确认或新 Agent 加入时才改。
 - 里面按 Agent 分家，各写各的：agents/codex/、agents/claude-code/、
-  agents/workbuddy/、agents/deepseek-honeycomb/（Deepseek Honeycomb 即
-  DSH，目录名 deepseek-honeycomb，适配器以后再做，现在只留位置）。
+  agents/workbuddy/、agents/deepseek-harness/（DeepSeek Harness 即
+  DSH，目录名 deepseek-harness，适配器以后再做，现在只留位置）。
   每家目录里是它自己的记忆文件（memory.md）、改动记录（changes.md）、
   日志（log.jsonl）、待办（backlog.md）、目标（goal.md，必须与总目标
   一致）。每个 Agent 只写自己那家目录，不用一把大锁；同一个 Agent 开
@@ -156,8 +156,8 @@ def anchor(root):
 
 # ---------------------------------------------------------------- store
 STORE_DIRNAME = '.project-relay'
-# 各家 Agent 的目录名。deepseek-honeycomb 只留位置，适配器以后再做。
-AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-honeycomb')
+# 各家 Agent 的目录名。deepseek-harness 只留位置，适配器以后再做。
+AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
 ACTIVE_AGENTS = ('codex', 'claude-code', 'workbuddy')
 # 外层文件：总目标、总记忆（精简）、指路表。
 OUTER_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
@@ -287,7 +287,7 @@ def render_index(agents):
              '| Agent | 目录 | 记忆文件 | 日志 | 备注 |',
              '|---|---|---|---|---|']
     for agent in agents:
-        note = '预留，未适配' if agent == 'deepseek-honeycomb' else ''
+        note = '预留，未适配' if agent == 'deepseek-harness' else ''
         lines.append('| %s | agents/%s/ | agents/%s/memory.md | agents/%s/log.jsonl | %s |'
                      % (agent, agent, agent, agent, note))
     return '\n'.join(lines) + '\n'
@@ -300,10 +300,10 @@ def write_index(store_dir):
 def ensure_agent_dir(store_dir, agent, update_index=True):
     """建一家目录（新 Agent 加入）：骨架文件 + 子目录 + 指路表。
 
-    已存在时只补缺失的骨架，不动已有内容。deepseek-honeycomb 不走
+    已存在时只补缺失的骨架，不动已有内容。deepseek-harness 不走
     这里（只留目录位置，见 init）。"""
-    require(agent != 'deepseek-honeycomb',
-            'deepseek-honeycomb 只留目录位置，适配器以后再做')
+    require(agent != 'deepseek-harness',
+            'deepseek-harness 只留目录位置，适配器以后再做')
     base = agent_dir(store_dir, agent)
     for d in AGENT_DIRS:
         (base / d).mkdir(parents=True, exist_ok=True)
@@ -420,7 +420,7 @@ def init(toplevel):
     """Create <root>/.project-relay/ with the per-agent layout.
 
     外层：总目标/总记忆文件 + receipts/ + state/（目标机件暂存）。
-    各家：agents/<agent>/，三家现役给全套骨架；deepseek-honeycomb
+    各家：agents/<agent>/，三家现役给全套骨架；deepseek-harness
     只留目录位置（适配器以后再做）。幂等：已建仓时只补缺失的骨架
     文件、不动已有内容，并确保 .gitignore 兜底。项目根目录就是身份，
     没有项目键、没有注册表。"""
@@ -430,7 +430,7 @@ def init(toplevel):
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
     for agent in ACTIVE_AGENTS:
         ensure_agent_dir(store_dir, agent, update_index=False)
-    dh = store_dir / 'agents' / 'deepseek-honeycomb'
+    dh = store_dir / 'agents' / 'deepseek-harness'
     for d in AGENT_DIRS:
         (dh / d).mkdir(parents=True, exist_ok=True)
     for name in OUTER_FILES:
