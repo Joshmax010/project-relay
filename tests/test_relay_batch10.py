@@ -172,7 +172,7 @@ class TestImportNoise(Batch10Base):
         self.call(sync.export_bundle, self.store, [self.repo], dest, 'dev', 'id')
         return dest
 
-    def test_fresh_import_adopts_and_has_no_fork_noise(self):
+    def test_fresh_import_adopts_and_only_baseline_fork_note(self):
         dest = self._package()
         # Second device: init only, then import.
         repo_b = self.make_repo('proj-b')
@@ -181,8 +181,16 @@ class TestImportNoise(Batch10Base):
         self.call(sync.import_bundle, dest, store_b, confirm=True)
         sd_b = relay.resolve_store_dir(store_b, repo_b)[1]
         state = (sd_b / 'archive' / 'state.md').read_text(encoding='utf-8')
-        self.assertNotIn('分叉待裁', state)
-        self.assertNotIn('- 当前分支@基线：未知', state.replace('\r\n', '\n'))
+        # D-sync-3: the branch line is a local measurement, so a fresh
+        # device keeps its own '未知' and records the peer's baseline as
+        # the one allowed fork note -- never silently adopting it. Any
+        # other fork note is still noise.
+        self.assertIn('- 当前分支@基线：未知', state.replace('\r\n', '\n'))
+        fork_notes = [l for l in state.replace('\r\n', '\n').splitlines()
+                      if l.startswith('- 分叉待裁：')]
+        self.assertEqual(len(fork_notes), 1, fork_notes)
+        self.assertIn('当前分支@基线', fork_notes[0])
+        self.assertIn('refs/heads/main@', fork_notes[0])
         self.assertIn('汇总 1', state)
         backlog = (sd_b / 'archive' / 'backlog.md').read_text(encoding='utf-8')
         self.assertIn('上线检查', backlog)
