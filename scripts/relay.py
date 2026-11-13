@@ -1,155 +1,490 @@
 #!/usr/bin/env python3
-"""project-relay v2 foundation: local-first memory store, project identity, init, goals.
+"""Relay v3：项目根目录下的共享记忆（Python 3.8+，stdlib），分 Agent 存放。
 
-Scope (detailed plan, part 02, steps 1.2-1.5 ONLY):
-  1.2  memory store layout under ~/.project-relay/ (Path.home() derived, never hardcoded)
-  1.3  project identity keyed by git remote, registry, `where` lookup
-  1.4  init: build the store, register the project, legacy .agent preview only
-  1.5  goal layer: the ONLY content that needs human confirmation, hash-certified
+档案在项目源码根目录的 `.project-relay/` 里：
 
-Provenance (every major piece notes its plan step and source):
-  - atomic()/safe()/digest()/save()/read_json()/git()/anchor()/utc()/RelayError:
-    old relayctl.py substrate, reused VERBATIM by import (plan 1.2, reuse list
-    "original reuse (foundation)"). Nothing here re-implements them.
-  - Store layout (projects/ + registry.json + global/ + trash/; six zones per
-    project store): plan 1.2 ORIGINAL layout decision; plain-text files only
-    borrows agent-beacon's plain-text boundary (fusion #25).
-  - Remote-as-identity: Handoff-CLI (fusion #28). Weak-key-to-strong-key
-    auto-migration: plan 1.3 ORIGINAL (no upstream handled this case).
-  - Goal fields: old project.md template fields, reused; hash-certification
-    point + honesty limit borrows planning-with-files (fusion #37); verbatim
-    user-quote discipline borrows ctx-handoff-mod (fusion #35); the
-    extract->draft->confirm chain, change-same-rule, tentative-as-first-class
-    state and no-goal exit are plan 1.5 ORIGINAL combinations.
+- 外层是本项目总的目标与总的记忆，要精简：总目标（goal.md，带确认
+  收据）、技术栈（stack.md）、项目未来预期（outlook.md）、共用的待办
+  与决定（backlog.md、decisions.md）、代码目前状况（state.md，由 resume
+  从各家文件里现算）、一张指路表（index.md）。这层各家 Agent 每轮不许
+  直接写，只在目标确认或新 Agent 加入时才改。
+- 里面按 Agent 分家，各写各的：agents/codex/、agents/claude-code/、
+  agents/workbuddy/、agents/deepseek-honeycomb/（Deepseek Honeycomb 即
+  DSH，目录名 deepseek-honeycomb，适配器以后再做，现在只留位置）。
+  每家目录里是它自己的记忆文件（memory.md）、改动记录（changes.md）、
+  日志（log.jsonl）、待办（backlog.md）、目标（goal.md，必须与总目标
+  一致）。每个 Agent 只写自己那家目录，不用一把大锁；同一个 Agent 开
+  两个会话同时写自己那份，用该目录下的小文件锁排队。
+- 两条规矩：公共的东西（目标、技术栈、共用待办和决定）只写在总记忆
+  那层，各家文件只写自己那份活；resume 接手简报里加一次跨 Agent 核
+  对，把各家记忆里互相矛盾的地方直接列出来。
 
-Honesty boundary (plan 1.5, from planning-with-files #37, kept verbatim in
-spirit): a local SHA256 receipt proves "the goal file has not been silently
-changed since confirmation". It is NOT a signature and does NOT stop anyone
-with local write access from forging a receipt. An auto-generated goal the
-user never read word-for-word counts as TENTATIVE, never confirmed.
+换设备只走 ZIP 交接（export-zip / import-zip），整包搬：另一台设备上
+任何 Agent 既能读别人的记忆，也能读自己的。
 
-All writes in this module go through relayctl.atomic(). Any direct open()
-write of a store file is a defect (plan 1.2 review red line).
-
-Environment override (tests only): PROJECT_RELAY_HOME replaces Path.home()
-when deriving the store root. Production never sets it.
+这是一份记忆工具，不是身份/鉴权边界。目标确认仍由用户把关。
 """
 import argparse
+import datetime as dt
 import difflib
+import hashlib
 import importlib.util
-import shutil
 import json
-import tempfile
 import os
-from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
-from urllib.parse import urlparse
+import tempfile
+from pathlib import Path, PurePosixPath
 
-# --- old substrate, imported verbatim (plan 1.2) ---------------------------
-_here = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location('relayctl', _here / 'relayctl.py')
-relayctl = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(relayctl)
+if os.name == 'nt':
+    import msvcrt
+else:
+    import fcntl
 
-RelayError = relayctl.RelayError
-require = relayctl.require
-utc = relayctl.utc
-digest = relayctl.digest
-atomic = relayctl.atomic
-save = relayctl.save
-read_json = relayctl.read_json
-safe = relayctl.safe
-git = relayctl.git
-anchor = relayctl.anchor
+# One relay module per process. The sibling modules (relay_flow,
+# relay_sync, relay_stats, relay_fork) load relay.py through importlib;
+# if each got its own copy, every copy would carry its own RelayError
+# class and main()'s handler would miss the ones the siblings raise
+# (a capture in an un-initialised project used to escape as a bare
+# traceback instead of ERROR + exit 1). The first loaded copy claims
+# the 'relay' name; the siblings reuse it (see their module tops).
+# An unregistered importlib load leaves registration to its loader.
+_self = sys.modules.get(__name__)
+if _self is not None:
+    sys.modules.setdefault('relay', _self)
 
+# Mode for a newly created document (atomic() restores the destination's
+# own mode instead of letting mkstemp's 0600 leak through).
+DOC_MODE = 0o644
+
+class RelayError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise RelayError(message)
+
+
+def utc():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe(root, rel):
+    """Accept relative paths only; reject every existing symlink component."""
+    require(isinstance(rel, str) and rel and '\\' not in rel,
+            '路径必须是非空的相对路径，使用 / 分隔')
+    parts = PurePosixPath(rel).parts
+    require(not PurePosixPath(rel).is_absolute() and '..' not in parts
+            and ':' not in rel and not rel.startswith('/'), '路径越界: ' + rel)
+    require(PurePosixPath(rel).as_posix() == rel, '路径必须规范化: ' + rel)
+    require(not root.is_symlink(), '拒绝符号链接目录: ' + str(root))
+    p = root
+    for part in parts:
+        p = p / part
+        require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
+    return p
+
+
+def atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    require(not path.is_symlink(), '拒绝符号链接: ' + str(path))
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = DOC_MODE
+    fd, name = tempfile.mkstemp(prefix='.relay-', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        # mkstemp creates 0600; keep the destination's own mode so a successful
+        # apply never silently restricts reviewed documents to the owner.
+        os.chmod(name, mode)
+        os.replace(name, str(path))
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def save(path, value):
+    atomic(path, (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + '\n').encode('utf-8'))
+
+
+def read_json(path):
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def git(root, *args, check=True, input_data=None, honor_autocrlf=False):
+    # Batch 3, A1: every git invocation through this wrapper pins
+    # core.autocrlf=false for the process only. Relay hashes working-tree
+    # bytes itself, so a checkout-time LF->CRLF conversion (Windows with
+    # autocrlf=true) silently breaks bundle hashes and store checkouts.
+    # The flag is per-process: the user's
+    # global/system autocrlf is never read for writing and never changed.
+    # Carve-out (honor_autocrlf): commit_check and resume() compare
+    # content the USER staged with their own git against the worktree.
+    # The index blob was produced under the repo's own autocrlf setting,
+    # so those three comparisons must use the same semantics, or a
+    # Windows user with the default autocrlf=true gets a false
+    # 'worktree differs from index' on every CRLF file they staged
+    # correctly. Relay-operated repos (sync store) never take this path:
+    # relay stages there too, so forced-false stays self-consistent.
+    cmd = ['git'] + ([] if honor_autocrlf else ['-c', 'core.autocrlf=false'])
+    cmd += ['-C', str(root), *args]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, input=input_data, timeout=60)
+    if check:
+        require(result.returncode == 0, 'Git 操作失败: ' + ' '.join(args))
+    return result
+
+
+def anchor(root):
+    head = git(root, 'rev-parse', '--verify', 'HEAD', check=False)
+    branch = git(root, 'symbolic-ref', '-q', 'HEAD', check=False)
+    return {'head': head.stdout.decode().strip() if head.returncode == 0 else None,
+            'branch': branch.stdout.decode().strip() if branch.returncode == 0 else None}
+
+
+
+# ---------------------------------------------------------------- store
 STORE_DIRNAME = '.project-relay'
-ZONES = ('raw', 'archive', 'state', 'tx', 'backups', 'receipts')
-# Archive skeletons (plan 1.2 fixed names; 1.13 may revise template bodies,
-# never these file names).
-ARCHIVE_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md', 'lessons.md')
-TEMPLATES_DIR = _here.parent / 'assets' / 'template-v2'
-if not TEMPLATES_DIR.is_dir():
-    # pip-installed layout (pyproject.toml data-files): the templates ship
-    # under <prefix>/share/project-relay/template-v2. The checkout layout
-    # above stays the authority; this only triggers when relay.py itself
-    # was installed without the repo around it.
-    _installed_templates = Path(sys.prefix) / 'share' / 'project-relay' / 'template-v2'
-    if _installed_templates.is_dir():
-        TEMPLATES_DIR = _installed_templates
+# 各家 Agent 的目录名。deepseek-honeycomb 只留位置，适配器以后再做。
+AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-honeycomb')
+ACTIVE_AGENTS = ('codex', 'claude-code', 'workbuddy')
+# 外层文件：总目标、总记忆（精简）、指路表。
+OUTER_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
+               'stack.md', 'outlook.md', 'index.md')
+# 每家目录里的文件：记忆、决定、教训、待办、改动记录、该家目标。
+AGENT_FILES = ('memory.md', 'decisions.md', 'lessons.md', 'backlog.md',
+               'changes.md', 'goal.md')
+AGENT_DIRS = ('raw', 'state', 'tx', 'backups')
+ARCHIVE_MARK = ('<!-- relay-archive-begin -->', '<!-- relay-archive-end -->')
 GOAL_STATUS_RE = re.compile(r'^状态：(.+?)\s*$', re.MULTILINE)
 TENTATIVE_WATERMARK = '【暂定目标】以下目标为暂定状态，不可当作硬约束执行。'
-
-
-# ---------------------------------------------------------------- 1.2 store
-def home_dir():
-    """User home; PROJECT_RELAY_HOME overrides it (tests only)."""
-    override = os.environ.get('PROJECT_RELAY_HOME')
-    return Path(override).expanduser() if override else Path.home()
-
-
-def default_store():
-    # Folder carrier (plan 2.3): the user may point the whole store at a
-    # sync folder via ~/.project-relay-location (written by sync-setup
-    # --carrier folder). The env override (tests) always wins; a pointer
-    # to a missing directory is returned as-is so commands fail loudly
-    # instead of silently writing to the wrong store.
-    if os.environ.get('PROJECT_RELAY_HOME'):
-        return home_dir() / STORE_DIRNAME
-    try:
-        target = (Path.home() / '.project-relay-location').read_text(
-            encoding='utf-8').strip()
-    except OSError:
-        target = ''
-    if target:
-        # Batch 3, C4: a pointer written by a pre-fix version may be
-        # relative; resolve it against the home dir, never the
-        # caller's cwd, so commands run elsewhere still find the store.
-        p = Path(target).expanduser()
-        return p if p.is_absolute() else home_dir() / p
-    return home_dir() / STORE_DIRNAME
-
-
-def device_identity():
-    """Stable per-device identity for folder-carrier heartbeat locks.
-
-    Lives in the home directory, never inside a synced store, so two
-    devices never fight over it. Generated once on first use (write
-    paths only; read-only flows must never call this).
-    """
-    path = home_dir() / '.project-relay-device.json'
-    try:
-        data = read_json(path)
-        if isinstance(data, dict) and data.get('device_id'):
-            return data['device_id'], data.get('device_name')
-    except (ValueError, OSError):
-        pass
-    import socket
-    import uuid
-    device_id = uuid.uuid4().hex
-    device_name = socket.gethostname()
-    save(path, {'device_id': device_id, 'device_name': device_name})
-    return device_id, device_name
-
-
-# ---------------------------------------------------------------- checksum manifest (plan 2.3.5)
-CHECKSUM_MANIFEST = 'state/checksum-manifest.json'
+CHECKSUM_MANIFEST = 'checksum-manifest.json'
+# Files under this prefix are excluded from the integrity manifest
+# (leftovers of the deleted sync-rollback trash; kept so old archives
+# still verify).
 ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'assets' / 'template-v2'
+
+
+def store_dir_for(toplevel):
+    """<项目根目录>/.project-relay —— v3 的唯一档案位置。"""
+    return Path(git_toplevel(toplevel)) / STORE_DIRNAME
+
+
+def resolve_store_dir(toplevel):
+    """Return the project store dir; fail closed when the project has no archive yet."""
+    store_dir = store_dir_for(toplevel)
+    require(store_dir.is_dir(),
+            '项目尚未建仓，先运行 relay init（档案在 <项目根目录>/.project-relay/）')
+    return store_dir
+
+
+def _store_exists(toplevel):
+    try:
+        return store_dir_for(toplevel).is_dir()
+    except RelayError:
+        return False
+
+
+class _StoreLock:
+    """排他文件锁：同一份档案同时只许一个写者。
+
+    外层一把（.project-relay/.write.lock），各家目录各一把
+    （agents/<agent>/.write.lock）。不同 Agent 写不同目录互不阻塞；
+    同一个 Agent 开两个会话同时写自己那份，在该目录的锁上排队。
+    锁是阻塞的，写路径上不设超时；跨设备合并不上的情况走分叉检测
+    与合并兜底，不走锁。"""
+
+    def __init__(self, lock_path):
+        self.path = Path(lock_path)
+        self._fh = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, 'a+')
+        if os.name == 'nt':
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(self._fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if os.name == 'nt':
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self._fh.close()
+        return False
+
+
+def outer_lock(store_dir):
+    """外层写锁：目标确认、新 Agent 加入、resume 写 state.md 时拿。"""
+    return _StoreLock(Path(store_dir) / '.write.lock')
+
+
+def agent_lock(store_dir, agent):
+    """某家目录的写锁：该 Agent 自己的 capture/summarize/日志都走它。"""
+    return _StoreLock(agent_dir(store_dir, agent) / '.write.lock')
+
+
+def ensure_gitignore(toplevel):
+    """Make sure <root>/.gitignore excludes .project-relay/ (init + import).
+
+    档案默认不进 git，换设备只走 ZIP。已有的 .gitignore 只追加一行，
+    不动其他内容（CRLF 文件保持 CRLF）。"""
+    root = Path(git_toplevel(toplevel))
+    gi = root / '.gitignore'
+    entry = STORE_DIRNAME + '/'
+    if gi.exists():
+        raw = gi.read_bytes()
+        newline = b'\r\n' if b'\r\n' in raw else b'\n'
+        lines = raw.decode('utf-8', errors='replace').splitlines()
+        if entry in [line.strip() for line in lines]:
+            return False
+        lines.append(entry)
+        atomic(gi, (newline.decode().join(lines) + newline.decode()).encode('utf-8'))
+        return True
+    atomic(gi, (entry + '\n').encode('utf-8'))
+    return True
+
+
+def agent_dir(store_dir, agent):
+    """agents/<agent>/。名字只认字母数字与 -_，未知名字直接拒绝。"""
+    require(isinstance(agent, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*',
+                                                    agent or ''),
+            '未知 Agent 名：%s' % agent)
+    return Path(store_dir) / 'agents' / agent
+
+
+def list_agents(store_dir):
+    """已建目录的 Agent 名（排序后）。目录本身就是入伙记录。"""
+    base = Path(store_dir) / 'agents'
+    if not base.is_dir():
+        return []
+    return sorted(d.name for d in base.iterdir() if d.is_dir())
+
+
+def render_index(agents):
+    """指路表：哪个 Agent 的记忆文件在哪。"""
+    lines = ['# 指路表', '',
+             '本项目记忆分家存放：外层是总目标与总记忆，各家 Agent 的记忆在 agents/<名>/。',
+             '外层文件只在目标确认或新 Agent 加入时改，平时由 resume 从各家文件里现算。', '',
+             '| Agent | 目录 | 记忆文件 | 日志 | 备注 |',
+             '|---|---|---|---|---|']
+    for agent in agents:
+        note = '预留，未适配' if agent == 'deepseek-honeycomb' else ''
+        lines.append('| %s | agents/%s/ | agents/%s/memory.md | agents/%s/log.jsonl | %s |'
+                     % (agent, agent, agent, agent, note))
+    return '\n'.join(lines) + '\n'
+
+
+def write_index(store_dir):
+    atomic(Path(store_dir) / 'index.md', render_index(list_agents(store_dir)).encode('utf-8'))
+
+
+def ensure_agent_dir(store_dir, agent, update_index=True):
+    """建一家目录（新 Agent 加入）：骨架文件 + 子目录 + 指路表。
+
+    已存在时只补缺失的骨架，不动已有内容。deepseek-honeycomb 不走
+    这里（只留目录位置，见 init）。"""
+    require(agent != 'deepseek-honeycomb',
+            'deepseek-honeycomb 只留目录位置，适配器以后再做')
+    base = agent_dir(store_dir, agent)
+    for d in AGENT_DIRS:
+        (base / d).mkdir(parents=True, exist_ok=True)
+    for name in AGENT_FILES:
+        dest = base / name
+        if dest.exists():
+            continue
+        template = 'agent-goal.md' if name == 'goal.md' else name
+        src = TEMPLATES_DIR / template
+        if src.exists():
+            dest.write_bytes(src.read_bytes())
+        else:
+            dest.write_text('', encoding='utf-8')
+    log = base / 'log.jsonl'
+    if not log.exists():
+        log.write_text('', encoding='utf-8')
+    if update_index:
+        index = Path(store_dir) / 'index.md'
+        if index.exists():
+            write_index(store_dir)
+    return base
+
+
+def _agent_log_path(store_dir, agent):
+    return agent_dir(store_dir, agent) / 'log.jsonl'
+
+
+def append_agent_log(store_dir, agent, event, detail=None):
+    """Append one JSON line to agents/<agent>/log.jsonl.
+
+    调用方应在已持有该家目录锁的写路径里调（capture/summarize/
+    relay log 都如此）；本函数自己不拿锁。"""
+    path = _agent_log_path(store_dir, agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {'at': utc(), 'agent': agent, 'event': event}
+    if detail is not None:
+        row['detail'] = detail
+    with open(path, 'a', encoding='utf-8') as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + '\n')
+    return row
+
+
+def read_agent_log(store_dir, agent, limit=50):
+    path = _agent_log_path(store_dir, agent)
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding='utf-8').splitlines()[-limit:]:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def _outer_doc(store_dir, name):
+    return store_path(store_dir, name)
+
+
+def read_stack(store_dir):
+    p = _outer_doc(store_dir, 'stack.md')
+    return p.read_text(encoding='utf-8') if p.exists() else ''
+
+
+def write_stack(store_dir, text):
+    atomic(_outer_doc(store_dir, 'stack.md'), text.encode('utf-8'))
+    return _outer_doc(store_dir, 'stack.md')
+
+
+def read_outlook(store_dir):
+    p = _outer_doc(store_dir, 'outlook.md')
+    return p.read_text(encoding='utf-8') if p.exists() else ''
+
+
+def write_outlook(store_dir, text):
+    atomic(_outer_doc(store_dir, 'outlook.md'), text.encode('utf-8'))
+    return _outer_doc(store_dir, 'outlook.md')
+
+
+def overall_goal_hash(store_dir):
+    """当前总目标的哈希：已确认用收据里的，否则用 goal.md 内容哈希，未建目标返回 None。"""
+    _path, receipt = _latest_receipt(store_dir)
+    if receipt:
+        return receipt.get('goal_hash')
+    data = _goal_bytes(store_dir)
+    if data is None or not data.strip():
+        return None
+    return digest(data)
+
+
+def read_agent_goal(store_dir, agent):
+    p = agent_dir(store_dir, agent) / 'goal.md'
+    return p.read_text(encoding='utf-8') if p.exists() else ''
+
+
+def agent_goal_recorded_hash(store_dir, agent):
+    """Agent 目标文件首行记录的总目标哈希（对齐检查用），无记录返回 None。"""
+    text = read_agent_goal(store_dir, agent)
+    m = re.search(r'^总目标哈希：([0-9a-f]{64})\s*$', text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def write_agent_goal(store_dir, agent, text):
+    """Write the agent's goal, stamping the overall-goal hash it aligns to.
+
+    只写该 Agent 自己的目录（调用方持 agent 锁）。"""
+    current = overall_goal_hash(store_dir)
+    header = ('总目标哈希：%s\n\n' % current) if current else ''
+    atomic(agent_dir(store_dir, agent) / 'goal.md', (header + text).encode('utf-8'))
+    return agent_dir(store_dir, agent) / 'goal.md'
+
+
+def init(toplevel):
+    """Create <root>/.project-relay/ with the per-agent layout.
+
+    外层：总目标/总记忆文件 + receipts/ + state/（目标机件暂存）。
+    各家：agents/<agent>/，三家现役给全套骨架；deepseek-honeycomb
+    只留目录位置（适配器以后再做）。幂等：已建仓时只补缺失的骨架
+    文件、不动已有内容，并确保 .gitignore 兜底。项目根目录就是身份，
+    没有项目键、没有注册表。"""
+    root = Path(git_toplevel(toplevel))
+    store_dir = root / STORE_DIRNAME
+    (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
+    (store_dir / 'state').mkdir(parents=True, exist_ok=True)
+    for agent in ACTIVE_AGENTS:
+        ensure_agent_dir(store_dir, agent, update_index=False)
+    dh = store_dir / 'agents' / 'deepseek-honeycomb'
+    for d in AGENT_DIRS:
+        (dh / d).mkdir(parents=True, exist_ok=True)
+    for name in OUTER_FILES:
+        dest = store_dir / name
+        if dest.exists() or name == 'index.md':
+            continue
+        src = TEMPLATES_DIR / name
+        if src.exists():
+            dest.write_bytes(src.read_bytes())
+        else:
+            dest.write_text('', encoding='utf-8')
+    write_index(store_dir)
+    ignored = ensure_gitignore(root)
+    return {'store_dir': str(store_dir), 'root': str(root),
+            'gitignored': ignored}
+
+def git_toplevel(path):
+    """Resolve any path inside a repo to its top level (plan 1.4 preflight)."""
+    path = Path(path).expanduser().resolve()
+    result = git(path, 'rev-parse', '--show-toplevel', check=False)
+    require(result.returncode == 0,
+            '请指定 Git 仓库内的路径；非 Git 项目不在本版范围')
+    return Path(os.fsdecode(result.stdout).strip()).resolve()
+
+def store_path(store, *rel):
+    """Resolve a relative path inside the store through the path jail."""
+    return safe(store, '/'.join(rel))
+
+def slug_for(name):
+    slug = re.sub(r'[^a-z0-9._-]+', '-', name.lower()).strip('-.')
+    return (slug[:40] or 'project')
+
 
 
 def _manifest_files(store_dir):
-    archive = store_dir / 'archive'
-    out = {}
-    if archive.is_dir():
-        for p in sorted(archive.rglob('*')):
-            if p.is_file() and not p.is_symlink():
-                rel = 'archive/' + p.relative_to(archive).as_posix()
-                if rel.startswith(ROLLBACK_TRASH_PREFIX):
-                    continue
-                out[rel] = p.read_bytes()
-    return out
+    """Every file under .project-relay/, as {relative path: bytes}.
 
+    完整性清单覆盖整棵树（外层 + 各家目录）。清单本身、锁文件、
+    回滚残留（rollback-trash）、记账（stats/）不计入：锁文件是空的
+    排队标记，残留本来就不属于正式档案，记账是本机才有的行记录、
+    随写随增（capture/summarize 写行时不刷新清单）。"""
+    out = {}
+    for p in sorted(Path(store_dir).rglob('*')):
+        if not p.is_file() or p.is_symlink():
+            continue
+        rel = p.relative_to(store_dir).as_posix()
+        if rel == CHECKSUM_MANIFEST or rel.endswith('.lock'):
+            continue
+        if rel.startswith(ROLLBACK_TRASH_PREFIX):
+            continue
+        if rel.startswith('stats/'):
+            continue
+        out[rel] = p.read_bytes()
+    return out
 
 def update_checksum_manifest(store_dir):
     """Integrity manifest (plan 2.3.5): SHA256 of every formal archive file.
@@ -163,7 +498,6 @@ def update_checksum_manifest(store_dir):
          {'updated_at': utc(),
           'files': {rel: digest(data) for rel, data in files.items()}})
     return len(files)
-
 
 def verify_checksum_manifest(store_dir):
     """Returns (present, mismatches). Extra files are ignored: merges and
@@ -190,462 +524,19 @@ def verify_checksum_manifest(store_dir):
                                    'actual': actual})
     return True, mismatches
 
-
-def store_path(store, *rel):
-    """Resolve a relative path inside the store through the path jail."""
-    return safe(store, '/'.join(rel))
-
-
-def load_registry(store):
-    path = store / 'registry.json'
-    if not path.exists():
-        return {'version': 1, 'projects': []}
-    value = read_json(path)
-    require(value.get('version') == 1 and isinstance(value.get('projects'), list),
-            '注册表格式不支持: ' + str(path))
-    return value
-
-
-def save_registry(store, registry):
-    save(store / 'registry.json', registry)
-
-
-def project_store_dir(store, row):
-    return store / 'projects' / (row['key'] + '-' + row['slug'])
-
-
-# ---------------------------------------------------------------- 1.3 identity
-def normalize_remote(url):
-    """Canonical remote identity. Returns None for non-URL remotes.
-
-    Strips protocol/userinfo differences, trailing .git, and case (plan 1.3).
-    Handoff-CLI (fusion #28) is the model: the remote address, not the local
-    path, is the project identity.
-    """
-    url = (url or '').strip().rstrip('/')
-    if url.endswith('.git'):
-        url = url[:-4]
-    if '://' in url:
-        parsed = urlparse(url)
-        host = (parsed.hostname or '').lower()
-        path = parsed.path.strip('/').lower()
-    else:
-        m = re.match(r'^(?:[^@:/\s]+@)?([^:/\s]+):(.+)$', url)
-        if not m:
-            return None
-        host, path = m.group(1).lower(), m.group(2).strip('/').lower()
-    if not host or not path:
-        return None
-    return host + '/' + path
-
-
-def remote_key(url):
-    canonical = normalize_remote(url)
-    return digest(canonical.encode('utf-8'))[:16] if canonical else None
-
-
-def local_key(toplevel):
-    """Weak key for remote-less projects (plan 3.6.3): hash of the resolved
-    top-level path plus the root-commit hash. Repos with no commits yet
-    fall back to the path hash alone. Rows created under the old
-    path-only formula keep their key: register() finds rows by path first
-    and never re-keys a local row to another local key (grandfathered)."""
-    roots = git(toplevel, 'rev-list', '--max-parents=0', 'HEAD', check=False)
-    root_shas = sorted(l.strip() for l in roots.stdout.decode().splitlines() if l.strip())
-    return digest((str(toplevel) + '\0' + ','.join(root_shas)).encode('utf-8'))[:16]
-
-
-# Volume 3, 3.6.3: the archive-header weak-identity line. It lives in
-# state.md OUTSIDE the managed block, so summarize rewrites never wipe
-# it; migration strips exactly this line (matched by the marker prefix).
-WEAK_IDENTITY_MARKER = '身份：弱身份'
-WEAK_IDENTITY_LINE = ('身份：弱身份（无 git remote；键为路径哈希 + 首提交哈希；'
-                       '加 remote 后可迁移，见 relay migrate-key）')
-
-
-def _ensure_weak_identity_line(store_dir):
-    """Append the weak-identity line to state.md if absent (init only).
-    Idempotent; never touches the managed block or user content."""
-    p = store_path(store_dir, 'archive', 'state.md')
-    if not p.exists():
-        return False
-    text = p.read_text(encoding='utf-8')
-    if WEAK_IDENTITY_MARKER in text:
-        return False
-    atomic(p, (text.rstrip('\n') + '\n\n' + WEAK_IDENTITY_LINE + '\n').encode('utf-8'))
-    return True
-
-
-def _strip_weak_identity_line(store_dir):
-    """Remove exactly the weak-identity line after a migration."""
-    p = store_path(store_dir, 'archive', 'state.md')
-    if not p.exists():
-        return False
-    lines = p.read_text(encoding='utf-8').splitlines(keepends=True)
-    kept = [l for l in lines if WEAK_IDENTITY_MARKER not in l]
-    if len(kept) == len(lines):
-        return False
-    atomic(p, ''.join(kept).encode('utf-8'))
-    return True
-
-
-def _migrate_row_to_remote(store, registry, row, key, canonical):
-    """Weak -> strong migration (plan 1.3 ORIGINAL, shared by register()
-    and the explicit `relay migrate-key` command, plan 3.6.3). Renames
-    the store dir (or quarantines to trash on collision), appends a
-    tombstone row, records migrated_from, and strips the weak-identity
-    header line from the migrated archive. Returns notes."""
-    notes = []
-    old_key, old_slug = row['key'], row['slug']
-    old_dir = store / 'projects' / (old_key + '-' + old_slug)
-    new_dir = store / 'projects' / (key + '-' + row['slug'])
-    if old_dir.exists() and not new_dir.exists():
-        old_dir.rename(new_dir)
-        notes.append('项目键已迁移：本地键 %s -> remote 键 %s，记忆仓已改名' % (old_key, key))
-        # Batch 9 (Codex PR #5 2026-11-06 review): stripping the
-        # weak-identity line rewrites archive/state.md, which is inside
-        # the checksum manifest's scope (archive/**), so the manifest
-        # must be refreshed when the strip actually changed the file --
-        # otherwise the next resume reports a manifest mismatch for
-        # state.md and blocks automatic summarization (same class as
-        # the fork-adjudication refresh in relay_fork.py).
-        if _strip_weak_identity_line(new_dir):
-            update_checksum_manifest(new_dir)
-    elif old_dir.exists():
-        target = store / 'trash' / (old_key + '-' + utc().replace(':', '-'))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        old_dir.rename(target)
-        notes.append('旧仓已移入 trash（%s），内容未自动合并，请人工核对' % target)
-    else:
-        notes.append('项目键已迁移：本地键 %s -> remote 键 %s（旧仓不存在，无需改名）' % (old_key, key))
-    tombstone = dict(row)
-    tombstone.update({'status': 'migrated', 'migrated_to': key,
-                      'paths': list(row.get('paths', []))})
-    row.update({'key': key, 'key_type': 'remote', 'remote': canonical,
-                'migrated_from': [*row.get('migrated_from', []), old_key],
-                'last_active': utc()})
-    registry['projects'].append(tombstone)
-    save_registry(store, registry)
-    return notes
-
-
-def pending_key_migration(store, toplevel):
-    """Plan 3.6.3: detect a weak -> remote migration waiting at pack time.
-    Read-only; never migrates by itself. Returns None or a dict with
-    old_key/new_key/remote, for pack to prompt (not auto-migrate)."""
-    try:
-        toplevel = git_toplevel(toplevel)
-        registry = load_registry(store)
-        row = find_row_by_path(registry, toplevel)
-        if row is None or row.get('key_type') != 'local':
-            return None
-        remote_url = origin_remote(toplevel)
-        canonical = normalize_remote(remote_url) if remote_url else None
-        key = remote_key(remote_url) if canonical else None
-        if not key or key == row['key']:
-            return None
-        return {'old_key': row['key'], 'new_key': key, 'remote': canonical,
-                'slug': row['slug']}
-    except Exception:
-        return None
-
-
-def migrate_key(store, toplevel):
-    """Explicit weak -> remote migration (plan 3.6.3). Refuses unless a
-    migration is actually pending; the rename + tombstone + migrated_from
-    trail makes it auditable and re-checkable."""
-    toplevel = git_toplevel(toplevel)
-    registry = load_registry(store)
-    row = find_row_by_path(registry, toplevel)
-    require(row is not None, '未登记，先运行 relay init')
-    require(row.get('key_type') == 'local', '当前已是 remote 键，无需迁移')
-    pending = pending_key_migration(store, toplevel)
-    require(pending is not None, '尚无 remote 或键已一致，无法迁移')
-    notes = _migrate_row_to_remote(store, registry, row,
-                                   pending['new_key'], pending['remote'])
-    return {'old_key': pending['old_key'], 'new_key': pending['new_key'],
-            'remote': pending['remote'], 'notes': notes}
-
-
-def slug_for(name):
-    slug = re.sub(r'[^a-z0-9._-]+', '-', name.lower()).strip('-.')
-    return (slug[:40] or 'project')
-
-
-def split_archive(store, toplevel, scope, name):
-    """Explicit monorepo split (plan 3.6.6). The parent archive is cloned
-    at split time: baseline + last-summary are copied, so the child's
-    first post-split summary takes its based_on from the parent's latest
-    summary (the split point, 3.3 chain semantics) with no new pointer
-    format. The child then evolves independently; the parent is untouched.
-    The child row carries key_type 'split' and a split_from audit trail.
-    Addressing note: path lookup still resolves the parent row (first
-    match wins); the child is addressed by key (relay where --key)."""
-    toplevel = git_toplevel(toplevel)
-    scope = scope.strip().strip('/')
-    require(bool(scope) and scope != '.' and '..' not in Path(scope).parts,
-            '范围必须是仓内子目录（拒绝 . 与越界）')
-    scope_path = toplevel / scope
-    require(scope_path.is_dir(), '范围目录不存在：' + scope)
-    slug = slug_for(name)
-    require(bool(slug), '拆分名无效')
-    row, parent_dir = resolve_store_dir(store, toplevel)
-    child_key = digest((row['key'] + '\0' + scope).encode('utf-8'))[:16]
-    registry = load_registry(store)
-    require(find_row_by_key(registry, child_key) is None,
-            '该范围已拆分过（子键 %s）' % child_key)
-    child_dir = store / 'projects' / (child_key + '-' + slug)
-    require(not child_dir.exists(), '目标分仓已存在：' + str(child_dir))
-    last_path = parent_dir / 'state' / 'last-summary.json'
-    split_seq = None
-    if last_path.exists():
-        try:
-            _last = read_json(last_path)
-            split_seq = _last.get('seq', _last.get('summary_seq'))
-        except Exception:
-            split_seq = None
-    split_summary_id = ('sum-%04d' % split_seq) if isinstance(split_seq, int) else None
-    shutil.copytree(parent_dir, child_dir, symlinks=True)
-    split_from = {'parent_key': row['key'], 'parent_slug': row['slug'],
-                  'scope': scope, 'split_seq': split_seq,
-                  'split_summary_id': split_summary_id}
-    cfg_path = child_dir / 'state' / 'config.json'
-    cfg = read_json(cfg_path) if cfg_path.exists() else {}
-    cfg.update({'scope': scope, 'split_from': split_from})
-    save(cfg_path, cfg)
-    child_row = {'key': child_key, 'slug': slug, 'display_name': name,
-                 'paths': [str(toplevel)], 'remote': row.get('remote'),
-                 'created_at': utc(), 'last_active': utc(),
-                 'key_type': 'split', 'status': 'active', 'migrated_from': [],
-                 'scope': scope, 'split_from': split_from}
-    registry['projects'].append(child_row)
-    save_registry(store, registry)
-    return {'parent_key': row['key'], 'child_key': child_key, 'slug': slug,
-            'child_dir': child_dir, 'scope': scope, 'split_seq': split_seq,
-            'split_summary_id': split_summary_id, 'split_from': split_from}
-
-
-def git_toplevel(path):
-    """Resolve any path inside a repo to its top level (plan 1.4 preflight)."""
-    path = Path(path).expanduser().resolve()
-    result = git(path, 'rev-parse', '--show-toplevel', check=False)
-    require(result.returncode == 0,
-            '请指定 Git 仓库内的路径；非 Git 项目不在本版范围')
-    return Path(os.fsdecode(result.stdout).strip()).resolve()
-
-
-def origin_remote(toplevel):
-    result = git(toplevel, 'config', '--get', 'remote.origin.url', check=False)
-    if result.returncode != 0:
-        return None
-    return result.stdout.decode().strip() or None
-
-
-def _active_rows(registry):
-    return [r for r in registry['projects'] if r.get('status', 'active') == 'active']
-
-
-def find_row_by_path(registry, toplevel):
-    for row in _active_rows(registry):
-        if str(toplevel) in row.get('paths', []):
-            return row
-    return None
-
-
-def find_row_by_key(registry, key):
-    for row in registry['projects']:
-        if row['key'] == key:
-            return row
-    return None
-
-
-def register(store, toplevel):
-    """Register a project, self-healing paths and migrating weak keys.
-
-    Returns (row, changed, notes). Writes the registry ONLY when something
-    actually changed, so a repeat registration is byte-identical (plan 1.4).
-    Never creates a project store directory (plan 1.3: stores are created
-    only by init or backfill); a migration rename only moves an existing one.
-    """
-    toplevel = git_toplevel(toplevel)
-    remote_url = origin_remote(toplevel)
-    canonical = normalize_remote(remote_url) if remote_url else None
-    key = remote_key(remote_url) if canonical else local_key(toplevel)
-    key_type = 'remote' if canonical else 'local'
-    registry = load_registry(store)
-    notes = []
-    row = find_row_by_path(registry, toplevel)
-    if row is not None:
-        if row['key'] == key:
-            return row, False, notes
-        if row.get('key_type') == 'local' and key_type == 'remote':
-            # Weak -> strong migration (plan 1.3 ORIGINAL, shared helper).
-            notes.extend(_migrate_row_to_remote(store, registry, row, key, canonical))
-            return row, True, notes
-        notes.append('remote 已变化但沿用既有项目键，不降级为本地键')
-        return row, False, notes
-    row = find_row_by_key(registry, key)
-    if row is not None and row.get('status', 'active') == 'active':
-        # Self-heal: same project at a new path (clone/move) joins the set.
-        row['paths'].append(str(toplevel))
-        row['last_active'] = utc()
-        save_registry(store, registry)
-        notes.append('已登记新路径：' + str(toplevel))
-        return row, True, notes
-    row = {'key': key, 'slug': slug_for(toplevel.name), 'display_name': toplevel.name,
-           'paths': [str(toplevel)], 'remote': canonical, 'created_at': utc(),
-           'last_active': utc(), 'key_type': key_type, 'status': 'active',
-           'migrated_from': []}
-    registry['projects'].append(row)
-    save_registry(store, registry)
-    return row, True, notes
-
-
-def where(store, path=None, key=None):
-    """Read-only lookup (plan 1.3): by path or by key. Never mutates anything."""
-    registry = load_registry(store)
-    if key:
-        row = find_row_by_key(registry, key)
-        if row is None:
-            return {'found': False, 'key': key, 'note': '注册表无此键，先运行 init'}
-        if row.get('status') == 'migrated':
-            return {'found': False, 'key': key,
-                    'note': '该键已迁移至 ' + str(row.get('migrated_to')), 'row': row}
-        return {'found': True, 'row': row, 'note': '按 key 查到'}
-    toplevel = git_toplevel(path) if path else None
-    require(toplevel is not None, 'where 需要 --path 或 --key')
-    row = find_row_by_path(registry, toplevel)
-    if row is not None:
-        return {'found': True, 'row': row, 'note': '路径已登记'}
-    remote_url = origin_remote(toplevel)
-    computed = remote_key(remote_url) if remote_url else local_key(toplevel)
-    row = find_row_by_key(registry, computed)
-    if row is not None and row.get('status', 'active') == 'active':
-        return {'found': True, 'row': row, 'note': '路径未登记，但 remote 键已登记（只读，未自动加入）'}
-    return {'found': False, 'key': computed, 'note': '未登记，先运行 init'}
-
-
-def resolve_store_dir(store, toplevel):
-    """Everyday commands: find the store, never create one (plan 1.3)."""
-    result = where(store, path=toplevel)
-    if not result['found']:
-        raise RelayError('项目未建仓，先运行 relay init：' + result['note'])
-    return result['row'], project_store_dir(store, result['row'])
-
-
-# ---------------------------------------------------------------- 1.4 init
-def _check_skill_package():
-    require(TEMPLATES_DIR.is_dir(), 'Skill 包不完整：缺少模板目录，未开始初始化')
-    missing = [name for name in ARCHIVE_FILES if not (TEMPLATES_DIR / name).is_file()
-               or not (TEMPLATES_DIR / name).read_bytes()]
-    require(not missing, 'Skill 包不完整：缺少模板：' + '、'.join(missing) + '，未开始初始化')
-
-
-def legacy_preview(toplevel):
-    """Preview-only mapping for a legacy .agent/ dir. Reads nothing else and
-    writes nothing (plan 1.4). Returns human-readable mapping lines."""
-    agent = toplevel / '.agent'
-    if not agent.is_dir():
-        return []
-    lines = ['旧 .agent/ 迁移预览（仅预览，未搬迁任何文件）：']
-    for p in sorted(q for q in agent.rglob('*') if q.is_file()):
-        rel = p.relative_to(agent).as_posix()
-        if rel.startswith('inbox/'):
-            target = 'raw/legacy-inbox/' + rel[len('inbox/'):]
-            note = '未审草稿 -> 原料区'
-        elif rel.startswith('.local/'):
-            target = 'tx/legacy-' + rel[len('.local/'):]
-            note = '事务/凭证 -> 事务区（人工核对）'
-        elif rel.startswith('conversations/raw/'):
-            target = 'raw/' + rel[len('conversations/raw/'):]
-            note = '聊天原文 -> 原料区'
-        elif rel.startswith(('tools/', 'archive/')):
-            target = None
-            note = '不迁移（工具副本/旧归档）'
-        elif rel.endswith('.md') and '/' not in rel:
-            target = 'archive/' + rel
-            note = '正式文档 -> 档案区'
-        else:
-            target = 'raw/legacy-' + rel
-            note = '其他 -> 原料区（人工核对）'
-        lines.append('  .agent/%s -> %s（%s）' % (rel, target or '（不迁移）', note))
-    lines.append('点头后才执行迁移；旧 .agent/ 保留不动。迁移执行不在卷一 1.4 范围。')
-    return lines
-
-
-def init(store, toplevel):
-    """Build the store for a project (plan 1.4). Preflight failures write nothing."""
-    # Preflight, in order; any failure exits before a single write.
-    toplevel = git_toplevel(toplevel)
-    registry = load_registry(store)
-    for row in _active_rows(registry):
-        for known in row.get('paths', []):
-            known_path = Path(known)
-            if toplevel != known_path and known_path in toplevel.parents:
-                raise RelayError('Git 顶层位于已登记项目之内（嵌套误登记）：' + known)
-    _check_skill_package()
-    row, changed, notes = register(store, toplevel)
-    store_dir = project_store_dir(store, row)
-    # Build: six zones + top-level store dirs; skeletons exclusive-create.
-    for zone in ZONES:
-        (store_dir / zone).mkdir(parents=True, exist_ok=True)
-    for top in ('projects', 'global', 'trash'):
-        (store / top).mkdir(parents=True, exist_ok=True)
-    # Codex PR #5 batch 1, A7: skeleton writes used to be open('x') +
-    # write, so an interrupted init left a truncated file that the next
-    # init skipped (exists -> continue) forever. All skeleton writes now
-    # go through atomic() (temp file + fsync + rename). A re-run also
-    # repairs a truncated skeleton: an existing file whose bytes are a
-    # strict prefix of the template (including empty) can only be an
-    # interrupted write, never user content, so it is rewritten atomically.
-    # A file equal to the template is skipped; any other existing content
-    # is treated as the user's and left untouched; symlinks are never
-    # followed or replaced.
-    repaired = []
-    for name in ARCHIVE_FILES:
-        dest = store_path(store_dir, 'archive', name)
-        template = (TEMPLATES_DIR / name).read_bytes()
-        if dest.exists():
-            if dest.is_symlink() or not dest.is_file():
-                continue
-            current = dest.read_bytes()
-            if current == template:
-                continue
-            if template.startswith(current):
-                atomic(dest, template)
-                repaired.append(name)
-            continue
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        atomic(dest, template)
-    if repaired:
-        notes.append('骨架截断已修复：' + '、'.join(repaired))
-    # Volume 3, 3.6.3: weak-identity header line for remote-less projects.
-    if row.get('key_type') == 'local' and _ensure_weak_identity_line(store_dir):
-        notes.append('档案头已标注弱身份（无 git remote）')
-    preview = legacy_preview(toplevel)
-    return {'store_dir': store_dir, 'key': row['key'], 'row': row,
-            'registered_changed': changed, 'notes': notes, 'preview': preview,
-            'repaired_skeletons': repaired}
-
-
-# ---------------------------------------------------------------- 1.5 goals
 def _goal_file(store_dir):
-    return store_path(store_dir, 'archive', 'goal.md')
-
+    return store_path(store_dir, 'goal.md')
 
 def _goal_bytes(store_dir):
     p = _goal_file(store_dir)
     return p.read_bytes() if p.exists() else None
 
-
 def _goal_text(store_dir):
     data = _goal_bytes(store_dir)
     return data.decode('utf-8') if data is not None else None
 
-
 def _skeleton_bytes():
     return (TEMPLATES_DIR / 'goal.md').read_bytes()
-
 
 def _latest_receipt(store_dir):
     receipts = store_path(store_dir, 'receipts')
@@ -655,33 +546,30 @@ def _latest_receipt(store_dir):
     path = found[-1]
     return path, read_json(path)
 
-
 def _receipt_snapshot(store_dir, seq):
     p = store_path(store_dir, 'receipts', 'goal-%04d.md' % seq)
     return p.read_bytes().decode('utf-8') if p.exists() else None
-
 
 def _tentative_record(store_dir):
     p = store_path(store_dir, 'state', 'goal-tentative.json')
     return read_json(p) if p.exists() else None
 
-
-def goal_status(store, toplevel):
+def goal_status(toplevel):
     """Verify the goal state. States: confirmed, tentative, none, tampered,
     modified, unconfirmed."""
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     data = _goal_bytes(store_dir)
     if data is None or not data.strip() or data == _skeleton_bytes():
-        return 'none', {'row': row, 'note': '无目标档案'}
+        return 'none', {'note': '无目标档案'}
     text = data.decode('utf-8')
     match = GOAL_STATUS_RE.search(text)
     declared = match.group(1) if match else None
     receipt_path, receipt = _latest_receipt(store_dir)
     if receipt and digest(data) == receipt['goal_hash']:
-        return 'confirmed', {'row': row, 'receipt': receipt, 'hash': receipt['goal_hash']}
+        return 'confirmed', {'receipt': receipt, 'hash': receipt['goal_hash']}
     tentative = _tentative_record(store_dir)
     if tentative and digest(data) == tentative['content_hash']:
-        return 'tentative', {'row': row, 'tentative': tentative}
+        return 'tentative', {'tentative': tentative}
     # Volume-2 (plan part 03, S4 on the v1 layout): a goal imported from
     # another device is usable only after a local one-click confirm.
     imported_path = store_path(store_dir, 'state', 'goal-imported.json')
@@ -691,24 +579,23 @@ def goal_status(store, toplevel):
         except ValueError:
             imported = None
         if imported and digest(data) == imported.get('source_goal_hash'):
-            return 'imported', {'row': row, 'imported': imported}
+            return 'imported', {'imported': imported}
     if receipt:
-        return 'tampered', {'row': row, 'receipt': receipt,
+        return 'tampered', {'receipt': receipt,
                             'stale': _receipt_snapshot(store_dir, receipt['seq']),
                             'current_hash': digest(data)}
     if tentative:
         snap = store_path(store_dir, 'state', 'goal-tentative.md')
         stale = snap.read_text(encoding='utf-8') if snap.exists() else None
-        return 'modified', {'row': row, 'tentative': tentative, 'stale': stale}
+        return 'modified', {'tentative': tentative, 'stale': stale}
     if declared in ('未建', '无'):
-        return 'none', {'row': row, 'note': '无目标档案'}
-    return 'unconfirmed', {'row': row, 'note': '目标内容存在但未经确认'}
+        return 'none', {'note': '无目标档案'}
+    return 'unconfirmed', {'note': '目标内容存在但未经确认'}
 
-
-def goal_draft(store, toplevel, content):
+def goal_draft(toplevel, content):
     """Stage a goal draft (Agent-written; sources annotated in the text).
     The tool does not judge the draft, it only stores it for diff + confirm."""
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     require(isinstance(content, str) and content.strip(), '目标草案内容不能为空')
     data = content.encode('utf-8')
     base = _goal_bytes(store_dir)
@@ -719,24 +606,22 @@ def goal_draft(store, toplevel, content):
           'created_at': utc()})
     return {'hash': digest(data)}
 
-
 def _read_draft(store_dir):
     p = store_path(store_dir, 'state', 'goal-draft.md')
     require(p.exists(), '没有待确认的目标草案，先运行 goal draft')
     return p.read_bytes()
 
-
-def goal_show(store, toplevel):
+def goal_show(toplevel):
     """Unified diff of current goal -> draft (the ONLY routine diff-to-human
     path in v2, plan 1.5; old review() diff rendering, reused as a pattern)."""
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     draft_path = store_path(store_dir, 'state', 'goal-draft.md')
     if draft_path.exists():
         old = _goal_text(store_dir) or ''
         new = draft_path.read_text(encoding='utf-8')
         title = '目标草案 diff（当前 -> 草案）'
     else:
-        state, info = goal_status(store, toplevel)
+        state, info = goal_status(toplevel)
         require(state == 'tampered', '没有待确认的目标草案，也没有被改动的目标')
         old = info['stale'] or ''
         new = _goal_text(store_dir) or ''
@@ -744,7 +629,6 @@ def goal_show(store, toplevel):
     return title + '\n' + ''.join(difflib.unified_diff(
         old.splitlines(True), new.splitlines(True),
         fromfile='goal.md:current', tofile='goal.md:proposed'))
-
 
 def _check_draft_base(store_dir):
     """Codex PR #5, batch 10: a draft is only confirmable against the goal
@@ -769,12 +653,11 @@ def _check_draft_base(store_dir):
             '目标草案已过期：起草后目标已被另一会话确认/否决/导入；'
             '请重新起草（relay goal draft）后再确认')
 
-
-def goal_confirm(store, toplevel, channel='cli', tentative=False):
+def _goal_confirm_inner(toplevel, channel='cli', tentative=False):
     """Confirm a draft. Normal path: write goal + hash-chained receipt.
     --tentative path: write goal WITHOUT a receipt; the goal counts as
     tentative only (plan 1.5: auto-generated, unread goals are never confirmed)."""
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     draft = _read_draft(store_dir)
     current = _goal_bytes(store_dir)
     if not tentative:
@@ -792,7 +675,7 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
         _check_draft_base(store_dir)
         seq = (receipt['seq'] + 1) if receipt else 1
         if current is not None and current != _skeleton_bytes() and current != draft:
-            history = store_path(store_dir, 'archive', 'goal-history')
+            history = store_path(store_dir, 'receipts', 'goal-history')
             atomic(history / ('%04d.md' % seq), current)
         atomic(_goal_file(store_dir), draft)
         prev_hash = digest(receipt_path.read_bytes()) if receipt_path else None
@@ -831,15 +714,14 @@ def goal_confirm(store, toplevel, channel='cli', tentative=False):
     update_checksum_manifest(store_dir)
     return {'tentative': True, 'hash': digest(draft)}
 
-
-def _confirm_imported(store, toplevel):
+def _confirm_imported(toplevel):
     """One-click local confirmation of an imported goal (plan part 03, S4).
 
     The local receipt chain keeps local continuity (seq = latest local
     seq + 1, prev_receipt_hash chained to the local previous receipt);
     cross-device version continuity is recorded, not forced, in the
     imported_from block (v1 receipts have no goal_version field)."""
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     imported_path = store_path(store_dir, 'state', 'goal-imported.json')
     require(imported_path.exists(), '没有待本机确认的导入目标')
     imported = read_json(imported_path)
@@ -861,8 +743,7 @@ def _confirm_imported(store, toplevel):
     imported_path.unlink(missing_ok=True)
     return {'receipt': new_receipt}
 
-
-def goal_decline(store, toplevel):
+def _goal_decline_inner(toplevel):
     """User declines to build a goal file (plan 1.5 no-goal exit).
 
     Codex PR #5 finding 2: merely writing the 未建 text left a prior
@@ -872,12 +753,12 @@ def goal_decline(store, toplevel):
     (archive the superseded goal text, delete receipts and tentative
     state) so the project returns to a clean 'none' state.
     """
-    row, store_dir = resolve_store_dir(store, toplevel)
+    store_dir = resolve_store_dir(toplevel)
     receipt_path, receipt = _latest_receipt(store_dir)
     if receipt is not None:
         current = _goal_bytes(store_dir)
         if current is not None and current.strip():
-            history = store_path(store_dir, 'archive', 'goal-history')
+            history = store_path(store_dir, 'receipts', 'goal-history')
             atomic(history / ('%04d-declined.md' % receipt['seq']), current)
         receipts = store_path(store_dir, 'receipts')
         if receipts.exists():
@@ -894,7 +775,7 @@ def goal_decline(store, toplevel):
     tentative_md = store_path(store_dir, 'state', 'goal-tentative.md')
     tentative_json = store_path(store_dir, 'state', 'goal-tentative.json')
     if tentative_md.exists() and tentative_md.read_bytes().strip():
-        history = store_path(store_dir, 'archive', 'goal-history')
+        history = store_path(store_dir, 'receipts', 'goal-history')
         stem = 'tentative-declined-%s' % utc().replace('-', '').replace(
             ':', '').replace('.', '').replace('+', '')
         atomic(history / (stem + '.md'), tentative_md.read_bytes())
@@ -910,10 +791,22 @@ def goal_decline(store, toplevel):
     return {'declined': True}
 
 
-def goal_inject(store, toplevel):
+
+def goal_confirm(toplevel, channel='cli', tentative=False):
+    store_dir = resolve_store_dir(toplevel)
+    with outer_lock(store_dir):
+        return _goal_confirm_inner(toplevel, channel=channel, tentative=tentative)
+
+
+def goal_decline(toplevel):
+    store_dir = resolve_store_dir(toplevel)
+    with outer_lock(store_dir):
+        return _goal_decline_inner(toplevel)
+
+def goal_inject(toplevel):
     """Text a new session may inject, by goal state (plan 1.5)."""
-    state, info = goal_status(store, toplevel)
-    row, store_dir = resolve_store_dir(store, toplevel)
+    state, info = goal_status(toplevel)
+    store_dir = resolve_store_dir(toplevel)
     # Plan part 03, step 3.3 item 4③: a forked goal never auto-merges --
     # injection freezes and the S4 reconfirmation flow takes over. The
     # canonical definition lives in relay_fork.goal_fork_active (flag
@@ -941,219 +834,17 @@ def goal_inject(store, toplevel):
         return out + (info.get('stale') or '')
     return '【目标未确认】以下内容未经确认，仅供参考：\n' + text
 
-
-def goal_check(store, toplevel):
+def goal_check(toplevel):
     """Injection gate: passes for every state except tampered (plan 1.5)."""
-    state, info = goal_status(store, toplevel)
+    state, info = goal_status(toplevel)
     if state == 'tampered':
-        diff = goal_show(store, toplevel)
+        diff = goal_show(toplevel)
         print(diff)
         raise RelayError('目标已被改动，注入已停止；请重新确认目标后再接手')
     return state, info
 
 
 # ---------------------------------------------------------------- CLI
-def _parser():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--root', default='.', help='项目路径（Git 仓库内任意位置），放在子命令之前')
-    p.add_argument('--store-root', default=None,
-                   help='记忆仓根目录（默认 ~/.project-relay；测试用）')
-    sub = p.add_subparsers(dest='command', required=True)
-    sub.add_parser('init')
-    sub.add_parser('migrate-key')
-    sp = sub.add_parser('split')
-    sp.add_argument('--scope', required=True, help='仓内子目录（相对仓根，如 pkg/a）')
-    sp.add_argument('--name', required=True, help='子项目名（作分仓 slug）')
-    w = sub.add_parser('where')
-    w.add_argument('--key')
-    w.add_argument('--path')
-    g = sub.add_parser('goal')
-    gsub = g.add_subparsers(dest='goal_command', required=True)
-    d = gsub.add_parser('draft')
-    d.add_argument('--file', required=True, help='UTF-8 文件：目标草案完整内容')
-    gsub.add_parser('show')
-    c = gsub.add_parser('confirm')
-    c.add_argument('--channel', default='cli')
-    c.add_argument('--tentative', action='store_true')
-    c.add_argument('--imported', action='store_true',
-                   help='一键确认已导入的目标（S4 跨设备确认）')
-    gsub.add_parser('check')
-    gsub.add_parser('inject')
-    gsub.add_parser('decline')
-    gsub.add_parser('status')
-    # --- volume-1 slice 2 (plan part 02, steps 1.6-1.14) -------------------
-    # Implemented in scripts/relay_flow.py; imported lazily in main() to
-    # avoid a relay.py <-> relay_flow.py import cycle (relay_flow loads
-    # relay.py itself through importlib for the foundation helpers).
-    cap = sub.add_parser('capture')
-    cap.add_argument('--tool')
-    cap.add_argument('--session')
-    cap.add_argument('--message')
-    cap.add_argument('--correction', help='纠正标记：本次采集是一次用户纠正，值为被纠正的错误类（卷三 3.2 晋升触发证据）')
-    # --- volume-3 slice 2 (plan part 03, step 3.2: promotion channel) ---
-    pr = sub.add_parser('promote')
-    prsub = pr.add_subparsers(dest='promote_command', required=True)
-    prsub.add_parser('list')
-    prsub.add_parser('refresh')
-    dec = prsub.add_parser('decide')
-    dec.add_argument('--id', required=True)
-    dec.add_argument('--adopt', action='store_true')
-    dec.add_argument('--reject', action='store_true')
-    dec.add_argument('--shelve', action='store_true')
-    dec.add_argument('--reason', help='否决时必填的一句理由，随提议归档')
-    it = prsub.add_parser('intent')
-    it.add_argument('--target', required=True, help='拟写入的正式文件（绝对路径或相对项目根）')
-    it.add_argument('--content', required=True, help='拟写入的原文')
-    it.add_argument('--source-pointer', help='证据指针，如原料条目或会话')
-    it.add_argument('--consequence', help='不采纳的后果（一行）')
-    it.add_argument('--kind', default='rule', choices=['rule', 'preference', 'goal', 'decision'])
-    it.add_argument('--origin', default='rule',
-                    choices=['rule', 'user_words', 'assistant_proposal_accepted'])
-    it.add_argument('--quote', help='目标/偏好类必填：用户原话逐字引用')
-    it.add_argument('--quote-session', help='目标/偏好类必填：原话出处会话')
-    # --- volume-3 slice 3 (plan part 03, step 3.3: fork chain) ---------
-    fk = sub.add_parser('fork')
-    fksub = fk.add_subparsers(dest='fork_command', required=True)
-    fksub.add_parser('list')
-    adj = fksub.add_parser('adjudicate')
-    adj.add_argument('--fork', required=True, help='待裁分叉支 id（如 br-xxxxxxxxxxxx）')
-    adj.add_argument('--winner', required=True, choices=['branch', 'main'],
-                     help='裁定哪支属实：branch（支）或 main（主支）')
-    adj.add_argument('--note', default='', help='裁定理由（一句）')
-    flg = fksub.add_parser('flag-goal')
-    flg.add_argument('--reason', required=True, help='目标分叉事由')
-    sub.add_parser('queue')
-    enf = sub.add_parser('enforce')
-    enf.add_argument('--tool')
-    enf.add_argument('--session')
-    hk = sub.add_parser('hook')
-    hksub = hk.add_subparsers(dest='hook_command', required=True)
-    hksub.add_parser('resume')
-    hksub.add_parser('stop')
-    r = sub.add_parser('recipe')
-    rsub = r.add_subparsers(dest='recipe_command', required=True)
-    ri = rsub.add_parser('install')
-    ri.add_argument('--tool', required=True, choices=['claude-code', 'codebuddy', 'workbuddy', 'codex'])
-    ri.add_argument('--target-root')
-    ri.add_argument('--home')
-    ru = rsub.add_parser('uninstall')
-    ru.add_argument('--tool', required=True, choices=['claude-code', 'codebuddy', 'workbuddy', 'codex'])
-    ru.add_argument('--target-root')
-    ru.add_argument('--home')
-    rp = rsub.add_parser('package')
-    rp.add_argument('--tool', required=True, choices=['workbuddy'])
-    rp.add_argument('--out')
-    sub.add_parser('precompress')
-    sub.add_parser('fingerprint')
-    sc = sub.add_parser('scales')
-    sc.add_argument('--session')
-    su = sub.add_parser('summarize')
-    su.add_argument('--source', default='scales')
-    su.add_argument('--semantic-file')
-    su.add_argument('--session')
-    su.add_argument('--trigger', choices=['milestone', 'volume', 'time',
-                                          'handoff', 'manual', 'pack'])
-    su.add_argument('--llm-usage', help='JSON：{"calls":n,"input_tokens":n,'
-                                        '"output_tokens":n}，有则记为实测')
-    sub.add_parser('recover')
-    sub.add_parser('handoff')
-    inj = sub.add_parser('inject')
-    inj.add_argument('--budget', type=int)
-    res = sub.add_parser('resume')
-    res.add_argument('--tool')
-    # --- volume-1 slice 3 (plan part 02, steps 1.15-1.16) -------------------
-    # Implemented in scripts/relay_backfill.py / scripts/relay_accept.py.
-    bf = sub.add_parser('backfill')
-    bf.add_argument('--log-root')
-    bf.add_argument('--tool', action='append')
-    bf.add_argument('--tier', default='metadata', choices=['metadata', 'excerpt'])
-    bf.add_argument('--deep', action='store_true')
-    bf.add_argument('--summarize', action='store_true')
-    bf.add_argument('--session-limit', type=int, default=5)
-    ac = sub.add_parser('accept')
-    ac.add_argument('--log-root')
-    ac.add_argument('--workdir')
-    ac.add_argument('--keep-dir', action='store_true')
-    # --- volume-2 slice 1 (plan part 03, steps 2.1-2.2) --------------------
-    # Implemented in scripts/relay_sync.py; imported lazily in main() like
-    # relay_flow/relay_backfill. The sync branch wraps its own errors
-    # because relay_sync's RelayError class is not this module's.
-    # Slice 2 (2.3-2.5) adds --carrier overrides and folder/server setup;
-    # the carrier default is inferred (remote -> git, folder -> folder,
-    # server-url -> server) so old invocations keep working.
-    pk = sub.add_parser('pack')
-    pk.add_argument('--remote')
-    pk.add_argument('--device-name')
-    pk.add_argument('--carrier', choices=['git', 'folder', 'server'])
-    pk.add_argument('--overwrite-unconsumed', action='store_true',
-                    help='覆盖上一份未在任何设备还原的 WIP 快照（2.6 显式确认）')
-    pk.add_argument('--trust-unsigned', action='store_true',
-                    help='放行无签名的 Git 包（B1 兜底，需明示；收据留痕）')
-    pk.add_argument('--repin', action='store_true',
-                    help='接受 Git 包签名公钥变更并重新钉死（B1，需明示；收据留痕）')
-    un = sub.add_parser('unpack')
-    un.add_argument('--remote')
-    un.add_argument('--confirm', action='store_true')
-    un.add_argument('--project', action='append', dest='projects')
-    un.add_argument('--carrier', choices=['git', 'folder', 'server'])
-    un.add_argument('--trust-unsigned', action='store_true',
-                    help='放行无签名的 Git 包（B1 兜底，需明示；收据留痕）')
-    un.add_argument('--repin', action='store_true',
-                    help='接受 Git 包签名公钥变更并重新钉死（B1，需明示；收据留痕）')
-    # --- volume-3 slice 5 (batch 7: manual folder carrier) ---------------
-    # Zip export/import: the same 2.1 bundle as the three carriers,
-    # carried by hand (export -> zip -> copy -> unzip -> import). No
-    # sync-setup required: device identity falls back to the hostname.
-    ez = sub.add_parser('export-zip')
-    ez.add_argument('--zip', required=True)
-    ez.add_argument('--strict', action='store_true',
-                    help='导出质量缺口为阻断级时直接失败，不产出包')
-    iz = sub.add_parser('import-zip')
-    iz.add_argument('--zip', required=True)
-    iz.add_argument('--confirm', action='store_true')
-    ss = sub.add_parser('sync-setup')
-    ss.add_argument('--remote')
-    ss.add_argument('--device-name')
-    ss.add_argument('--carrier', choices=['git', 'folder', 'server'])
-    ss.add_argument('--folder')
-    ss.add_argument('--server-type', choices=['webdav', 'sftp', 'https', 'local'])
-    ss.add_argument('--server-url')
-    ss.add_argument('--server-user')
-    ss.add_argument('--server-token')
-    sc = sub.add_parser('sync-claim')
-    sc.add_argument('--key', required=True)
-    sc.add_argument('--confirm', action='store_true')
-    rb = sub.add_parser('sync-rollback')
-    rb.add_argument('--to')
-    rb.add_argument('--bundle')
-    rb.add_argument('--reason', default='')
-    sub.add_parser('sync-status')
-    # --- volume-2 slice 3 (plan part 03, steps 2.6-2.7) -------------------
-    sr = sub.add_parser('sync-resolve')
-    sr.add_argument('--list', action='store_true')
-    sr.add_argument('--goal', action='store_true')
-    sr.add_argument('--fork')
-    sr.add_argument('--backlog')
-    sr.add_argument('--decision', choices=['keep-local', 'adopt-incoming'])
-    sr.add_argument('--file')
-    sub.add_parser('sync-accept')
-    # --- volume-3 slice 4 (plan part 03, step 3.4) ------------------------
-    # Cost stats: local-only report, tuning, and fuse controls.
-    st = sub.add_parser('stats')
-    st.add_argument('--weeks', type=int, default=4)
-    st.add_argument('--tune-knob', choices=['volume_files', 'volume_lines',
-                                            'time_days', 'inject_budget',
-                                            'precompress_sample_cap'])
-    st.add_argument('--tune-value', type=int)
-    st.add_argument('--tune-note', default='')
-    st.add_argument('--eval-tune', action='store_true')
-    st.add_argument('--clear-fuse', action='store_true')
-    return p
-
-
-def _store_from_args(a):
-    return Path(a.store_root).expanduser() if a.store_root else default_store()
-
 
 def _session_from_stdin():
     """Session id from a hook payload on stdin (Codex PR #5 finding 4).
@@ -1180,7 +871,6 @@ def _session_from_stdin():
         sid = data.get('session_id') or data.get('sessionId') or data.get('session')
         return sid if isinstance(sid, str) and sid.strip() else None
     return None
-
 
 def _print_sync_project(entry):
     """One line per imported project plus its conflicts/discards."""
@@ -1214,113 +904,148 @@ def _print_sync_project(entry):
         print('  注：' + note)
 
 
-def _print_sync_report(rep):
-    if 'report' not in rep:
-        print('项目 %s：跳过（%s）' % (rep['key'], rep.get('note')))
-        return
-    for entry in rep['report']['projects']:
-        _print_sync_project(entry)
-    # Batch 2, B1: git signature verification travels in the report so
-    # a TOFU pin, a repin, or a --trust-unsigned acceptance is visible
-    # in the CLI output, not only in the receipt file.
-    verification = rep['report'].get('signature_verification')
-    if verification:
-        print('  签收：%s（设备 %s，密钥 %s）%s'
-              % (verification.get('status'), verification.get('device_id'),
-                 verification.get('key_id'),
-                 '：' + verification['note'] if verification.get('note') else ''))
+# ---------------------------------------------------------------- CLI
 
 
-def _stats_body(a, stats, store_dir):
-    """`relay stats` subcommands (plan part 03, step 3.4). Kept out of
-    main() so the stats module's own RelayError can be converted by
-    the caller (it loads a separate relay copy; see the stats branch)."""
-    if a.tune_knob is not None:
-        if a.tune_value is None:
-            raise RelayError('调优须同时给 --tune-value')
-        row = stats.apply_tuning(store_dir, a.tune_knob,
-                                 a.tune_value, note=a.tune_note or '')
-        print('调优：%s %s → %s（前两周接手均值 %s tokens，%d 次）'
-              % (row['knob'], row['old'], row['new'],
-                 row['before_mean'], row['before_n']))
-    elif a.eval_tune:
-        res = stats.evaluate_tuning(store_dir)
-        if not res.get('evaluated'):
-            print('评估：' + res.get('reason', ''))
-        else:
-            print('评估：%s %s → %s，前均值 %s，后均值 %s，%s'
-                  % (res['knob'], res['old'], res['new'],
-                     res['before_mean'], res['after_mean'],
-                     '有改善' if res['improved'] else '无改善'))
-            if res.get('rolled_back'):
-                print('已回退到稳定值 %s，结论写进教训 %s'
-                      % (res['stable'], res['lesson']))
-    elif a.clear_fuse:
-        stats.clear_fuse(store_dir)
-        print('保险丝已人工清除（下次评估若仍满足飙升条件会重新触发）。')
-    else:
-        print(stats.render_report(stats.build_report(store_dir,
-                                                     weeks=a.weeks)))
+# ---------------------------------------------------------------- CLI
+def _parser():
+    p = argparse.ArgumentParser(prog='relay', description='项目根目录下的共享记忆，分 Agent 存放（v3）')
+    p.add_argument('--root', default='.', help='项目根目录（默认当前目录）')
+    p.add_argument('--version', action='version', version='relay 3.0.0')
+    sub = p.add_subparsers(dest='command', required=True)
+    sub.add_parser('init')
+    sub.add_parser('agents')
+    g = sub.add_parser('goal')
+    gsub = g.add_subparsers(dest='goal_command', required=True)
+    d = gsub.add_parser('draft')
+    d.add_argument('--file', required=True, help='UTF-8 文件：目标草案完整内容')
+    gsub.add_parser('show')
+    c = gsub.add_parser('confirm')
+    c.add_argument('--channel', default='cli')
+    c.add_argument('--tentative', action='store_true')
+    c.add_argument('--imported', action='store_true',
+                   help='一键确认已导入的目标（跨设备确认）')
+    gsub.add_parser('check')
+    gsub.add_parser('inject')
+    gsub.add_parser('decline')
+    gsub.add_parser('status')
+    ag = sub.add_parser('agent-goal')
+    ag.add_argument('--agent', required=True, help='Agent 名，如 codex')
+    ag.add_argument('--set', help='写入该家目标全文（不给则只显示）')
+    ag.add_argument('--file', help='从 UTF-8 文件读该家目标全文写入')
+    # Implemented in scripts/relay_flow.py; imported lazily in main() to
+    # avoid a relay.py <-> relay_flow.py import cycle (relay_flow loads
+    # relay.py itself through importlib for the foundation helpers).
+    cap = sub.add_parser('capture')
+    cap.add_argument('--agent', required=True, help='采集进哪家目录，如 codex')
+    cap.add_argument('--session')
+    cap.add_argument('--message')
+    q = sub.add_parser('queue')
+    q.add_argument('--agent', help='只看某家，不给则看全部')
+    enf = sub.add_parser('enforce')
+    enf.add_argument('--agent', required=True)
+    enf.add_argument('--session')
+    hk = sub.add_parser('hook')
+    hksub = hk.add_subparsers(dest='hook_command', required=True)
+    hksub.add_parser('resume')
+    hksub.add_parser('stop')
+    r = sub.add_parser('recipe')
+    rsub = r.add_subparsers(dest='recipe_command', required=True)
+    ri = rsub.add_parser('install')
+    ri.add_argument('--tool', required=True,
+                    choices=['claude-code', 'codex', 'workbuddy'])
+    ri.add_argument('--target-root')
+    ri.add_argument('--home')
+    ru = rsub.add_parser('uninstall')
+    ru.add_argument('--tool', required=True,
+                    choices=['claude-code', 'codex', 'workbuddy'])
+    ru.add_argument('--target-root')
+    ru.add_argument('--home')
+    rp = rsub.add_parser('package')
+    rp.add_argument('--tool', required=True, choices=['workbuddy'])
+    rp.add_argument('--out')
+    pc = sub.add_parser('precompress')
+    pc.add_argument('--agent', required=True)
+    fp = sub.add_parser('fingerprint')
+    fp.add_argument('--agent', required=True)
+    sc = sub.add_parser('scales')
+    sc.add_argument('--agent', required=True)
+    sc.add_argument('--session')
+    su = sub.add_parser('summarize')
+    su.add_argument('--agent', required=True, help='汇总哪家目录，如 codex')
+    su.add_argument('--source', default='scales')
+    su.add_argument('--semantic-file')
+    su.add_argument('--session')
+    su.add_argument('--trigger', choices=['milestone', 'volume', 'time',
+                                          'handoff', 'manual'])
+    su.add_argument('--llm-usage', help='JSON：{"calls":n,"input_tokens":n,'
+                                        '"output_tokens":n}，有则记为实测')
+    rc = sub.add_parser('recover')
+    rc.add_argument('--agent', required=True)
+    inj = sub.add_parser('inject')
+    inj.add_argument('--budget', type=int)
+    inj.add_argument('--agent', help='同时带上某家的待办与决定，不给则只用外层')
+    sub.add_parser('resume')
+    # Implemented in scripts/relay_sync.py; imported lazily in main() like
+    # relay_flow. The sync branch wraps its own errors (belt and braces);
+    # its RelayError is the same class main() catches, since the sibling
+    # modules share one process-wide relay copy.
+    ez = sub.add_parser('export-zip')
+    ez.add_argument('--zip', required=True)
+    ez.add_argument('--strict', action='store_true',
+                    help='导出质量缺口为阻断级时直接失败，不产出包')
+    iz = sub.add_parser('import-zip')
+    iz.add_argument('--zip', required=True)
+    iz.add_argument('--confirm', action='store_true')
+    sr = sub.add_parser('sync-resolve')
+    sr.add_argument('--list', action='store_true')
+    sr.add_argument('--goal', action='store_true')
+    sr.add_argument('--fork')
+    sr.add_argument('--agent',
+                    help='分叉 key 在多家 memory.md 里都有时，指定裁哪一家')
+    sr.add_argument('--backlog')
+    sr.add_argument('--decision', choices=['keep-local', 'adopt-incoming'])
+    sr.add_argument('--file')
+    st = sub.add_parser('stack')
+    st.add_argument('--set', help='写入技术栈全文（不给则只显示）')
+    st.add_argument('--file', help='从 UTF-8 文件读技术栈全文写入')
+    ou = sub.add_parser('outlook')
+    ou.add_argument('--set', help='写入未来预期全文（不给则只显示）')
+    ou.add_argument('--file', help='从 UTF-8 文件读未来预期全文写入')
+    lg = sub.add_parser('log')
+    lg.add_argument('--agent', required=True, help='Agent 名，如 codex')
+    lg.add_argument('--append', help='追加一条日志（正文）')
+    lg.add_argument('--limit', type=int, default=20)
+    return p
 
 
 def main(argv=None):
     a = _parser().parse_args(argv)
     try:
-        store = _store_from_args(a)
         if a.command == 'init':
-            result = init(store, a.root)
+            result = init(a.root)
             print('记忆仓：' + str(result['store_dir']))
-            print('项目键：' + result['key'])
+            print('档案默认不进 git（已写 .gitignore 兜底）' if result['gitignored']
+                  else '档案已在 .gitignore 里')
             print('下一步：用 goal draft 提交目标草案，再用 goal show 查看 diff、goal confirm 确认')
-            for note in result['notes']:
-                print('注：' + note)
-            for line in result['preview']:
-                print(line)
-        elif a.command == 'migrate-key':
-            result = migrate_key(store, a.root)
-            print('身份迁移完成：%s -> %s（remote %s）'
-                  % (result['old_key'], result['new_key'], result['remote']))
-            for note in result['notes']:
-                print('注：' + note)
-        elif a.command == 'split':
-            result = split_archive(store, a.root, a.scope, a.name)
-            print('拆分完成：父键 %s，子键 %s（%s），范围 %s'
-                  % (result['parent_key'], result['child_key'], result['slug'],
-                     result['scope']))
-            print('拆分点：%s' % result['split_summary_id'])
-            print('子仓：' + str(result['child_dir']))
-            print('注：子仓首个汇总的 based_on 指向拆分点；按路径寻址仍返回父行，'
-                  '子仓请按项目键寻址（relay where --key %s）' % result['child_key'])
-        elif a.command == 'where':
-            result = where(store, path=a.path or a.root, key=a.key)
-            if result['found']:
-                row = result['row']
-                print('项目键：' + row['key'])
-                print('显示名：' + row['display_name'])
-                print('键类型：' + row['key_type'])
-                print('remote：' + str(row.get('remote')))
-                print('已知路径：')
-                for path in row.get('paths', []):
-                    print('  ' + path)
-                print('来源：' + result['note'])
-            else:
-                print('未找到：' + result['note'])
-                if result.get('key'):
-                    print('项目键：' + result['key'])
+        elif a.command == 'agents':
+            store_dir = resolve_store_dir(a.root)
+            print((store_dir / 'index.md').read_text(encoding='utf-8')
+                  if (store_dir / 'index.md').exists() else '（无指路表，先 relay init）')
         elif a.command == 'goal':
             root = a.root
             if a.goal_command == 'draft':
                 content = Path(a.file).read_text(encoding='utf-8')
-                info = goal_draft(store, root, content)
+                info = goal_draft(root, content)
                 print('目标草案已暂存，内容 SHA256：' + info['hash'])
             elif a.goal_command == 'show':
-                print(goal_show(store, root))
+                print(goal_show(root))
             elif a.goal_command == 'confirm':
                 if a.imported:
-                    info = _confirm_imported(store, root)
+                    info = _confirm_imported(root)
                     print('导入目标已在本机确认，收据：goal-%04d.json' % info['receipt']['seq'])
                     return 0
-                info = goal_confirm(store, root, channel=a.channel, tentative=a.tentative)
+                info = goal_confirm(root, channel=a.channel, tentative=a.tentative)
                 if info.get('already'):
                     print('目标已确认，无需重复确认')
                 elif info.get('tentative'):
@@ -1328,15 +1053,15 @@ def main(argv=None):
                 else:
                     print('目标已确认，收据：goal-%04d.json' % info['receipt']['seq'])
             elif a.goal_command == 'check':
-                state, _info = goal_check(store, root)
+                state, _info = goal_check(root)
                 print('PASS：目标状态 ' + state + '，可注入')
             elif a.goal_command == 'inject':
-                print(goal_inject(store, root))
+                print(goal_inject(root))
             elif a.goal_command == 'decline':
-                goal_decline(store, root)
+                goal_decline(root)
                 print('已记录：用户决定不建目标档案')
             elif a.goal_command == 'status':
-                state, info = goal_status(store, root)
+                state, info = goal_status(root)
                 print('目标状态：' + state)
                 if info.get('receipt'):
                     print('最新收据：goal-%04d.json，目标哈希 %s'
@@ -1345,161 +1070,31 @@ def main(argv=None):
                     print('暂定记录：' + str(info['tentative'].get('adopted_at')))
                 if info.get('note'):
                     print('注：' + info['note'])
-        elif a.command == 'backfill':
-            _bspec = importlib.util.spec_from_file_location(
-                'relay_backfill', Path(__file__).resolve().parent / 'relay_backfill.py')
-            backfill_mod = importlib.util.module_from_spec(_bspec)
-            _bspec.loader.exec_module(backfill_mod)
-            report = backfill_mod.backfill(
-                store, a.root, home=a.log_root, tools=a.tool, tier=a.tier,
-                deep=a.deep, session_limit=a.session_limit,
-                summarize_after=a.summarize)
-            print('回溯层级：%s（深扒：%s）' % (report['tier'], report['deep']))
-            for tool, info in report['tools'].items():
-                print('%s：发现 %d 个会话，匹配 %d 个'
-                      % (tool, info['found'], info['matched']))
-            print('新建回溯条目：%s  已回溯过（跳过）：%s  暂缓深扒：%d 个会话'
-                  % (report['entries_created'], report['already_backfilled'],
-                     len(report['deferred'])))
-            if report['summary_seq'] is not None:
-                print('建档汇总序号：%d，保真度声明：%s'
-                      % (report['summary_seq'], report['fidelity_doc']))
-            for w in report['fidelity'].get('warnings', []):
-                print('保真警告：' + w)
-            for gap in report['gaps']:
-                print('缺料[%s·影响%s] %s' % (gap['category'], gap['impact'], gap['item']))
-        elif a.command == 'accept':
-            _aspec = importlib.util.spec_from_file_location(
-                'relay_accept', Path(__file__).resolve().parent / 'relay_accept.py')
-            accept_mod = importlib.util.module_from_spec(_aspec)
-            _aspec.loader.exec_module(accept_mod)
-            # Acceptance isolation (regression: accept used to inherit the
-            # persistent default store, so fixture projects keyed by their
-            # fixed remote URLs collided across runs and the second run
-            # measured the first run's leftovers instead of its own acts).
-            # Default: a fresh throwaway store, like workdir/log_home.
-            # An explicit --store-root is still honored for debugging.
-            if a.store_root is None:
-                store = Path(tempfile.mkdtemp(prefix='relay-accept-store-'))
-            record = accept_mod.run_acceptance(
-                store, workdir=a.workdir, log_home=a.log_root,
-                keep_dir=a.keep_dir)
-            print(accept_mod.render_record(record))
-            if record['verdict'] != 'PASS':
-                return 1
-        elif a.command in ('pack', 'unpack', 'sync-setup', 'sync-claim',
-                           'sync-rollback', 'sync-status', 'sync-resolve',
-                           'sync-accept', 'export-zip', 'import-zip'):
-            # relay_sync's RelayError is a different class from this
-            # module's (importlib double-load), so the sync branch wraps
-            # its own errors instead of relying on main()'s except.
+        elif a.command == 'agent-goal':
+            store_dir = resolve_store_dir(a.root)
+            ensure_agent_dir(store_dir, a.agent)
+            text = getattr(a, 'set')
+            if a.file:
+                text = Path(a.file).read_text(encoding='utf-8')
+            if text is None:
+                current = read_agent_goal(store_dir, a.agent)
+                print(current if current else '（空）')
+            else:
+                with agent_lock(store_dir, a.agent):
+                    write_agent_goal(store_dir, a.agent, text)
+                print('%s 的目标已写入（已记当前总目标哈希备查）' % a.agent)
+        elif a.command in ('export-zip', 'import-zip', 'sync-resolve'):
+            # The sync branch wraps its own errors (belt and braces):
+            # its RelayError is the same class main() catches, since the
+            # sibling modules share one process-wide relay copy -- but
+            # export/import must never leak a traceback either way.
             try:
                 _sspec = importlib.util.spec_from_file_location(
                     'relay_sync', Path(__file__).resolve().parent / 'relay_sync.py')
                 sync = importlib.util.module_from_spec(_sspec)
                 _sspec.loader.exec_module(sync)
-                if a.command == 'pack':
-                    result = sync.pack(store, a.root, remote=a.remote,
-                                       device_name=a.device_name,
-                                       carrier=a.carrier,
-                                       overwrite_unconsumed=a.overwrite_unconsumed,
-                                       trust_unsigned=a.trust_unsigned,
-                                       repin=a.repin)
-                    rec = result['receipt']
-                    if rec['carrier'] == 'folder':
-                        print('pack 完成（文件夹载体，无包序列号）')
-                    elif rec['carrier'] == 'server':
-                        print('pack 完成：序列号 %d，服务器 %s'
-                              % (rec['seq'], rec.get('server_url')))
-                    else:
-                        print('pack 完成：序列号 %d，提交 %s' % (rec['seq'], rec['commit']))
-                    print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
-                          % (rec['entry_count'], rec['file_count'], rec['redacted_count']))
-                    print('回执：' + result['receipt_path'])
-                    for step in rec['steps']:
-                        print('步骤 %s：%s' % (step['step'], step['status']))
-                    # Batch 2, B1: surface the step-0 pull-merge signature
-                    # verification (TOFU pin / repin / trust-unsigned)
-                    # in pack output too, not only in the receipt.
-                    pull_report = None
-                    if rec['steps'] and isinstance(rec['steps'][0], dict):
-                        pull_report = rec['steps'][0].get('report')
-                    if isinstance(pull_report, dict):
-                        ver = pull_report.get('signature_verification')
-                        if ver:
-                            print('拉取合并签收：%s（设备 %s，密钥 %s）'
-                                  % (ver.get('status'), ver.get('device_id'),
-                                     ver.get('key_id')))
-                    wip = rec.get('wip') or {}
-                    if wip.get('status') == 'created':
-                        print('未提交改动快照已推送：%s，文件 %d 个'
-                              % (wip['sha'][:12], len(wip.get('changed_files') or [])))
-                        if wip.get('ignored_recent'):
-                            print('被忽略且近 7 天改过、未进快照：%s'
-                                  % '、'.join(wip['ignored_recent']))
-                        if wip.get('overwritten_unconsumed'):
-                            print('注：已覆盖上一份未还原的快照')
-                    elif wip.get('status') == 'skipped':
-                        print('快照未推送：' + wip.get('reason', ''))
-                    # Volume 3, 3.6.3: pack-time migration prompt (never auto).
-                    prompt = result.get('key_migration_prompt')
-                    if prompt:
-                        print('身份迁移待确认：本项目当前为弱身份键 %s，检测到 remote %s，'
-                              '可迁移至 %s；迁移请运行 relay migrate-key'
-                              '（分仓目录改名 + 索引更新，全程留痕），本次 pack 仍用弱身份键，未自动迁移'
-                              % (prompt['old_key'], prompt['remote'], prompt['new_key']))
-                elif a.command == 'unpack':
-                    try:
-                        _top = git_toplevel(a.root)
-                    except Exception:
-                        _top = None
-                    result = sync.unpack(store, remote=a.remote, confirm=a.confirm,
-                                         project_keys=a.projects,
-                                         carrier=a.carrier, toplevel=_top,
-                                         trust_unsigned=a.trust_unsigned,
-                                         repin=a.repin)
-                    if not result.get('landed'):
-                        if result.get('note'):
-                            print(result['note'])
-                        else:
-                            print('干跑预览（未写入任何内容）：')
-                        for rep in result.get('reports', []):
-                            _print_sync_report(rep)
-                    else:
-                        if result.get('carrier') == 'folder':
-                            print('文件夹载体对账完成')
-                            found = result.get('conflicts', {}).get('found') or []
-                            if found:
-                                print('发现 %d 个同步冲突副本，已隔离，未自动合并'
-                                      % len(found))
-                        elif result.get('carrier') == 'server':
-                            print('unpack 已落盘（服务器载体）')
-                        else:
-                            print('unpack 已落盘并提交：%s' % result['commit'])
-                        for rep in result.get('reports', []):
-                            _print_sync_report(rep)
-                        for note in result.get('reconcile', []):
-                            print('对账 %s：目标状态 %s，pending %s，分支 %s'
-                                  % (note['slug'], note.get('goal_status'),
-                                     note.get('pending'), note.get('branch')))
-                        if result.get('ready'):
-                            print('接力就绪')
-                        else:
-                            for problem in result.get('ready_problems', []):
-                                print('对账差异：' + problem)
-                        for rest in result.get('wip_restores', []):
-                            if rest.get('status') == 'restored':
-                                print('未提交改动已还原为未暂存改动：快照 %s'
-                                      % rest['sha'][:12])
-                            elif rest.get('status') == 'refused-dirty':
-                                print('快照未还原：本机工作区不干净，你的改动无损；'
-                                      '请先提交或清理后再 unpack')
-                            elif rest.get('status') not in ('none', 'already-consumed'):
-                                print('快照还原：%s' % rest.get('status'))
-                        print('回执：' + result['receipt_path'])
-                elif a.command == 'export-zip':
-                    result = sync.export_zip(store, a.root, a.zip,
-                                             strict=a.strict)
+                if a.command == 'export-zip':
+                    result = sync.export_zip(a.root, a.zip, strict=a.strict)
                     print('导出完成：%s' % result['zip'])
                     print('条目 %d 个，文件 %d 个，脱敏命中 %d 次'
                           % (result['entry_count'], result['file_count'],
@@ -1512,7 +1107,7 @@ def main(argv=None):
                             print('  [%s] %s'
                                   % (gap.get('severity'), gap.get('message')))
                 elif a.command == 'import-zip':
-                    result = sync.import_zip(store, a.zip, confirm=a.confirm)
+                    result = sync.import_zip(a.root, a.zip, confirm=a.confirm)
                     if not result['landed']:
                         print('干跑预览（未写入任何内容）：')
                     else:
@@ -1521,107 +1116,9 @@ def main(argv=None):
                         _print_sync_project(entry)
                         if entry.get('repaired'):
                             print('  修复：' + '、'.join(entry['repaired']))
-                elif a.command == 'sync-setup':
-                    carrier = a.carrier
-                    if a.folder and not a.store_root:
-                        store = Path(a.folder).expanduser()
-                    if carrier is None:
-                        if a.server_url:
-                            carrier = 'server'
-                        elif a.folder:
-                            carrier = 'folder'
-                        elif a.remote:
-                            carrier = 'git'
-                        else:
-                            raise Exception(
-                                'sync-setup 需要指定载体：git 用 --remote，'
-                                'folder 用 --folder，server 用 --server-url')
-                    if carrier == 'folder':
-                        result = sync.sync_setup_folder(
-                            store, device_name=a.device_name)
-                        print('同步配置已写入：设备 %s（%s），文件夹 %s'
-                              % (result['config']['device_name'],
-                                 result['config']['device_id'], result['store']))
-                        for note in result['notes']:
-                            print('注：' + note)
-                    elif carrier == 'server':
-                        if not a.server_url:
-                            raise Exception('server 载体需要 --server-url')
-                        stype = a.server_type
-                        if stype is None:
-                            if a.server_url.startswith('local:'):
-                                stype = 'local'
-                            else:
-                                raise Exception(
-                                    'server 载体需要 --server-type'
-                                    '（webdav/sftp/https/local）')
-                        token = a.server_token or os.environ.get('RELAY_SERVER_TOKEN')
-                        result = sync.sync_setup_server(
-                            store, stype, a.server_url,
-                            server_user=a.server_user, token=token,
-                            device_name=a.device_name)
-                        print('同步配置已写入：设备 %s（%s），服务器 %s %s'
-                              % (result['config']['device_name'],
-                                 result['config']['device_id'], stype,
-                                 a.server_url))
-                        for note in result['notes']:
-                            print('注：' + note)
-                    else:
-                        if not a.remote:
-                            raise Exception('git 载体需要 --remote')
-                        result = sync.sync_setup(store, a.remote, device_name=a.device_name)
-                        print('同步配置已写入：设备 %s（%s），远端 %s'
-                              % (result['config']['device_name'],
-                                 result['config']['device_id'], a.remote))
-                        for claim in result['claims']:
-                            if claim['status'] == 'matched':
-                                print('可认领：%s ↔ 本机项目 %s'
-                                      % (claim['slug'], claim['local_display']))
-                            else:
-                                print('待认领区：%s（本机无对应项目）' % claim['slug'])
-                        for note in result['notes']:
-                            print('注：' + note)
-                elif a.command == 'sync-claim':
-                    result = sync.sync_claim(store, a.key, a.root, confirm=a.confirm)
-                    if not result['landed']:
-                        print('干跑预览（未写入任何内容）：')
-                    _print_sync_project(result['report'])
-                    if result['landed']:
-                        print('认领完成，合并日志：' + result['report']['merge_log'])
-                elif a.command == 'sync-rollback':
-                    result = sync.sync_rollback(store, a.root, ref=a.to,
-                                                reason=a.reason, bundle=a.bundle)
-                    if result['commit'] is None:
-                        print('已回退（无提交载体），恢复文件 %d 个'
-                              % result['files_restored'])
-                    else:
-                        print('已回退到 %s，恢复文件 %d 个，提交 %s'
-                              % (a.to, result['files_restored'], result['commit']))
-                    print('回退前内容备份于：' + result['backup_dir'])
-                    if result.get('trash_dir'):
-                        print('被替换的旧文件已归档到：' + result['trash_dir'])
-                elif a.command == 'sync-status':
-                    for row in sync.sync_status(store, a.root):
-                        if row.get('conflicts_found'):
-                            print('发现 %d 个同步冲突副本，已隔离，未自动合并'
-                                  % len(row['conflicts_found']))
-                        carrier = row.get('carrier') or '—'
-                        if not row['packed']:
-                            print('%s：未 pack 过，当前原料 %d 条、汇总 %d 个，载体 %s'
-                                  % (row['slug'], row['current_entries'],
-                                     row['current_summaries'], carrier))
-                        else:
-                            seq = row['last_pack_seq'] \
-                                if row['last_pack_seq'] is not None else '—'
-                            commit = row['last_pack_commit'] or '—'
-                            print('%s：上次 pack %s（seq %s，提交 %s），'
-                                  '自 pack 后新增汇总 %s 个、新原料 %d 条，载体 %s'
-                                  % (row['slug'], row['last_pack_at'], seq,
-                                     commit, row['new_summaries_since_pack'],
-                                     row['new_entries_since_pack'], carrier))
                 elif a.command == 'sync-resolve':
                     if a.list:
-                        result = sync.sync_resolve(store, a.root, list_only=True)
+                        result = sync.sync_resolve(a.root, list_only=True)
                         if not result['pending']:
                             print('无待裁项')
                         for item in result['pending']:
@@ -1638,82 +1135,55 @@ def main(argv=None):
                                          item.get('incoming')))
                     else:
                         result = sync.sync_resolve(
-                            store, a.root, goal=a.goal or None,
+                            a.root, goal=a.goal or None,
                             fork=a.fork, backlog=a.backlog,
-                            decision=a.decision, file=a.file)
+                            decision=a.decision, file=a.file,
+                            agent=a.agent)
                         for action in result['actions']:
                             print(action)
-                elif a.command == 'sync-accept':
-                    record = sync.run_sync_acceptance()
-                    print(sync.render_sync_record(record))
-                    if record['verdict'] != 'PASS':
-                        return 1
             except Exception as exc:
                 print('ERROR: ' + str(exc), file=sys.stderr)
                 return 1
-        elif a.command == 'promote':
-            _pspec = importlib.util.spec_from_file_location(
-                'relay_promote', Path(__file__).resolve().parent / 'relay_promote.py')
-            promote = importlib.util.module_from_spec(_pspec)
-            _pspec.loader.exec_module(promote)
-            _row, store_dir = resolve_store_dir(store, a.root)
-            if a.promote_command == 'list':
-                print(promote.render_section(store_dir))
-            elif a.promote_command == 'refresh':
-                result = promote.refresh(store_dir, a.root)
-                print('过期：%s；新提议：%s' % (result['expired'], result['proposed']))
-            elif a.promote_command == 'decide':
-                actions = [x for x in ('adopt', 'reject', 'shelve') if getattr(a, x)]
-                if len(actions) != 1:
-                    print('ERROR: decide 必须且只能选 --adopt/--reject/--shelve 其中之一',
-                          file=sys.stderr)
-                    return 1
-                result = promote.decide(store_dir, a.id, actions[0], reason=a.reason)
-                verb = {'adopted': '采纳', 'rejected': '否决', 'shelved': '搁置'}[result['action']]
-                print('提议 %s 已%s' % (result['id'], verb))
-                if result['action'] == 'adopted':
-                    print('写入：%s（决策记录 %s）' % (result['target'], result['decision']))
-                if result['action'] == 'shelved':
-                    print('搁置到期：%s' % result['shelved_until'])
-            elif a.promote_command == 'intent':
-                result = promote.record_formal_intent(
-                    store_dir, a.root, a.target, a.content,
-                    source_pointer=a.source_pointer, consequence=a.consequence,
-                    content_kind=a.kind, origin=a.origin,
-                    quote=a.quote, quote_session=a.quote_session)
-                prop = result['proposal']
-                if prop['proposed']:
-                    print('晋升提议已生成：%s' % prop['proposed'])
-                else:
-                    print('意向已记录（intent #%d），未生成提议：%s'
-                          % (result['intent_seq'], prop['detail']))
-        elif a.command == 'fork':
-            _fspec = importlib.util.spec_from_file_location(
-                'relay_fork', Path(__file__).resolve().parent / 'relay_fork.py')
-            fork = importlib.util.module_from_spec(_fspec)
-            _fspec.loader.exec_module(fork)
-            _row, store_dir = resolve_store_dir(store, a.root)
-            if a.fork_command == 'list':
-                detection = fork.detect_forks(store_dir, persist=False)
-                print(fork.render_fork_section(store_dir, detection))
-            elif a.fork_command == 'adjudicate':
-                result = fork.adjudicate(store_dir, a.fork, a.winner, a.note)
-                print('分叉 %s 已裁定：%s 胜（%s）'
-                      % (result['fork'], result['winner'], result['note']))
-            elif a.fork_command == 'flag-goal':
-                fork.flag_goal_fork(store_dir, a.reason)
-                print('目标分叉已标记，注入已冻结；请走 S4 重新确认流程。')
+        elif a.command in ('stack', 'outlook'):
+            store_dir = resolve_store_dir(a.root)
+            read_fn = read_stack if a.command == 'stack' else read_outlook
+            write_fn = write_stack if a.command == 'stack' else write_outlook
+            label = '技术栈' if a.command == 'stack' else '未来预期'
+            text = getattr(a, 'set')
+            if a.file:
+                text = Path(a.file).read_text(encoding='utf-8')
+            if text is None:
+                current = read_fn(store_dir)
+                print(current if current else '（空）')
+            else:
+                with outer_lock(store_dir):
+                    write_fn(store_dir, text)
+                print('%s已写入' % label)
+        elif a.command == 'log':
+            store_dir = resolve_store_dir(a.root)
+            if a.append is not None:
+                with agent_lock(store_dir, a.agent):
+                    append_agent_log(store_dir, a.agent, 'note', a.append)
+                print('日志已追加到 agents/%s/log.jsonl' % a.agent)
+            else:
+                rows = read_agent_log(store_dir, a.agent, limit=a.limit)
+                if not rows:
+                    print('（无日志）')
+                for row in rows:
+                    detail = row.get('detail')
+                    print('%s %s%s' % (row.get('at', ''), row.get('event', ''),
+                                       ('：' + str(detail)) if detail is not None else ''))
         elif a.command in ('capture', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
-                           'handoff', 'inject', 'resume'):
+                           'inject', 'resume'):
             _fspec = importlib.util.spec_from_file_location(
                 'relay_flow', Path(__file__).resolve().parent / 'relay_flow.py')
             flow = importlib.util.module_from_spec(_fspec)
             _fspec.loader.exec_module(flow)
             root = a.root
             if a.command == 'capture':
-                info = flow.capture(store, root, tool=a.tool, session=a.session,
-                                    message=a.message, correction_of=a.correction)
+                info = flow.capture(root, agent=a.agent, session=a.session,
+                                    message=a.message)
                 if info.get('deduped'):
                     if a.message is not None:
                         # Batch 2, B4: the dedup key is the repo state
@@ -1727,16 +1197,9 @@ def main(argv=None):
                         print('采集去重：事实未变，返回已有条目 cap-%04d' % info['seq'])
                 else:
                     print('采集条目：cap-%04d（%s）' % (info['seq'], info['path']))
-                    promo = info.get('promotion') or {}
-                    if promo.get('proposed'):
-                        print('晋升提议已生成：%s（见 relay promote list）'
-                              % '、'.join(promo['proposed']))
-                    elif promo.get('error'):
-                        print('晋升检测失败（采集本身已成功）：%s' % promo['error'],
-                              file=sys.stderr)
             elif a.command == 'queue':
-                st = flow.queue_status(flow.relay.resolve_store_dir(store, root)[1],
-                                       repair=False)
+                st = flow.queue_status(flow.relay.resolve_store_dir(root),
+                                       agent=a.agent, repair=False)
                 print('pending：%d  summarized：%d  summarizing：%d'
                       % (st['pending'], st['summarized'], st['summarizing']))
                 print('raw 总量：%s MB  最老 pending：%s  脱敏累计：%d'
@@ -1745,26 +1208,26 @@ def main(argv=None):
                       % (st['stale_summarizing'], st['over_retries']))
             elif a.command == 'enforce':
                 session = a.session or _session_from_stdin()
-                info = flow.enforce(store, root, tool=a.tool, session=session)
+                info = flow.enforce(root, agent=a.agent, session=session)
                 print(info.get('instruction') or ('PASS：' + info['note']))
                 if info['action'] == 'block':
                     return 2
             elif a.command == 'hook':
-                # Project-agnostic entry for the Claude Code plugin hooks
-                # (hooks/hooks.json): the project is the session cwd.
-                # Anything unresolvable fails closed with the skip note.
+                # Project entry for the Claude Code hooks: the project is
+                # the session cwd. Anything unresolvable fails closed
+                # with the skip note.
                 try:
                     hook_root = git_toplevel(a.root)
                 except Exception:
-                    print('当前目录不属于本项目（注册表无此项目），钩子不对账')
+                    print('当前目录不在 Git 仓库里，钩子不对账')
                     return 0
                 if a.hook_command == 'resume':
-                    r = flow.hook_resume(store, hook_root, tool='claude-code')
+                    r = flow.hook_resume(hook_root)
                     print(r['note'] if r.get('skipped') else
                           (r['message'] if r.get('no_archive') else flow.render_resume(r)))
                 else:
                     session = _session_from_stdin()
-                    r = flow.hook_stop(store, hook_root, tool='claude-code', session=session)
+                    r = flow.hook_stop(hook_root, agent='claude-code', session=session)
                     cap, enf = r['capture'], r['enforce']
                     print(cap['note'] if cap.get('skipped') else
                           '采集条目：cap-%04d（%s）' % (cap['seq'], cap.get('path', '')))
@@ -1783,32 +1246,32 @@ def main(argv=None):
                     target = Path(a.target_root).expanduser() if a.target_root else Path.home()
                     if a.recipe_command == 'install':
                         if a.tool == 'claude-code':
-                            info = flow.install_claude(store, root, home_dir=home)
+                            info = flow.install_claude(root, home_dir=home)
                             print('\n'.join(info['notes']))
-                        elif a.tool in ('codebuddy', 'workbuddy'):
-                            info = flow.install_codebuddy(store, root, target, flavor=a.tool)
+                        elif a.tool == 'workbuddy':
+                            info = flow.install_workbuddy(root)
                             print('skill 目录：' + info['skill_dir'])
                             print(info['note'])
                         else:
-                            info = flow.install_codex(store, root)
+                            info = flow.install_codex(root)
                             print(info['note'])
                     else:
                         if a.tool == 'claude-code':
-                            info = flow.uninstall_claude(store, root, home_dir=home)
+                            info = flow.uninstall_claude(root, home_dir=home)
                             print('\n'.join(info['notes']))
-                        elif a.tool in ('codebuddy', 'workbuddy'):
-                            info = flow.uninstall_codebuddy(store, root, flavor=a.tool)
+                        elif a.tool == 'workbuddy':
+                            info = flow.uninstall_workbuddy(root)
                             print('已移除：' + info['removed'])
                         else:
-                            info = flow.uninstall_codex(store, root)
+                            info = flow.uninstall_codex(root)
                             print(info['note'])
             elif a.command == 'precompress':
-                doc = flow.precompress(store, root)
+                doc = flow.precompress(root, agent=a.agent)
                 print('整理稿：条目区间 %s，改动文件 %d 个，失败样本 %d 个'
                       % (doc['entry_range'], len(doc['files_changed']),
                          len(doc['degraded_samples'])))
             elif a.command == 'fingerprint':
-                m = flow.measure_change(store, root)
+                m = flow.measure_change(root, agent=a.agent)
                 c = m['counts']
                 print('新增 %d / 修改 %d / 删除 %d / 改名 %d；行数 +%d/-%d'
                       % (len(c['added']), len(c['modified']), len(c['deleted']),
@@ -1821,12 +1284,12 @@ def main(argv=None):
                          t.get('cache_hits', 0), t.get('cache_misses', 0)))
                 if t.get('exceeded'):
                     print('指纹耗时超过阈值（%.1fs），可配置排除目录：'
-                          'state/config.json 的 fingerprint_excludes，'
+                          '.project-relay/state/config.json 的 fingerprint_excludes，'
                           '排除项写入保真度声明' % t.get('threshold_s', 30.0))
                 for e in m['snapshot'].get('excluded', []):
                     print('已排除：%s' % e)
             elif a.command == 'scales':
-                rec = flow.scales(store, root, session=a.session)
+                rec = flow.scales(root, agent=a.agent, session=a.session)
                 for row in rec['rows']:
                     print('%s：%s，阈值 %s，到线：%s（%s）'
                           % (row['scale'], row['value'], row['threshold'],
@@ -1836,7 +1299,7 @@ def main(argv=None):
                 semantic = (Path(a.semantic_file).read_text(encoding='utf-8')
                             if a.semantic_file else None)
                 usage = json.loads(a.llm_usage) if a.llm_usage else None
-                info = flow.summarize(store, root, source=a.source,
+                info = flow.summarize(root, agent=a.agent, source=a.source,
                                       semantic_text=semantic, session=a.session,
                                       trigger=a.trigger, llm_usage=usage)
                 if info.get('noop'):
@@ -1845,7 +1308,7 @@ def main(argv=None):
                     print('汇总序号：%d，覆盖条目 %s，触发源 %s'
                           % (info['seq'], info['entry_range'], info['source']))
             elif a.command == 'recover':
-                info = flow.recover(store, root)
+                info = flow.recover(root, agent=a.agent)
                 print('已恢复事务：' + info['recovered'])
                 # Batch 2, A2: recover rolls the whole transaction back,
                 # not just the archive files -- print the rolled-back
@@ -1857,34 +1320,16 @@ def main(argv=None):
                          info.get('baseline_summary_seq'),
                          info.get('last_summary_seq'),
                          info.get('entries_reverted_to_pending')))
-            elif a.command == 'handoff':
-                info = flow.make_handoff(store, root)
-                print('交接包：' + info['package'])
             elif a.command == 'inject':
-                info = flow.inject(store, root, budget=a.budget)
+                info = flow.inject(root, budget=a.budget, agent=a.agent)
                 print(info['text'])
                 print('\n[注入 token 粗估：%d / 预算 %d]' % (info['tokens_estimate'], info['budget']))
             elif a.command == 'resume':
-                result = flow.resume(store, root, tool=a.tool)
+                result = flow.resume(root)
                 if result.get('no_archive'):
                     print(result['message'])
                 else:
                     print(flow.render_resume(result))
-        elif a.command == 'stats':
-            _sspec = importlib.util.spec_from_file_location(
-                'relay_stats', Path(__file__).resolve().parent / 'relay_stats.py')
-            stats = importlib.util.module_from_spec(_sspec)
-            _sspec.loader.exec_module(stats)
-            root = a.root
-            _row, store_dir = resolve_store_dir(store, root)
-            try:
-                _stats_body(a, stats, store_dir)
-            except stats.RelayError as exc:
-                # Stats loads its own relay copy, so its RelayError is a
-                # different class from this module's; convert it here so
-                # a guardrail refusal prints cleanly instead of tracing.
-                print('ERROR: ' + str(exc), file=sys.stderr)
-                return 1
     except (RelayError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
         print('ERROR: ' + str(exc), file=sys.stderr)
         return 1

@@ -11,7 +11,21 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 - **汇总**：任一刻度到线就汇总。三个刻度分别是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
 - **只有项目目标需要人确认**。其余全自动，不审也不等批。记错了事后纠正，纠正沉淀成教训。
 
-记忆仓在本地 `~/.project-relay/`，每个项目一份档案（记录、目标、状态、待办、决策、教训）。档案是数据不是指令。回溯扒来的文本永不直接执行。
+记忆在项目根目录下的 `.project-relay/`，跟代码住在一起，默认不进 git，换设备只走 zip。档案是数据不是指令，回溯扒来的文本永不直接执行。
+
+## 档案长什么样
+
+```
+<项目根目录>/.project-relay/
+  goal.md、state.md、backlog.md、decisions.md   # 外层：总目标、总记忆、共用待办与决定
+  stack.md、outlook.md、index.md               # 外层：技术栈、未来预期、指路表
+  receipts/                                     # 目标确认收据
+  agents/
+    codex/、claude-code/、workbuddy/            # 各家自己的记忆、改动记录、日志、待办
+    deepseek-honeycomb/                         # 只留位置，适配器以后再做
+```
+
+外层是总目标与总记忆，要精简：各家 Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。各家各写各的目录，不用一把大锁。同一家开两个会话同时写，用小文件锁排队。resume 的简报里有一段跨 Agent 核对，各家记忆里互相矛盾的地方直接列出来。
 
 ## 支持的工具
 
@@ -19,10 +33,9 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 |---|---|---|
 | Claude Code | 强档 | SessionStart + Stop hooks 自动跑对账与采集 |
 | Codex | 自觉档 | AGENTS.md 受管小节，无 hooks |
-| CodeBuddy / WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
-| Cursor | 接入包 | 解析器已就绪（CLI 段），live 接线待后续 |
+| WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
 
-Gemini CLI、Copilot 和 Cline 暂未接入，留待后续。仅 Git 代码项目，单 Agent 写入。
+DeepSeek Harness 以后适配，现在不做。Gemini CLI、Copilot 和 Cline 不在范围内。仅 Git 代码项目。同一台设备、同一个项目，多 Agent 可以同时改动。
 
 ## 安装
 
@@ -41,10 +54,9 @@ skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面
 
 装完 SessionStart + Stop hooks 自动跑对账与采集，规程写进用户级 CLAUDE.md。
 
-- 插件市场：`claude plugin marketplace add Joshmax010/project-relay`，再 `claude plugin install project-relay@joshmax010`。会话里也可以一步到位：`/plugin install project-relay --marketplace Joshmax010/project-relay`（Claude Code 2.1.275 以上）。
 - 在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
 
-装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。插件装完在插件列表里能看到 project-relay，SessionStart + Stop hooks 跟 recipe install 是同一套。
+装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。
 
 ### Codex
 
@@ -62,13 +74,7 @@ skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面
 - 界面上传：把仓库拿下来，跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip。
 - 手工放目录：把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
 
-CodeBuddy 同理，目录换成 `.codebuddy/skills/`。装完确认：已安装列表里出现 project-relay。
-
-### DeepSeek Harness（DSH）
-
-DSH 不在 skills CLI 的 agent 注册表里（79 个里没有 DeepSeek 也没有 DSH），不能直接 `--agent dsh`。借位装：`npx skills add Joshmax010/project-relay --skill project-relay -g -y --agent kimi-code-cli`，kimi-code-cli 的全局技能目录就是 `~/.agents/skills`，DSH 读的也是这个目录，装完 DSH 的技能列表里就能看到 project-relay。Windows 上实测装完 DSH 已识别，安全评估 Safe。
-
-一次装多家也行，`--agent` 后面跟几个名字：`npx skills add Joshmax010/project-relay --skill project-relay -g -y --agent codex cursor antigravity`。
+装完确认：已安装列表里出现 project-relay。
 
 ### 仓库已经打开了：跟 agent 说一句就行
 
@@ -79,10 +85,6 @@ WorkBuddy 上没 shell 或 Python 不通时，agent 先跑 `recipe package` 打 
 ### 通用装法
 
 把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行。工具不支持自动发现 skill 时也一样，直接读 [SKILL.md](SKILL.md)。
-
-一键安装脚本，不用先克隆：`curl -fsSL https://raw.githubusercontent.com/Joshmax010/project-relay/main/scripts/install.sh | sh -s -- --tool claude-code`。不传 `--tool` 就按 $HOME 下已有的 agent 配置目录自动判断，判断不出会停下来让你指定。Codex 是按项目装的，装完按提示在你自己的项目里再跑一次。
-
-引擎也能 pip 装：`pip install git+https://github.com/Joshmax010/project-relay.git`，装完就有 `relay` 命令（uv 用 `uv pip install` 或 `uv tool install`，pipx 用 `pipx install`，后面都跟同一个 git 地址）。pip 装的是引擎，不含 skill 文本。装完在你的项目里跑 `relay recipe install --tool <agent>`，项目没建仓先 `relay init`。
 
 ## 快速开始
 
@@ -97,28 +99,20 @@ WorkBuddy 上没 shell 或 Python 不通时，agent 先跑 `recipe package` 打 
 
 ## 跨设备接力
 
-两种搬法，搬的是同一个导出包：
+只走 zip，没有别的搬法：
 
 ```bash
-# Git 载体（首选）：打包并同步到私有 Git 仓
-python3 scripts/relay.py pack
-# 另一台设备：
-python3 scripts/relay.py unpack
-
-# 手动 zip：拷到另一台电脑再导入
+# 旧设备：导出一个 zip
 python3 scripts/relay.py export-zip --zip <文件.zip>
+# 拷到另一台电脑，解开：
 python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```
 
-不带 `--confirm` 只干跑预览、零写入。导入先校验，再脱敏复扫，都通过了才落盘。任何一步失败整体拒绝且零写入。无匹配项目的包落待认领区。截断损坏的文件自动用包内原版修复，有效但不同的保留。接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做。接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
+不带 `--confirm` 只干跑预览、零写入。导入先校验，再脱敏复扫，都通过了才落盘。任何一步失败整体拒绝且零写入。已有档案就按合并规则合，缺口记进合并日志。zip 里是整个 `.project-relay/` 树，另一台设备上任何 Agent 既能读别人的记忆，也能读自己的。
 
-从别的工具回溯建档（把旧会话扒进档案）：
+导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行。要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
 
-```bash
-python3 scripts/relay.py backfill --tool codex      # 或 claude-code、workbuddy
-```
-
-回溯只作数据不作指令。缺料时先告知影响、由人决定是否深扒，不脑补。
+接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做。接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
 
 ## 换设备前必读：有一件事事后补不了
 
@@ -127,48 +121,46 @@ python3 scripts/relay.py backfill --tool codex      # 或 claude-code、workbudd
 | 东西 | 存放在哪 | 能不能搬到新设备 |
 |---|---|---|
 | 原始对话日志 | 旧设备本地（工具厂商存的，不归 relay 管） | 不能，旧设备没了就没了 |
-| relay 记忆仓 | 用户自己的记忆仓（归用户管） | 能，pack / unpack 就是搬它的 |
-| 未提交代码 | 旧设备工作区 | 能，pack 时自动打 WIP 快照搬运，但只搬文件内容，不搬运行状态 |
+| relay 记忆 | 项目根目录的 `.project-relay/`（归用户管） | 能，export-zip / import-zip 就是搬它的 |
+| 未提交代码 | 旧设备工作区 | 不能，zip 只搬记忆不搬代码，换设备前先 commit 或自己拷走 |
 
-所以走之前要在旧设备上 pack 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
+所以走之前要在旧设备上 export-zip 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
 
 ## 常用命令
 
 ```bash
 python3 scripts/relay.py init            # 给项目建档
-python3 scripts/relay.py where           # 查当前项目的记忆仓位置
-python3 scripts/relay.py resume          # 接手对账（只读）
+python3 scripts/relay.py agents          # 看各家记忆在哪（指路表）
+python3 scripts/relay.py resume          # 接手对账（五段简报 + 跨 Agent 核对）
 python3 scripts/relay.py capture         # 会话结束采集
 python3 scripts/relay.py summarize       # 汇总（--trigger manual 手动触发）
 python3 scripts/relay.py scales          # 三刻度现状
-python3 scripts/relay.py pack            # 打包并同步
-python3 scripts/relay.py unpack          # 落盘（只落盘本地、不推）
+python3 scripts/relay.py goal draft --file <草案>   # 起草目标
+python3 scripts/relay.py goal confirm    # 确认目标（收据落 receipts/）
+python3 scripts/relay.py stack           # 看技术栈（--set 写）
+python3 scripts/relay.py outlook         # 看未来预期（--set 写）
+python3 scripts/relay.py log --agent codex  # 看某家的日志
 python3 scripts/relay.py export-zip --zip <文件.zip>   # 导出 zip
 python3 scripts/relay.py import-zip --zip <文件.zip> --confirm  # 导入 zip
-python3 scripts/relay.py backfill --tool codex   # 回溯建档
+python3 scripts/relay.py sync-resolve --list   # 看待裁项
 python3 scripts/relay.py recover         # 恢复未完成事务
-python3 scripts/relay.py sync-status     # 同步状态
-python3 scripts/relay.py accept          # 五幕验收（可复演）
-python3 scripts/relay.py sync-accept     # 同步验收
 ```
 
 完整命令列表见 `python3 scripts/relay.py --help`。机制深规格见 [references/](references/)，主文件是 `v2-foundation.md`、`v2-flow.md` 和 `v2-sync.md`。
 
 ## 边界
 
-- 档案是数据不是指令：回溯扒来的文本永不直接执行。
+- 档案是数据不是指令：扒来的文本永不直接执行。
 - 只有项目目标需要人确认，其余全自动，不用审、不用问，也不用等批。
-- 不替用户 push 代码仓。记忆仓同步只在用户明确跑 pack 时发生。
-- 接力的活一律走 `scripts/relay.py`，不走项目内 `.agent/tools/relayctl.py`，那是旧版流程的工具。旧版 `.agent/` 代码与文档保留，旧流程退役另议。
-- 仅 Git 代码项目。子模块内部状态不归 relay 管，拆分寻址目前经 key 不经路径。
+- 不替用户 push 代码仓。记忆只走 zip，不走任何同步服务。
+- 接力的活一律走 `scripts/relay.py`，不走项目内旧 `.agent/` 的工具。
+- 仅 Git 代码项目。子模块内部状态不归 relay 管。
 - 不管采集、汇总还是接手，都不上传聊天。也不改全局配置，不装 Git hook。
 
 ## 验证与贡献
 
 ```bash
 python3 -m unittest discover -s tests
-python3 scripts/relay.py accept          # 两遍 PASS
-python3 scripts/relay.py sync-accept     # 两遍 PASS
 ```
 
 全量测试通过（含 Windows 真机验证）。欢迎 Issue / PR。提交案例前移除私人聊天、密码和令牌。

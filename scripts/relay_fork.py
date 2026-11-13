@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""project-relay v2 fork chain (plan part 03, step 3.3).
+"""project-relay v3 fork chain (plan part 03, step 3.3).
 
 Volume 1 only made forks VISIBLE (foreign-tool entries listed at resume).
 This slice completes the chain structure: every summary product carries a
@@ -28,7 +28,7 @@ Design notes (all load-bearing, do not "simplify" away):
   state/forks.json is refreshed by summarize (a write command) and by
   the fork CLI only. The displayed list is therefore never staler than
   the last summarize, and resume itself shows a live computation.
-- The pending-adjudication section in state.md lives OUTSIDE the managed
+- The pending-adjudication section in memory.md lives OUTSIDE the managed
   STATE_BEGIN/END block, so summarize's block replacement can never wipe
   an undecided conflict. Adjudication is recorded twice: the pending
   line is rewritten to resolved, and state/fork-adjudications.json keeps
@@ -56,14 +56,23 @@ Write discipline: every store write goes through relay.atomic()/save().
 
 import hashlib
 import importlib.util
+import sys
 import json
 import re
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location('relay', _HERE / 'relay.py')
-relay = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(relay)
+# Reuse the process-wide relay copy when one is already registered
+# (relay.py claims the name at its own top; the CLI's __main__ copy
+# and the test harness's copy both count). A fresh copy would carry a
+# different RelayError class, which main()'s handler cannot catch.
+_relay_mod = sys.modules.get('relay')
+if _relay_mod is None:
+    _spec = importlib.util.spec_from_file_location('relay', _HERE / 'relay.py')
+    _relay_mod = importlib.util.module_from_spec(_spec)
+    sys.modules['relay'] = _relay_mod
+    _spec.loader.exec_module(_relay_mod)
+relay = _relay_mod
 
 RelayError = relay.RelayError
 require = relay.require
@@ -73,12 +82,11 @@ atomic = relay.atomic
 save = relay.save
 read_json = relay.read_json
 
-ARCHIVE_FILES = ('state.md', 'decisions.md', 'lessons.md', 'backlog.md')
+ARCHIVE_FILES = ('memory.md', 'decisions.md', 'lessons.md', 'backlog.md')
 BRANCHES_DIRNAME = 'branches'
 FORKS_FILENAME = 'state/forks.json'
 GOAL_FORK_FILENAME = 'state/goal-fork.json'
 GOAL_CONFLICT_FILENAME = 'state/goal-conflict.json'
-ADJUDICATIONS_FILENAME = 'state/fork-adjudications.json'
 ANCHOR_FILENAME = 'state/chain-anchor.json'
 CHAIN_ARCHIVES_DIRNAME = 'chain-archives'
 PENDING_BEGIN = '<!-- relay:fork-pending-begin -->'
@@ -154,14 +162,6 @@ def latest_summary(store_dir):
     chain head for a new based_on pointer)."""
     live = [e for e in list_summaries(store_dir) if not e['packaged']]
     return live[-1] if live else None
-
-
-def chain_anchor(store_dir):
-    p = store_dir / ANCHOR_FILENAME
-    try:
-        return read_json(p) if p.exists() else None
-    except ValueError:
-        return None
 
 
 def list_branches(store_dir):
@@ -274,8 +274,8 @@ def _branch_info(nodes, tip_id, store_dir):
             'entry_range': node['entry_range']}
     if node['kind'] == 'branch':
         snap = store_dir / 'state' / BRANCHES_DIRNAME / tip_id
-        main_state = _state_block_text(store_dir / 'archive' / 'state.md')
-        branch_state = _state_block_text(snap / 'state.md') if (snap / 'state.md').exists() else None
+        main_state = _state_block_text(store_dir / 'memory.md')
+        branch_state = _state_block_text(snap / 'memory.md') if (snap / 'memory.md').exists() else None
         info['field_diff'] = field_diff(main_state, branch_state) if branch_state is not None else []
     else:
         info['field_diff'] = []
@@ -374,17 +374,6 @@ def goal_fork_active(store_dir):
     return goal_fork_info(store_dir)['active']
 
 
-def flag_goal_fork(store_dir, reason):
-    save(store_dir / GOAL_FORK_FILENAME,
-         {'reason': reason, 'at': utc()})
-    return {'flagged': True, 'reason': reason}
-
-
-def clear_goal_fork(store_dir):
-    (store_dir / GOAL_FORK_FILENAME).unlink(missing_ok=True)
-    return {'cleared': True}
-
-
 # ---------------------------------------------------------------- branches
 def write_branch(store_dir, snapshot, based_on, source, entry_range,
                  appended, mismatches):
@@ -405,7 +394,7 @@ def write_branch(store_dir, snapshot, based_on, source, entry_range,
     snap_dir = d / branch_id
     for name, text in snapshot.items():
         atomic(snap_dir / name, text.encode('utf-8'))
-    goal_path = store_dir / 'archive' / 'goal.md'
+    goal_path = store_dir / 'goal.md'
     if goal_path.exists():
         atomic(snap_dir / 'goal.md', goal_path.read_bytes())
     record = {'id': branch_id, 'based_on': based_on, 'source': source,
@@ -455,7 +444,7 @@ def merge_branches(store_dir, texts, summary_seq):
     merged_ids = []
     notes = []
     new_texts = dict(texts)
-    main_state = _state_block_text_from_text(new_texts.get('state.md', ''))
+    main_state = _state_block_text_from_text(new_texts.get('memory.md', ''))
     for branch in list_branches(store_dir):
         if branch.get('status') == 'merged':
             continue
@@ -463,8 +452,8 @@ def merge_branches(store_dir, texts, summary_seq):
         if not snap_dir.is_dir():
             continue
         branch_state = ''
-        if (snap_dir / 'state.md').exists():
-            branch_state = _state_block_text(snap_dir / 'state.md')
+        if (snap_dir / 'memory.md').exists():
+            branch_state = _state_block_text(snap_dir / 'memory.md')
         for fname, prefix in (('decisions.md', 'D'), ('lessons.md', 'L'),
                               ('backlog.md', 'T')):
             main_text = new_texts.get(fname, '')
@@ -492,7 +481,7 @@ def merge_branches(store_dir, texts, summary_seq):
                 main_keys.add(key)
             new_texts[fname] = main_text
         for diff in field_diff(main_state, branch_state):
-            existing = pending_adjudications_from_text(new_texts.get('state.md', ''))
+            existing = pending_adjudications_from_text(new_texts.get('memory.md', ''))
             if any(p.get('fork') == branch['id'] and p.get('field') == diff['field']
                    and p.get('status') == 'open' for p in existing):
                 continue
@@ -500,8 +489,8 @@ def merge_branches(store_dir, texts, summary_seq):
                     'main_value': diff['main'], 'branch_value': diff['branch'],
                     'branch_source': branch.get('source'),
                     'branch_at': branch.get('at'), 'status': 'open'}
-            new_texts['state.md'] = append_pending_adjudication(
-                new_texts.get('state.md', ''), item)
+            new_texts['memory.md'] = append_pending_adjudication(
+                new_texts.get('memory.md', ''), item)
             notes.append('支 %s 的字段 %s 进入待裁区' % (branch['id'], diff['field']))
         branch['status'] = 'merged'
         branch['merged_in'] = summary_seq
@@ -518,7 +507,7 @@ def _state_block_text_from_text(text):
 
 # ---------------------------------------------------------------- pending adjudications
 def pending_adjudications(store_dir):
-    path = store_dir / 'archive' / 'state.md'
+    path = store_dir / 'memory.md'
     if not path.exists():
         return []
     return pending_adjudications_from_text(path.read_text(encoding='utf-8'))
@@ -568,68 +557,6 @@ def append_pending_adjudication(text, item):
         return text[:stop] + line + '\n' + text[stop:]
     return (text.rstrip('\n') + '\n\n' + PENDING_BEGIN + '\n' + line + '\n'
             + PENDING_END + '\n')
-
-
-def adjudicate(store_dir, fork_id, winner, note):
-    """Resolve one pending item (plan 3.3 item 4②): the next takeover
-    agent checks the live code, picks the true side, and the裁定 is
-    recorded both in the pending section and in the durable log."""
-    require(winner in ('branch', 'main'), 'winner 须为 branch 或 main')
-    path = store_dir / 'archive' / 'state.md'
-    require(path.exists(), '本项目无 state.md')
-    text = path.read_text(encoding='utf-8')
-    require(PENDING_BEGIN in text and PENDING_END in text,
-            '本项目无待裁区')
-    start = text.index(PENDING_BEGIN)
-    stop = text.index(PENDING_END)
-    section = text[start:stop]
-    lines = section.splitlines()
-    found = False
-    for i, line in enumerate(lines):
-        m = re.match(r'^-\s*fork=(\S+)\s+field=(\S+)\s+status=open\b', line.strip())
-        if m and m.group(1) == fork_id:
-            # Rebuild in canonical field order (fork field status main
-            # branch winner note): a bare 'status=open' replacement would
-            # put winner/note before main/branch and the pending-section
-            # parser (fixed-order optional groups) would drop the line.
-            parsed = pending_adjudications_from_text(
-                PENDING_BEGIN + '\n' + line + '\n' + PENDING_END)
-            item = parsed[0] if parsed else {}
-            rebuilt = ('- fork=%s field=%s status=resolved main=%s branch=%s'
-                       % (fork_id, m.group(2),
-                          item.get('main_value', ''), item.get('branch_value', '')))
-            if item.get('branch_source'):
-                rebuilt += ' source=%s' % item['branch_source']
-            if item.get('branch_at'):
-                rebuilt += ' at=%s' % item['branch_at']
-            rebuilt += ' winner=%s note=%s' % (winner, (note or '').replace('\n', ' '))
-            lines[i] = rebuilt
-            found = True
-            break
-    require(found, '无待裁项：分叉 %s' % fork_id)
-    new_text = text[:start] + '\n'.join(lines) + '\n' + text[stop:]
-    atomic(path, new_text.encode('utf-8'))
-    log_path = store_dir / ADJUDICATIONS_FILENAME
-    log = []
-    if log_path.exists():
-        try:
-            log = read_json(log_path)
-        except ValueError:
-            log = []
-    if not isinstance(log, list):
-        log = []
-    log.append({'fork': fork_id, 'winner': winner, 'note': note,
-                'decided_at': utc()})
-    save(log_path, log)
-    # Codex PR #5 rounds 7-12, item 7: adjudication rewrites
-    # archive/state.md, which is inside the checksum manifest's scope
-    # (archive/**), so the manifest must be refreshed here -- otherwise
-    # the next resume reports a manifest mismatch for state.md and
-    # blocks automatic summarization until repaired. The adjudication
-    # log itself (state/fork-adjudications.json) is outside manifest
-    # scope and needs no refresh.
-    relay.update_checksum_manifest(store_dir)
-    return {'fork': fork_id, 'winner': winner, 'note': note}
 
 
 # ---------------------------------------------------------------- compression
