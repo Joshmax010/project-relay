@@ -28,7 +28,7 @@ class TestInitLayout(V3Base):
             self.assertTrue((store / name).is_file(), 'missing outer ' + name)
         self.assertTrue((store / 'receipts').is_dir())
         self.assertTrue((store / 'state').is_dir())
-        for agent in ('codex', 'claude-code', 'workbuddy'):
+        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
             adir = store / 'agents' / agent
             for name in AGENT_FILES:
                 self.assertTrue((adir / name).is_file(),
@@ -37,12 +37,6 @@ class TestInitLayout(V3Base):
                 self.assertTrue((adir / d).is_dir(),
                                 'missing agents/%s/%s/' % (agent, d))
             self.assertTrue((adir / 'log.jsonl').is_file())
-        # deepseek-harness: directory reserved, zero files (adapter later).
-        dh = store / 'agents' / 'deepseek-harness'
-        self.assertTrue(dh.is_dir())
-        self.assertEqual([], [p for p in dh.rglob('*') if p.is_file()])
-        for d in AGENT_DIRS:
-            self.assertTrue((dh / d).is_dir())
 
     def test_init_is_idempotent_and_keeps_content(self):
         root = self.init()
@@ -73,13 +67,14 @@ class TestInitLayout(V3Base):
         self.assertEqual(root / '.project-relay',
                          relay.resolve_store_dir(sub))
 
-    def test_index_lists_agents_and_marks_reserved(self):
+    def test_index_lists_agents_and_marks_tiers(self):
         root = self.init()
         text = (self.store_dir(root) / 'index.md').read_text(encoding='utf-8')
-        for agent in ('codex', 'claude-code', 'workbuddy'):
+        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
             self.assertIn('agents/%s/' % agent, text)
         self.assertIn('deepseek-harness', text)
-        self.assertIn('预留', text)
+        self.assertIn('弱档（技能目录）', text)
+        self.assertNotIn('预留', text)
 
 
 class TestGitignore(V3Base):

@@ -21,8 +21,7 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
   stack.md、outlook.md、index.md               # 外层：技术栈、未来预期、指路表
   receipts/                                     # 目标确认收据
   agents/
-    codex/、claude-code/、workbuddy/            # 各家自己的记忆、改动记录、日志、待办
-    deepseek-harness/                         # 只留位置，适配器以后再做
+    codex/、claude-code/、workbuddy/、deepseek-harness/   # 各家自己的记忆、改动记录、日志、待办
 ```
 
 外层是总目标与总记忆，要精简：各家 Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。各家各写各的目录，不用一把大锁。同一家开两个会话同时写，用小文件锁排队。resume 的简报里有一段跨 Agent 核对，各家记忆里互相矛盾的地方直接列出来。
@@ -34,8 +33,9 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 | Claude Code | 强档 | SessionStart + Stop hooks 自动跑对账与采集 |
 | Codex | 自觉档 | AGENTS.md 受管小节，无 hooks |
 | WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
+| DeepSeek Harness | 弱档 | 无生命周期 hooks，项目内 .deepseek-harness/skills/project-relay 技能目录，靠 Agent 自觉执行 |
 
-DeepSeek Harness 以后适配，现在不做。Gemini CLI、Copilot 和 Cline 不在范围内。仅 Git 代码项目。同一台设备、同一个项目，多 Agent 可以同时改动。
+Gemini CLI、Copilot 和 Cline 不在范围内。仅 Git 代码项目。同一台设备、同一个项目，多 Agent 可以同时改动。
 
 ## 安装
 

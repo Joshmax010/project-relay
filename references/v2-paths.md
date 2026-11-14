@@ -1,6 +1,6 @@
-# 路径表 v3（三家工具的安装落点）
+# 路径表 v3（四家工具的安装落点）
 
-> 本表只记 v3 留下的三家工具的安装落点与证据等级。Cursor、Gemini、
+> 本表只记 v3 留下的四家工具的安装落点与证据等级。Cursor、Gemini、
 > Copilot、Cline 的回溯路径已随回溯建档一起删除，不在本文件里。
 > **三档必须分开记**：官方路径（厂商文档原话）、实测路径（本机真实
 > 会话验证过）、证据等级；没有实测的条目一律标「未验证」，不许把
@@ -47,8 +47,11 @@
   SKILL.md、整个 `scripts/`、深规格文档），用户在技能面板上传。
 - 卸载删技能目录与安装记录。无 hooks，全靠 Agent 自觉执行。
 
-## DeepSeek Harness（以后适配，现在不做）
+## DeepSeek Harness（弱档，技能目录）
 
-- **证据等级：未验证**。档案里只留 `agents/deepseek-harness/` 的目录
-  位置，适配器本身不在本版范围；DSH 的借位装法（`--agent kimi-code-cli`）
-  已随范围收紧删除，不再推荐。
+- **落点**：项目内 `.deepseek-harness/skills/project-relay/SKILL.md`，
+  由 `recipe install --tool deepseek-harness` 写入（与 WorkBuddy 同款弱档，
+  注入 `agent_created: true`）。无生命周期 hooks，靠 Agent 自觉执行。
+- **卸载**：`recipe uninstall --tool deepseek-harness` 删技能目录与安装记录。
+- **证据等级：本机安装流程已实测**（脚本单测覆盖）；DSH 宿主侧真实会话
+  调用仍待真机验证。

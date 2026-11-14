@@ -257,7 +257,9 @@ class TestResume(V3Base):
         root = self.init()
         self.confirm_goal(root)
         store = self.store_dir(root)
-        for agent in ('codex', 'claude-code', 'workbuddy'):
+        # All four agents are active now: stamp each one's goal against the
+        # current overall-goal hash so the alignment check sees a full match.
+        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
             relay.write_agent_goal(store, agent, '负责自己那份。\n')
         text = self.resume_text(root)
         self.assertIn('目标对齐', text)

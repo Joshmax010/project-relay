@@ -97,7 +97,7 @@ goal/log/raw/state（last-summary + summaries）、receipts、目标机件暂存
 
 ## 8. 健康检查（`health_check`）
 
-外层 7 文件 + 各家 6 文件（跳过 deepseek-harness）+ 全家条目解析 +
+外层 7 文件 + 各家 6 文件 + 全家条目解析 +
 各家 tx 门（tx 日志 files 键相对 agent 目录）+ 各家游标检查 + 收据解析。
 memory.md 写冲突标记后报问题。
 

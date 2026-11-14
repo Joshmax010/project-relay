@@ -1258,7 +1258,9 @@ _FACT_HEADING_RE = re.compile(r'^## 事实\s*$')
 _FACT_LINE_RE = re.compile(r'^- (.+?)：(.*)$')
 _CHANGES_HEADING_RE = re.compile(r'^## 汇总 (\d+)\s*$')
 _AGENT_GOAL_HASH_RE = re.compile(r'^总目标哈希：([0-9a-f]{64})\s*$', re.M)
-_FILELESS_AGENTS = ('deepseek-harness',)
+# 四家现役都有自己的一套文件，没有零文件 Agent。保留这个空元组以兼容
+# 现有调用点（判断 a in _FILELESS_AGENTS 恒为假）。
+_FILELESS_AGENTS = ()
 
 
 def _recorded_goal_hash(text):

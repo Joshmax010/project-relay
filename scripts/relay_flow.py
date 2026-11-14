@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -171,7 +172,7 @@ def cross_agent_check(store_dir, agents=None):
     Read-only.
     """
     if agents is None:
-        agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
+        agents = list(relay.list_agents(store_dir))
     facts = {}
     for agent in agents:
         path = relay.agent_dir(store_dir, agent) / 'memory.md'
@@ -772,8 +773,6 @@ def queue_status(store_dir, agent=None, repair=False):
              'raw_mb': 0, 'stale_summarizing': [], 'over_retries': [],
              'rolled_back': [], 'oldest_pending': None}
     for a in relay.list_agents(store_dir):
-        if a == 'deepseek-harness':
-            continue
         one = _queue_status_dir(store_dir, relay.agent_dir(store_dir, a), cfg, False)
         for key in ('pending', 'summarizing', 'summarized', 'redacted_total', 'raw_mb'):
             total[key] += one[key]
@@ -1413,7 +1412,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 记忆在项目根目录下的 `.project-relay/`，跟代码住在一起，默认不进 git，换设备只走 zip。外一层是总的：总目标、技术栈、未来预期、共用待办与决定、一张指路表。这层你每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。
 
-各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`，每家有自己的记忆、改动记录、日志、待办。DeepSeek Harness 以后适配，现在只留 `agents/deepseek-harness/` 的位置。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
+各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`、`agents/deepseek-harness/`，每家有自己的记忆、改动记录、日志、待办。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
 
 ## 怎么跟用户说话
 
@@ -1514,6 +1513,41 @@ def uninstall_workbuddy(toplevel):
         shutil.rmtree(skill_dir)
     _recipe_state_path(store_dir, 'workbuddy').unlink(missing_ok=True)
     return {'removed': str(skill_dir), 'message': '已从 WorkBuddy 卸载'}
+
+
+def install_deepseek_harness(toplevel):
+    """Install the DeepSeek Harness (DSH) recipe -- the weak flavour.
+
+    DSH reads the same skill text as every other tool, from its own
+    project-local skill directory .deepseek-harness/skills/project-relay/.
+    Mirrors install_workbuddy; unlike WorkBuddy there is no packaging step.
+    """
+    toplevel = relay.git_toplevel(toplevel)
+    store_dir = relay.resolve_store_dir(toplevel)
+    skill_dir = toplevel / '.deepseek-harness' / 'skills' / 'project-relay'
+    dest = skill_dir / 'SKILL.md'
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    atomic(dest, _inject_agent_created(RELAY_SKILL_TEXT).encode('utf-8'))
+    _save_recipe_state(store_dir, 'deepseek-harness',
+                       {'tool': 'deepseek-harness', 'installed_at': utc(),
+                        'source': 'installed'})
+    return {'tool': 'deepseek-harness', 'installed_at': utc(), 'source': 'installed',
+            'skill_dir': str(dest), 'skill_path': str(dest), 'installed': True,
+            'note': '已装到 DeepSeek Harness（.deepseek-harness/skills/project-relay）',
+            'message': '已装到 DeepSeek Harness（.deepseek-harness/skills/project-relay）'}
+
+
+def uninstall_deepseek_harness(toplevel):
+    """Remove the DeepSeek Harness skill directory and its install record."""
+    toplevel = relay.git_toplevel(toplevel)
+    store_dir = relay.resolve_store_dir(toplevel)
+    state = _load_recipe_state(store_dir, 'deepseek-harness')
+    require(state is not None, '未找到 DeepSeek Harness 配方安装记录')
+    skill_dir = toplevel / '.deepseek-harness' / 'skills' / 'project-relay'
+    if skill_dir.is_dir():
+        shutil.rmtree(skill_dir)
+    _recipe_state_path(store_dir, 'deepseek-harness').unlink(missing_ok=True)
+    return {'removed': str(skill_dir), 'message': '已从 DeepSeek Harness 卸载'}
 
 
 def _inject_agent_created(skill_md):
@@ -2689,7 +2723,7 @@ def _goal_alignment_section(toplevel):
                           'reason': '总目标无哈希（未确认收据）'}
     except Exception as exc:
         return None, {'error': repr(exc), 'checked': False}
-    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
+    agents = list(relay.list_agents(store_dir))
     rows = []
     aligned = 0
     for a in agents:
@@ -2742,8 +2776,6 @@ def _entry_code_fingerprint(store_dir):
     best = None
     best_at = ''
     for agent in relay.list_agents(store_dir):
-        if agent == 'deepseek-harness':
-            continue
         for entry in list_entries(relay.agent_dir(store_dir, agent)):
             fingerprint = entry['header'].get('fingerprint') or {}
             code = fingerprint.get('code') or {}
@@ -2920,7 +2952,7 @@ def resume(toplevel):
                 'assessment': assessment}
     store_dir = relay.resolve_store_dir(toplevel)
     cfg = load_config(store_dir)
-    agents = [a for a in relay.list_agents(store_dir) if a != 'deepseek-harness']
+    agents = list(relay.list_agents(store_dir))
     adirs = {a: relay.agent_dir(store_dir, a) for a in agents}
     _stats = _stats_module()
     _prev_sum = _record_stats_safe(_stats.latest_summarize_row, store_dir)

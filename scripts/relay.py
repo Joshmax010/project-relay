@@ -156,9 +156,10 @@ def anchor(root):
 
 # ---------------------------------------------------------------- store
 STORE_DIRNAME = '.project-relay'
-# 各家 Agent 的目录名。deepseek-harness 只留位置，适配器以后再做。
+# 各家 Agent 的目录名。四家现役：Codex、Claude Code、WorkBuddy、
+# DeepSeek Harness（DSH，目录名 deepseek-harness）。
 AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
-ACTIVE_AGENTS = ('codex', 'claude-code', 'workbuddy')
+ACTIVE_AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
 # 外层文件：总目标、总记忆（精简）、指路表。
 OUTER_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
                'stack.md', 'outlook.md', 'index.md')
@@ -286,8 +287,10 @@ def render_index(agents):
              '外层文件只在目标确认或新 Agent 加入时改，平时由 resume 从各家文件里现算。', '',
              '| Agent | 目录 | 记忆文件 | 日志 | 备注 |',
              '|---|---|---|---|---|']
+    tiers = {'claude-code': '强档（hooks）', 'codex': '自觉档（AGENTS.md）',
+             'workbuddy': '弱档（技能目录）', 'deepseek-harness': '弱档（技能目录）'}
     for agent in agents:
-        note = '预留，未适配' if agent == 'deepseek-harness' else ''
+        note = tiers.get(agent, '')
         lines.append('| %s | agents/%s/ | agents/%s/memory.md | agents/%s/log.jsonl | %s |'
                      % (agent, agent, agent, agent, note))
     return '\n'.join(lines) + '\n'
@@ -300,10 +303,7 @@ def write_index(store_dir):
 def ensure_agent_dir(store_dir, agent, update_index=True):
     """建一家目录（新 Agent 加入）：骨架文件 + 子目录 + 指路表。
 
-    已存在时只补缺失的骨架，不动已有内容。deepseek-harness 不走
-    这里（只留目录位置，见 init）。"""
-    require(agent != 'deepseek-harness',
-            'deepseek-harness 只留目录位置，适配器以后再做')
+    已存在时只补缺失的骨架，不动已有内容。四家现役都走这里。"""
     base = agent_dir(store_dir, agent)
     for d in AGENT_DIRS:
         (base / d).mkdir(parents=True, exist_ok=True)
@@ -413,6 +413,10 @@ def write_agent_goal(store_dir, agent, text):
     current = overall_goal_hash(store_dir)
     header = ('总目标哈希：%s\n\n' % current) if current else ''
     atomic(agent_dir(store_dir, agent) / 'goal.md', (header + text).encode('utf-8'))
+    # Any archive write must refresh the integrity manifest, else the next
+    # resume reports goal.md as a mismatch. Goal writes used to leave it
+    # stale; now that all four agents have goal.md from init, they must sync.
+    update_checksum_manifest(store_dir)
     return agent_dir(store_dir, agent) / 'goal.md'
 
 
@@ -420,19 +424,15 @@ def init(toplevel):
     """Create <root>/.project-relay/ with the per-agent layout.
 
     外层：总目标/总记忆文件 + receipts/ + state/（目标机件暂存）。
-    各家：agents/<agent>/，三家现役给全套骨架；deepseek-harness
-    只留目录位置（适配器以后再做）。幂等：已建仓时只补缺失的骨架
-    文件、不动已有内容，并确保 .gitignore 兜底。项目根目录就是身份，
-    没有项目键、没有注册表。"""
+    各家：agents/<agent>/，四家现役（含 DeepSeek Harness）都给全套骨架。
+    幂等：已建仓时只补缺失的骨架文件、不动已有内容，并确保 .gitignore
+    兜底。项目根目录就是身份，没有项目键、没有注册表。"""
     root = Path(git_toplevel(toplevel))
     store_dir = root / STORE_DIRNAME
     (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
     for agent in ACTIVE_AGENTS:
         ensure_agent_dir(store_dir, agent, update_index=False)
-    dh = store_dir / 'agents' / 'deepseek-harness'
-    for d in AGENT_DIRS:
-        (dh / d).mkdir(parents=True, exist_ok=True)
     for name in OUTER_FILES:
         dest = store_dir / name
         if dest.exists() or name == 'index.md':
@@ -953,12 +953,14 @@ def _parser():
     rsub = r.add_subparsers(dest='recipe_command', required=True)
     ri = rsub.add_parser('install')
     ri.add_argument('--tool', required=True,
-                    choices=['claude-code', 'codex', 'workbuddy'])
+                    choices=['claude-code', 'codex', 'workbuddy',
+                             'deepseek-harness'])
     ri.add_argument('--target-root')
     ri.add_argument('--home')
     ru = rsub.add_parser('uninstall')
     ru.add_argument('--tool', required=True,
-                    choices=['claude-code', 'codex', 'workbuddy'])
+                    choices=['claude-code', 'codex', 'workbuddy',
+                             'deepseek-harness'])
     ru.add_argument('--target-root')
     ru.add_argument('--home')
     rp = rsub.add_parser('package')
@@ -1252,6 +1254,10 @@ def main(argv=None):
                             info = flow.install_workbuddy(root)
                             print('skill 目录：' + info['skill_dir'])
                             print(info['note'])
+                        elif a.tool == 'deepseek-harness':
+                            info = flow.install_deepseek_harness(root)
+                            print('skill 目录：' + info['skill_dir'])
+                            print(info['note'])
                         else:
                             info = flow.install_codex(root)
                             print(info['note'])
@@ -1261,6 +1267,9 @@ def main(argv=None):
                             print('\n'.join(info['notes']))
                         elif a.tool == 'workbuddy':
                             info = flow.uninstall_workbuddy(root)
+                            print('已移除：' + info['removed'])
+                        elif a.tool == 'deepseek-harness':
+                            info = flow.uninstall_deepseek_harness(root)
                             print('已移除：' + info['removed'])
                         else:
                             info = flow.uninstall_codex(root)

@@ -1,6 +1,6 @@
 # project-relay v3 地基
 
-> 实现：`scripts/relay.py`（标准库 only）。v3 只留三家 Agent 与 ZIP 交接；
+> 实现：`scripts/relay.py`（标准库 only）。v3 只留四家 Agent 与 ZIP 交接；
 > v1 人审工具（`relayctl.py`、`init_project.py`）、Git 打包、服务器载体、
 > 文件夹载体、回溯建档、晋升通道、Cursor 解析器、插件市场、pip 打包、
 > 一键安装脚本、accept/sync-accept 验收脚本已全部删除，不在本片范围。
@@ -14,8 +14,8 @@
   `state/`（目标机件暂存）、`checksum-manifest.json`（整树完整性清单）。
 - 各家目录 `agents/<agent>/`：`memory.md`、`decisions.md`、`lessons.md`、
   `backlog.md`、`changes.md`、`goal.md`、`log.jsonl`、`raw/`、`state/`、`tx/`、
-  `backups/`。三家有全套骨架：`codex/`、`claude-code/`、`workbuddy/`；
-  `deepseek-harness/` 只留目录位置，适配器以后再做。
+  `backups/`。四家现役都有全套骨架：`codex/`、`claude-code/`、`workbuddy/`；
+  `deepseek-harness/`（DSH，弱档，技能目录）。
 - **子模块排除**：指纹计算跳过子模块路径（mode 160000 的 gitlink），缺口
   记在快照 `gaps`；子模块内部不在本仓档案范围内，想接力须在子模块仓内
   单独建档。缺口标注位置见 `references/v2-boundaries.md`。

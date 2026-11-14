@@ -23,7 +23,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 记忆在项目根目录下的 `.project-relay/`，跟代码住在一起，默认不进 git，换设备只走 zip。外一层是总的：总目标、技术栈、未来预期、共用待办与决定、一张指路表。这层你每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。
 
-各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`，每家有自己的记忆、改动记录、日志、待办。DeepSeek Harness 以后适配，现在只留 `agents/deepseek-harness/` 的位置。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
+各家各写各的：`agents/codex/`、`agents/claude-code/`、`agents/workbuddy/`、`agents/deepseek-harness/`，每家有自己的记忆、改动记录、日志、待办。你只写自己那家目录。同一家开两个会话同时写，用小文件锁排队。
 
 ## 怎么跟用户说话
 
@@ -70,7 +70,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 ## 安装
 
-用户说装上接力，你来装，装到你当前这个工具里。如果提示项目未建仓，先跑 relay init 再装。你知道你是谁，`--tool` 参数按你是谁填，别问用户装到哪。Claude Code 是强档，SessionStart + Stop hooks 自动跑对账与采集。Codex 是自觉档，AGENTS.md 受管小节，无 hooks。WorkBuddy 是弱档，无 hooks，靠你自觉执行开头 resume、结尾 capture。卸载用 `recipe uninstall`。无论哪档，会话开始 resume、会话结束 capture 这两条规程不变。
+用户说装上接力，你来装，装到你当前这个工具里。如果提示项目未建仓，先跑 relay init 再装。你知道你是谁，`--tool` 参数按你是谁填，别问用户装到哪。Claude Code 是强档，SessionStart + Stop hooks 自动跑对账与采集。Codex 是自觉档，AGENTS.md 受管小节，无 hooks。WorkBuddy 是弱档，无 hooks，靠你自觉执行开头 resume、结尾 capture。DeepSeek Harness 也是弱档，装进项目内 `.deepseek-harness/skills/project-relay`，同样靠你自觉执行。卸载用 `recipe uninstall`。无论哪档，会话开始 resume、会话结束 capture 这两条规程不变。
 
 别的装法，按用户手边有什么选一个，不用都列出来问：
 - skills 命令行：npx、bun x、pnpm dlx、deno、npm -g 装好的 skills，都是 `skills add Joshmax010/project-relay --skill project-relay -g -a <你是谁> -y`，`-y` 别省，脚本里跑没它会弹确认然后取消。yarn dlx 要 Yarn Berry，本机没验通，别主动推。
