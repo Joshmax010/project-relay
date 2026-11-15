@@ -8,9 +8,9 @@
   与决定（backlog.md、decisions.md）、代码目前状况（state.md，由 resume
   从各家文件里现算）、一张指路表（index.md）。这层各家 Agent 每轮不许
   直接写，只在目标确认或新 Agent 加入时才改。
-- 里面按 Agent 分家，各写各的：agents/codex/、agents/claude-code/、
-  agents/workbuddy/、agents/deepseek-harness/（DeepSeek Harness 即
-  DSH，目录名 deepseek-harness，适配器以后再做，现在只留位置）。
+- 里面按 Agent 分家，各写各的：agents/deepseek-harness/（DeepSeek
+  Harness 即 DSH，目录名 deepseek-harness）。旧版其他 Agent 的目录只在导入
+  旧档案时保留为只读兼容层，新产品面不再创建。
   每家目录里是它自己的记忆文件（memory.md）、改动记录（changes.md）、
   日志（log.jsonl）、待办（backlog.md）、目标（goal.md，必须与总目标
   一致）。每个 Agent 只写自己那家目录，不用一把大锁；同一个 Agent 开
@@ -156,10 +156,10 @@ def anchor(root):
 
 # ---------------------------------------------------------------- store
 STORE_DIRNAME = '.project-relay'
-# 各家 Agent 的目录名。四家现役：Codex、Claude Code、WorkBuddy、
-# DeepSeek Harness（DSH，目录名 deepseek-harness）。
+# 现役 Agent：DeepSeek Harness（DSH，目录名 deepseek-harness）。
+# AGENTS 保留历史名字用于读取旧档案；ACTIVE_AGENTS 决定 init 建哪些目录。
 AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
-ACTIVE_AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
+ACTIVE_AGENTS = ('deepseek-harness',)
 # 外层文件：总目标、总记忆（精简）、指路表。
 OUTER_FILES = ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
                'stack.md', 'outlook.md', 'index.md')
@@ -178,9 +178,20 @@ ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'assets' / 'template-v2'
 
 
+def main_worktree(path):
+    """Return the repository's main worktree, even when called from a linked worktree."""
+    root = Path(git_toplevel(path))
+    result = git(root, 'worktree', 'list', '--porcelain', check=False)
+    if result.returncode == 0:
+        for line in os.fsdecode(result.stdout).splitlines():
+            if line.startswith('worktree '):
+                return Path(line[len('worktree '):]).resolve()
+    return root
+
+
 def store_dir_for(toplevel):
-    """<项目根目录>/.project-relay —— v3 的唯一档案位置。"""
-    return Path(git_toplevel(toplevel)) / STORE_DIRNAME
+    """<项目根目录>/.project-relay —— v3 的唯一档案位置（从工作树也解析到主工作树）。"""
+    return main_worktree(toplevel) / STORE_DIRNAME
 
 
 def resolve_store_dir(toplevel):
@@ -248,7 +259,7 @@ def ensure_gitignore(toplevel):
 
     档案默认不进 git，换设备只走 ZIP。已有的 .gitignore 只追加一行，
     不动其他内容（CRLF 文件保持 CRLF）。"""
-    root = Path(git_toplevel(toplevel))
+    root = Path(main_worktree(toplevel))
     gi = root / '.gitignore'
     entry = STORE_DIRNAME + '/'
     if gi.exists():
@@ -287,10 +298,9 @@ def render_index(agents):
              '外层文件只在目标确认或新 Agent 加入时改，平时由 resume 从各家文件里现算。', '',
              '| Agent | 目录 | 记忆文件 | 日志 | 备注 |',
              '|---|---|---|---|---|']
-    tiers = {'claude-code': '强档（hooks）', 'codex': '自觉档（AGENTS.md）',
-             'workbuddy': '弱档（技能目录）', 'deepseek-harness': '弱档（技能目录）'}
+    tiers = {'deepseek-harness': '弱档（技能目录）'}
     for agent in agents:
-        note = tiers.get(agent, '')
+        note = tiers.get(agent, '旧版兼容（只读）')
         lines.append('| %s | agents/%s/ | agents/%s/memory.md | agents/%s/log.jsonl | %s |'
                      % (agent, agent, agent, agent, note))
     return '\n'.join(lines) + '\n'
@@ -303,7 +313,7 @@ def write_index(store_dir):
 def ensure_agent_dir(store_dir, agent, update_index=True):
     """建一家目录（新 Agent 加入）：骨架文件 + 子目录 + 指路表。
 
-    已存在时只补缺失的骨架，不动已有内容。四家现役都走这里。"""
+    已存在时只补缺失的骨架，不动已有内容。现役 DSH 与旧版兼容目录都走这里。"""
     base = agent_dir(store_dir, agent)
     for d in AGENT_DIRS:
         (base / d).mkdir(parents=True, exist_ok=True)
@@ -424,10 +434,10 @@ def init(toplevel):
     """Create <root>/.project-relay/ with the per-agent layout.
 
     外层：总目标/总记忆文件 + receipts/ + state/（目标机件暂存）。
-    各家：agents/<agent>/，四家现役（含 DeepSeek Harness）都给全套骨架。
+    各家：agents/<agent>/，现役 DeepSeek Harness 给全套骨架。
     幂等：已建仓时只补缺失的骨架文件、不动已有内容，并确保 .gitignore
     兜底。项目根目录就是身份，没有项目键、没有注册表。"""
-    root = Path(git_toplevel(toplevel))
+    root = Path(main_worktree(toplevel))
     store_dir = root / STORE_DIRNAME
     (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
@@ -930,14 +940,14 @@ def _parser():
     gsub.add_parser('decline')
     gsub.add_parser('status')
     ag = sub.add_parser('agent-goal')
-    ag.add_argument('--agent', required=True, help='Agent 名，如 codex')
+    ag.add_argument('--agent', required=True, help='Agent 名，如 deepseek-harness')
     ag.add_argument('--set', help='写入该家目标全文（不给则只显示）')
     ag.add_argument('--file', help='从 UTF-8 文件读该家目标全文写入')
     # Implemented in scripts/relay_flow.py; imported lazily in main() to
     # avoid a relay.py <-> relay_flow.py import cycle (relay_flow loads
     # relay.py itself through importlib for the foundation helpers).
     cap = sub.add_parser('capture')
-    cap.add_argument('--agent', required=True, help='采集进哪家目录，如 codex')
+    cap.add_argument('--agent', required=True, help='采集进哪家目录，如 deepseek-harness')
     cap.add_argument('--session')
     cap.add_argument('--message')
     q = sub.add_parser('queue')
@@ -953,19 +963,14 @@ def _parser():
     rsub = r.add_subparsers(dest='recipe_command', required=True)
     ri = rsub.add_parser('install')
     ri.add_argument('--tool', required=True,
-                    choices=['claude-code', 'codex', 'workbuddy',
-                             'deepseek-harness'])
+                    choices=['deepseek-harness'])
     ri.add_argument('--target-root')
     ri.add_argument('--home')
     ru = rsub.add_parser('uninstall')
     ru.add_argument('--tool', required=True,
-                    choices=['claude-code', 'codex', 'workbuddy',
-                             'deepseek-harness'])
+                    choices=['deepseek-harness'])
     ru.add_argument('--target-root')
     ru.add_argument('--home')
-    rp = rsub.add_parser('package')
-    rp.add_argument('--tool', required=True, choices=['workbuddy'])
-    rp.add_argument('--out')
     pc = sub.add_parser('precompress')
     pc.add_argument('--agent', required=True)
     fp = sub.add_parser('fingerprint')
@@ -974,7 +979,7 @@ def _parser():
     sc.add_argument('--agent', required=True)
     sc.add_argument('--session')
     su = sub.add_parser('summarize')
-    su.add_argument('--agent', required=True, help='汇总哪家目录，如 codex')
+    su.add_argument('--agent', required=True, help='汇总哪家目录，如 deepseek-harness')
     su.add_argument('--source', default='scales')
     su.add_argument('--semantic-file')
     su.add_argument('--session')
@@ -988,6 +993,22 @@ def _parser():
     inj.add_argument('--budget', type=int)
     inj.add_argument('--agent', help='同时带上某家的待办与决定，不给则只用外层')
     sub.add_parser('resume')
+    wk = sub.add_parser('work', help='多 Agent 的分支与工作树事务层')
+    wksub = wk.add_subparsers(dest='work_command', required=True)
+    for name in ('enter', 'status', 'review', 'merge'):
+        wp = wksub.add_parser(name)
+        wp.add_argument('--agent', default='deepseek-harness')
+        wp.add_argument('--workspace', default=None,
+                        help='Agent 工作区（默认当前目录）')
+        wp.add_argument('--branch', default=None,
+                        help='默认 agent/<agent>')
+        wp.add_argument('--base', default=None,
+                        help='默认主工作树当前分支，否则 main/master')
+        wp.add_argument('--worktree-root', default=None,
+                        help='工作树根（默认 <workspace>/worktrees）')
+        if name == 'merge':
+            wp.add_argument('--confirm', action='store_true',
+                            help='用户批准后才能真正合并')
     # Implemented in scripts/relay_sync.py; imported lazily in main() like
     # relay_flow. The sync branch wraps its own errors (belt and braces);
     # its RelayError is the same class main() catches, since the sibling
@@ -1015,7 +1036,7 @@ def _parser():
     ou.add_argument('--set', help='写入未来预期全文（不给则只显示）')
     ou.add_argument('--file', help='从 UTF-8 文件读未来预期全文写入')
     lg = sub.add_parser('log')
-    lg.add_argument('--agent', required=True, help='Agent 名，如 codex')
+    lg.add_argument('--agent', required=True, help='Agent 名，如 deepseek-harness')
     lg.add_argument('--append', help='追加一条日志（正文）')
     lg.add_argument('--limit', type=int, default=20)
     return p
@@ -1175,6 +1196,25 @@ def main(argv=None):
                     detail = row.get('detail')
                     print('%s %s%s' % (row.get('at', ''), row.get('event', ''),
                                        ('：' + str(detail)) if detail is not None else ''))
+        elif a.command == 'work':
+            _wspec = importlib.util.spec_from_file_location(
+                'relay_work', Path(__file__).resolve().parent / 'relay_work.py')
+            work = importlib.util.module_from_spec(_wspec)
+            _wspec.loader.exec_module(work)
+            if a.work_command == 'enter':
+                info = work.enter(a.root, workspace=a.workspace, agent=a.agent,
+                                  branch=a.branch, base=a.base,
+                                  worktree_root=a.worktree_root)
+                print(work.render_enter(info))
+            elif a.work_command == 'status':
+                print(work.render_status(work.status(a.root, agent=a.agent)))
+            elif a.work_command == 'review':
+                print(work.render_review(work.review(a.root, agent=a.agent,
+                                                     branch=a.branch, base=a.base)))
+            else:
+                print(work.render_merge(work.merge(a.root, agent=a.agent,
+                                                   branch=a.branch, base=a.base,
+                                                   confirm=a.confirm)))
         elif a.command in ('capture', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
                            'inject', 'resume'):
@@ -1255,7 +1295,8 @@ def main(argv=None):
                             print('skill 目录：' + info['skill_dir'])
                             print(info['note'])
                         elif a.tool == 'deepseek-harness':
-                            info = flow.install_deepseek_harness(root)
+                            info = flow.install_deepseek_harness(root,
+                                target_root=a.target_root, home_dir=home)
                             print('skill 目录：' + info['skill_dir'])
                             print(info['note'])
                         else:

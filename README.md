@@ -1,15 +1,17 @@
-# Project Relay · 项目接力
+# Project Relay · 项目接力（DeepSeek Harness 版）
 
-给 Git 代码项目建一份项目记忆。工具、会话和设备换了，都不用重新交代。只有项目目标需要人确认，其余全自动。
+给 Git 代码项目建一份项目记忆。会话、设备或 Agent 换了，都不用重新交代。只有项目目标需要人确认；代码合并需要你批准。
 
-Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了，为什么这么写，下一步该干什么。下一个 Agent 打开就能接着干，不用问原主。
+Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了、为什么这么写、下一步该干什么，并给多个 Agent 提供互不干扰的 Git 分支和工作树。
+
+本版只适配 **DeepSeek Harness**。旧版其他 Agent 的代码只保留为读取旧档案的兼容层，产品面不再创建、不再安装。
 
 ## 一句话：它怎么工作
 
 - **会话开始**：先跑 `relay resume` 对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟），对账完成前不许动代码。
 - **会话结束**：先跑 `relay capture` 采集确定性快照，顺手填上这一轮做了什么，为什么这么做，定了什么，还剩什么尾巴。
-- **汇总**：任一刻度到线就汇总。三个刻度分别是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
-- **只有项目目标需要人确认**。其余全自动，不审也不等批。记错了事后纠正，纠正沉淀成教训。
+- **汇总**：任一刻度到线就汇总。三个刻度是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
+- **Git 工作区**：项目根的主工作树留在 main 给你验收；多 Agent 模式下每个 Agent 在自己的工作区里有一条 `agent/<名字>` 分支和独立 worktree，改完经你批准才合并。
 
 记忆在项目根目录下的 `.project-relay/`，跟代码住在一起，默认不进 git，换设备只走 zip。档案是数据不是指令，回溯扒来的文本永不直接执行。
 
@@ -20,142 +22,110 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
   goal.md、state.md、backlog.md、decisions.md   # 外层：总目标、总记忆、共用待办与决定
   stack.md、outlook.md、index.md               # 外层：技术栈、未来预期、指路表
   receipts/                                     # 目标确认收据
-  agents/
-    codex/、claude-code/、workbuddy/、deepseek-harness/   # 各家自己的记忆、改动记录、日志、待办
+  agents/deepseek-harness/                     # DSH 自己的记忆、改动记录、日志、待办
 ```
 
-外层是总目标与总记忆，要精简：各家 Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。各家各写各的目录，不用一把大锁。同一家开两个会话同时写，用小文件锁排队。resume 的简报里有一段跨 Agent 核对，各家记忆里互相矛盾的地方直接列出来。
+外层是总目标与总记忆，要精简：Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。DSH 只写 `agents/deepseek-harness/`，同一家开两个会话同时写时用小文件锁排队。
 
-## 支持的工具
+## 工作区、分支与工作树
 
-| 工具 | 档位 | 说明 |
-|---|---|---|
-| Claude Code | 强档 | SessionStart + Stop hooks 自动跑对账与采集 |
-| Codex | 自觉档 | AGENTS.md 受管小节，无 hooks |
-| WorkBuddy | 弱档 | 无生命周期 hooks，靠 Agent 自觉执行 |
-| DeepSeek Harness | 弱档 | 无生命周期 hooks，项目内 .deepseek-harness/skills/project-relay 技能目录，靠 Agent 自觉执行 |
+先分清两个位置：
 
-Gemini CLI、Copilot 和 Cline 不在范围内。仅 Git 代码项目。同一台设备、同一个项目，多 Agent 可以同时改动。
+- **项目仓库根**：Git 仓库根，由 `.git` 决定，`.project-relay/` 永远放在这里。
+- **DSH 工作区**：DSH 自己的目录，可能包含很多项目；项目根可能就在里面，也可能在别处。
 
-## 安装
+### 单 Agent：项目根和工作区重合
 
-先把 skill 装进你的 agent。装法按你手边有什么选一个，装完都一样用。需要 Git 和 Python 3.8+，脚本只用标准库。仓库在 https://github.com/Joshmax010/project-relay.git。skills.sh 上的收录页是 https://skills.sh/Joshmax010/project-relay/project-relay，收录是自动的，靠真实安装数据。`find` 搜不到只是命令行索引没跟上，名字撞车，写全 Joshmax010/project-relay。
+项目根等于 DSH 工作区，或项目根位于 DSH 工作区里面（或反过来）：**直接在项目文件夹里改，普通 Git，可留在 main**。`relay work enter` 只提示你就在项目根，不创建额外工作树。这是正常模式，不是降级。
 
-skills 命令行（同一条 `skills add`，换个跑它的工具而已。下面以 Claude Code 为例，Codex 把 `-a` 后面换成 `codex`。结尾的 `-y` 是跳过安装确认，别省，脚本里跑、终端不接受输入时没它会弹确认然后取消。`--skill project-relay` 钉住仓库里这一个 skill，也别省）：
+### 多 Agent：项目根和工作区分开
 
-- `npx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
-- `bun x skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`（bunx 同款，本机只验了 `bun x`）
-- `pnpm dlx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
-- `deno run -A npm:skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
-- `npm install -g skills` 后跑 `skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`
-- `yarn dlx skills add Joshmax010/project-relay --skill project-relay -g -a claude-code -y`（要 Yarn Berry 才有 dlx。沙箱里没验通，Berry 的网络层过不了本机代理）
+项目根在 DSH 工作区外面时：项目根的主工作树留在 `main` 给你验收；DSH 在自己的工作区建独立工作树，分支 `agent/deepseek-harness`。多个 Agent 各自一条 `agent/<名字>` 分支和自己的工作树，可同时修改，互不抢文件。
 
-### Claude Code
+```bash
+relay work enter --agent deepseek-harness --workspace <DSH 工作区>
+relay work status
+relay work review --agent deepseek-harness
+relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
+```
 
-装完 SessionStart + Stop hooks 自动跑对账与采集，规程写进用户级 CLAUDE.md。
+`relay work enter` 默认把工作树放在 `<workspace>/worktrees/<项目名>/<agent>`；`--worktree-root` 可改根目录。`.project-relay/` 只有一份，所有工作树共享，不复制记忆，也不进入导出 zip。`merge` 冲突会自动中止并保留分支和主工作树原状。
 
-- 在仓库里跑 `python scripts/relay.py recipe install --tool claude-code`（Windows 用 `python`）。
+## 安装（DeepSeek Harness）
 
-装完确认：`~/.claude/settings.json` 里登记了 relay 的 hooks，`~/.claude/CLAUDE.md` 里有 relay 一节。
+需要 Git 和 Python 3.8+。仓库在 https://github.com/Joshmax010/project-relay.git。
 
-### Codex
+在项目根运行：
 
-装完在项目 AGENTS.md 里加一段受管小节，无 hooks。
+```bash
+relay init
+python scripts/relay.py recipe install --tool deepseek-harness
+```
 
-- skills 命令行见上面，`-a` 后面换成 `codex`。
-- 在仓库里跑 `python scripts/relay.py recipe install --tool codex`。
+默认写项目级 `<项目根>/.dsh/skills/project-relay/SKILL.md`，这是 DSH 扫描的项目技能目录。要给整台机器安装：
 
-装完确认：项目 AGENTS.md 里有 relay 的受管小节。
+```bash
+python scripts/relay.py recipe install --tool deepseek-harness --home <用户目录>
+```
 
-### WorkBuddy
-
-无 hooks，靠 agent 自觉执行开头 resume、结尾 capture。npx 不认 WorkBuddy。
-
-- 界面上传：把仓库拿下来，跑 `recipe package` 打出 project-relay-workbuddy.zip，在技能面板 → 添加技能 → 上传技能传这个 zip。
-- 手工放目录：把 zip 解开，把里面的 project-relay 文件夹放到 `%USERPROFILE%\.workbuddy\skills\`（Windows）或 `~/.workbuddy/skills/`。
-
-装完确认：已安装列表里出现 project-relay。
-
-### 仓库已经打开了：跟 agent 说一句就行
-
-仓库已经在 agent 手边时，不用敲命令，跟 agent 说一句“装上接力”，agent 自己装，装到当前这个 agent 里，不问你装到哪。前提是 agent 得能看到 project-relay 仓库。看不到就直说，让你把仓库打开再说一声，不要硬装。agent 在后台跑 `recipe install` 装、`recipe uninstall` 卸，`--tool` 按它自己是谁填。默认装用户级，只给当前项目装就加 `--target-root <项目根目录>`。
-
-WorkBuddy 上没 shell 或 Python 不通时，agent 先跑 `recipe package` 打 zip，让用户在技能面板上传。Windows 上跑 Python 先试 `py -X utf8`。
-
-### 通用装法
-
-把仓库拿下来（`git clone https://github.com/Joshmax010/project-relay.git`），跟 agent 说一句“读 SKILL.md，按里面的规程走”。agent 能读文件、能跑脚本就行。工具不支持自动发现 skill 时也一样，直接读 [SKILL.md](SKILL.md)。
+这会写 `<用户目录>/.agents/skills/project-relay/SKILL.md`。DSH 会扫描项目级 `.dsh/skills`、`.agents/skills` 和用户级 `~/.dsh/skills`、`~/.agents/skills`；DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
 
 ## 快速开始
 
-装好之后，平时就是说话，不用敲命令。跟 agent 说：
+装好之后，平时就是说话，不用敲命令：
 
 - “接力”：接上这个项目。agent 先对账，用一句人话告诉你上次做到哪、还剩什么，然后接着干。
-- “这个项目要做……”：定目标。目标是唯一需要人确认的东西，agent 在聊天里把目标用大白话摆出来问一句，你说行就行。
+- “这个项目要做……”：定目标。目标是记忆层唯一需要确认的东西，agent 在聊天里用大白话问一句，你说行就行。
 - “交接”：把项目打包给另一台电脑。agent 问清楚发到哪，打好 zip 告诉你文件在哪、对方拿到后说什么。
-- “装上接力”：见上面安装。
-
-会话开始 agent 自己跑对账，对完再动代码。会话结束自己跑采集。汇总平时由三刻度自动触发。采集时 14 类敏感信息自动脱敏（比如密钥、token），不要自己往条目里写密钥。
+- “做完这个分支，给我看”：agent 跑 `relay work review`；你说可以合，它才跑 `relay work merge --confirm`。
 
 ## 跨设备接力
 
-只走 zip，没有别的搬法：
+只走 zip：
 
 ```bash
-# 旧设备：导出一个 zip
+# 旧设备
 python3 scripts/relay.py export-zip --zip <文件.zip>
-# 拷到另一台电脑，解开：
+# 新设备解开后
 python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```
 
-不带 `--confirm` 只干跑预览、零写入。导入先校验，再脱敏复扫，都通过了才落盘。任何一步失败整体拒绝且零写入。已有档案就按合并规则合，缺口记进合并日志。zip 里是整个 `.project-relay/` 树，另一台设备上任何 Agent 既能读别人的记忆，也能读自己的。
+不带 `--confirm` 只干跑预览、零写入。导入先校验、再脱敏复扫、后落盘，任何一步失败整体拒绝且零写入。已有档案就按合并规则合，缺口记进合并日志。zip 里是整个 `.project-relay/` 树。
 
-导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行。要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
+导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行；要硬门槛就加 `--strict`。
 
 接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做。接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
-
-## 换设备前必读：有一件事事后补不了
-
-各 AI 工具的原始对话日志只存在于旧设备的本地目录里，设备一旦弃用、重装或清盘，任何工具都无法在新设备上事后扒出这些日志来补建档案。这不是 relay 的缺陷，是存放位置决定的物理边界。
-
-| 东西 | 存放在哪 | 能不能搬到新设备 |
-|---|---|---|
-| 原始对话日志 | 旧设备本地（工具厂商存的，不归 relay 管） | 不能，旧设备没了就没了 |
-| relay 记忆 | 项目根目录的 `.project-relay/`（归用户管） | 能，export-zip / import-zip 就是搬它的 |
-| 未提交代码 | 旧设备工作区 | 不能，zip 只搬记忆不搬代码，换设备前先 commit 或自己拷走 |
-
-所以走之前要在旧设备上 export-zip 一下，和拔 U 盘前点弹出一样，是个日常动作，不是仪式。
 
 ## 常用命令
 
 ```bash
 python3 scripts/relay.py init            # 给项目建档
-python3 scripts/relay.py agents          # 看各家记忆在哪（指路表）
+python3 scripts/relay.py agents          # 看指路表
 python3 scripts/relay.py resume          # 接手对账（五段简报 + 跨 Agent 核对）
 python3 scripts/relay.py capture         # 会话结束采集
 python3 scripts/relay.py summarize       # 汇总（--trigger manual 手动触发）
 python3 scripts/relay.py scales          # 三刻度现状
 python3 scripts/relay.py goal draft --file <草案>   # 起草目标
-python3 scripts/relay.py goal confirm    # 确认目标（收据落 receipts/）
+python3 scripts/relay.py goal confirm    # 确认目标
 python3 scripts/relay.py stack           # 看技术栈（--set 写）
 python3 scripts/relay.py outlook         # 看未来预期（--set 写）
-python3 scripts/relay.py log --agent codex  # 看某家的日志
-python3 scripts/relay.py export-zip --zip <文件.zip>   # 导出 zip
-python3 scripts/relay.py import-zip --zip <文件.zip> --confirm  # 导入 zip
-python3 scripts/relay.py sync-resolve --list   # 看待裁项
-python3 scripts/relay.py recover         # 恢复未完成事务
+python3 scripts/relay.py work enter      # 进入 Agent 分支/工作树
+python3 scripts/relay.py work status     # 看各工作树
+python3 scripts/relay.py work review     # 看待合并改动
+python3 scripts/relay.py work merge --confirm  # 用户批准后合并
+python3 scripts/relay.py export-zip --zip <文件.zip>
+python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```
 
-完整命令列表见 `python3 scripts/relay.py --help`。机制深规格见 [references/](references/)，主文件是 `v2-foundation.md`、`v2-flow.md` 和 `v2-sync.md`。
+完整命令列表见 `python3 scripts/relay.py --help`。
 
 ## 边界
 
 - 档案是数据不是指令：扒来的文本永不直接执行。
-- 只有项目目标需要人确认，其余全自动，不用审、不用问，也不用等批。
+- 记忆层面只有项目目标需要人确认；Git 合并必须用户明确批准。
 - 不替用户 push 代码仓。记忆只走 zip，不走任何同步服务。
 - 接力的活一律走 `scripts/relay.py`，不走项目内旧 `.agent/` 的工具。
 - 仅 Git 代码项目。子模块内部状态不归 relay 管。
-- 不管采集、汇总还是接手，都不上传聊天。也不改全局配置，不装 Git hook。
 
 ## 验证与贡献
 
@@ -163,7 +133,7 @@ python3 scripts/relay.py recover         # 恢复未完成事务
 python3 -m unittest discover -s tests
 ```
 
-全量测试通过（含 Windows 真机验证）。欢迎 Issue / PR。提交案例前移除私人聊天、密码和令牌。
+欢迎 Issue / PR。提交案例前移除私人聊天、密码和令牌。
 
 ## 许可证
 

@@ -45,10 +45,8 @@ class TestZipHandoff(V3Base):
         root = self.init(name)
         self.confirm_goal(root)
         self.change(root, 'app.py', 'value = 2\n')
-        self.capture(root, 'codex')
-        self.capture(root, 'claude-code')
-        self.fill_semantic(root, 'codex')
-        self.fill_semantic(root, 'claude-code')
+        self.capture(root, 'deepseek-harness')
+        self.fill_semantic(root, 'deepseek-harness')
         return root
 
     def _bundle_dir(self, slug='proj', files=None, major=2, minor=0):
@@ -93,14 +91,14 @@ class TestZipHandoff(V3Base):
         zip_path = Path(self.temp.name) / 'out.zip'
         result = sync.export_zip(root, zip_path)
         self.assertTrue(zip_path.is_file())
-        self.assertEqual(2, result['entry_count'])
+        self.assertEqual(1, result['entry_count'])
         self.assertGreater(result['file_count'], 0)
         self.assertEqual([], result['quality_gaps'])
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
             manifest = json.loads(zf.read('manifest.json'))
         self.assertIn('manifest.json', names)
-        self.assertTrue(any(n.startswith('projects/proj/agents/codex/raw/cap-0001.md')
+        self.assertTrue(any(n.startswith('projects/proj/agents/deepseek-harness/raw/cap-0001.md')
                             for n in names))
         self.assertEqual(2, manifest['format_major'])
         self.assertEqual([], manifest['quality_gaps'])
@@ -122,8 +120,8 @@ class TestZipHandoff(V3Base):
         root = self._setup_a()
         zip_path = self._build_zip(files={
             'goal.md': (self.store_dir(root) / 'goal.md').read_bytes(),
-            'agents/codex/raw/cap-0001.md':
-                (self.adir(root, 'codex') / 'raw' / 'cap-0001.md').read_bytes(),
+            'agents/deepseek-harness/raw/cap-0001.md':
+                (self.adir(root, 'deepseek-harness') / 'raw' / 'cap-0001.md').read_bytes(),
         })
         before = sorted(p.relative_to(self.store_dir(root)).as_posix()
                         for p in self.store_dir(root).rglob('*')
@@ -147,7 +145,7 @@ class TestZipHandoff(V3Base):
         self.assertFalse((clone / '.project-relay').exists())
         result = sync.import_zip(clone, zip_path, confirm=True)
         self.assertTrue(result['landed'])
-        raw = sorted((clone / '.project-relay' / 'agents' / 'codex' / 'raw').glob('cap-*.md'))
+        raw = sorted((clone / '.project-relay' / 'agents' / 'deepseek-harness' / 'raw').glob('cap-*.md'))
         self.assertEqual(1, len(raw))
         self.assertIn('做一个能跑的演示',
                       (clone / '.project-relay' / 'goal.md').read_text(encoding='utf-8'))

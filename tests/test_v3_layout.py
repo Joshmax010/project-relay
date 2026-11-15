@@ -28,7 +28,7 @@ class TestInitLayout(V3Base):
             self.assertTrue((store / name).is_file(), 'missing outer ' + name)
         self.assertTrue((store / 'receipts').is_dir())
         self.assertTrue((store / 'state').is_dir())
-        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
+        for agent in ('deepseek-harness',):
             adir = store / 'agents' / agent
             for name in AGENT_FILES:
                 self.assertTrue((adir / name).is_file(),
@@ -70,7 +70,7 @@ class TestInitLayout(V3Base):
     def test_index_lists_agents_and_marks_tiers(self):
         root = self.init()
         text = (self.store_dir(root) / 'index.md').read_text(encoding='utf-8')
-        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
+        for agent in ('deepseek-harness',):
             self.assertIn('agents/%s/' % agent, text)
         self.assertIn('deepseek-harness', text)
         self.assertIn('弱档（技能目录）', text)

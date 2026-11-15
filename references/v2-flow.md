@@ -9,8 +9,8 @@
 `relay capture --agent <家> [--session] [--message]`、`relay queue [--agent]`、
 `relay enforce --agent <家> [--session]`（未传 --session 时，若 stdin 是钩子 JSON
 则取其中 session_id；否则沿用 default）、
-`relay recipe install|uninstall --tool claude-code|workbuddy|codex [--target-root] [--home]`、
-`relay recipe package`、`relay precompress`、`relay fingerprint`、
+`relay recipe install|uninstall --tool deepseek-harness [--target-root] [--home]`、
+`relay work enter|status|review|merge`、`relay precompress`、`relay fingerprint`、
 `relay scales [--agent]`、`relay summarize --agent <家> [--source] [--semantic-file] [--session]`、
 `relay recover --agent <家>`、`relay inject [--budget] [--agent]`、
 `relay resume`、`relay hook resume|stop`、`relay stack/outlook [--set]`、

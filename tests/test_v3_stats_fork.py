@@ -368,7 +368,7 @@ class TestForkSummaries(V3Base):
 class TestGoalFork(V3Base):
     def test_goal_fork_flag_and_conflict_marker(self):
         root = self.init()
-        adir = self.adir(root, 'codex')
+        adir = self.adir(root, 'deepseek-harness')
         self.assertFalse(fork.goal_fork_active(adir))
         flag = adir / 'state' / 'goal-fork.json'
         flag.write_text(json.dumps({'reason': '两边目标不一致'}, ensure_ascii=False),
@@ -385,7 +385,7 @@ class TestGoalFork(V3Base):
 
     def test_render_lists_active_goal_fork(self):
         root = self.init()
-        adir = self.adir(root, 'codex')
+        adir = self.adir(root, 'deepseek-harness')
         (adir / 'state' / 'goal-fork.json').write_text(
             json.dumps({'reason': '两边目标不一致'}, ensure_ascii=False),
             encoding='utf-8')

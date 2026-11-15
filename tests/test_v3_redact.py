@@ -165,7 +165,7 @@ class TestVerifyRedactedEntries(V3Base):
         header = _verified_header()
         text = _entry_text(header, 'body has ' + GH_TOKEN + '\n')
         new_text, _ = sync._redact_entry_text(text, flow)
-        rel = 'agents/codex/raw/cap-0001.md'
+        rel = 'agents/deepseek-harness/raw/cap-0001.md'
         return rel, text.encode('utf-8'), new_text.encode('utf-8')
 
     def test_fingerprint_with_11_digits_still_verifies_after_redact(self):
@@ -198,19 +198,19 @@ class TestVerifyRedactedEntries(V3Base):
 class TestIsRawEntryRel(V3Base):
     def test_accepts_cap_and_archived_cap(self):
         self.assertTrue(sync._is_raw_entry_rel(
-            'agents/codex/raw/cap-0001.md'))
+            'agents/deepseek-harness/raw/cap-0001.md'))
         self.assertTrue(sync._is_raw_entry_rel(
-            'agents/codex/raw/archived/cap-0001.md'))
+            'agents/deepseek-harness/raw/archived/cap-0001.md'))
         self.assertTrue(sync._is_raw_entry_rel(
             'agents/claude-code/raw/cap-0042.md'))
 
     def test_rejects_other_markdown(self):
-        for rel in ('agents/codex/raw/notes.md',
-                    'agents/codex/raw/cap-0001.txt',
-                    'agents/codex/memory.md',
-                    'agents/codex/state/cap-0001.md',
-                    'agents/codex/raw/sub/cap-0001.md',
-                    'agents/codex/raw/cap-0001.md.bak',
+        for rel in ('agents/deepseek-harness/raw/notes.md',
+                    'agents/deepseek-harness/raw/cap-0001.txt',
+                    'agents/deepseek-harness/memory.md',
+                    'agents/deepseek-harness/state/cap-0001.md',
+                    'agents/deepseek-harness/raw/sub/cap-0001.md',
+                    'agents/deepseek-harness/raw/cap-0001.md.bak',
                     'goal.md'):
             self.assertFalse(sync._is_raw_entry_rel(rel), rel)
 
@@ -218,31 +218,31 @@ class TestIsRawEntryRel(V3Base):
 class TestIsPayloadFile(V3Base):
     def test_device_local_files_do_not_ship(self):
         for rel in ('x.lock',
-                    'agents/codex/state/x.lock',
+                    'agents/deepseek-harness/state/x.lock',
                     'checksum-manifest.json',
                     'stats/capture.jsonl',
                     'stats/fuse.json',
-                    'agents/codex/tx/plan.json',
-                    'agents/codex/backups/cap-0001.md',
+                    'agents/deepseek-harness/tx/plan.json',
+                    'agents/deepseek-harness/backups/cap-0001.md',
                     'config.json',
                     'state/config.json',
                     'state/cursor.json',
                     'state/baseline.json',
-                    'agents/codex/state/cursor.json',
-                    'agents/codex/state/baseline.json',
-                    'agents/codex/state/numbers.json',
-                    'agents/codex/state/enforce.json',
-                    'agents/codex/state/forks.json',
-                    'agents/codex/recipe.json'):
+                    'agents/deepseek-harness/state/cursor.json',
+                    'agents/deepseek-harness/state/baseline.json',
+                    'agents/deepseek-harness/state/numbers.json',
+                    'agents/deepseek-harness/state/enforce.json',
+                    'agents/deepseek-harness/state/forks.json',
+                    'agents/deepseek-harness/recipe.json'):
             self.assertFalse(sync._is_payload_file(rel), rel)
 
     def test_archive_files_ship(self):
         for rel in ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
                     'stack.md', 'outlook.md', 'index.md',
-                    'agents/codex/memory.md',
-                    'agents/codex/raw/cap-0001.md',
-                    'agents/codex/raw/archived/cap-0001.md',
-                    'agents/codex/state/last-summary.md',
+                    'agents/deepseek-harness/memory.md',
+                    'agents/deepseek-harness/raw/cap-0001.md',
+                    'agents/deepseek-harness/raw/archived/cap-0001.md',
+                    'agents/deepseek-harness/state/last-summary.md',
                     'receipts/goal-0001.json',
                     'state/goal-draft.json'):
             self.assertTrue(sync._is_payload_file(rel), rel)
@@ -251,7 +251,7 @@ class TestIsPayloadFile(V3Base):
         # Fixed in this batch: 'stats' joined _LOCAL_ONLY_AGENT_DIRS,
         # so a stats/ dir under an agent no longer ships either.
         self.assertFalse(sync._is_payload_file(
-            'agents/codex/stats/rows.json'))
+            'agents/deepseek-harness/stats/rows.json'))
 
 
 class TestFixLocalRedactions(V3Base):
@@ -259,16 +259,16 @@ class TestFixLocalRedactions(V3Base):
         root = self.init()
         store = self.store_dir(root)
         original = {'goal.md': b'call ' + PHONE.encode() + b'\n',
-                    'agents/codex/memory.md': b'clean\n'}
+                    'agents/deepseek-harness/memory.md': b'clean\n'}
         redacted = {'goal.md': b'call \n',
-                    'agents/codex/memory.md': b'clean\n'}
+                    'agents/deepseek-harness/memory.md': b'clean\n'}
         for rel, data in original.items():
             (store / rel).write_bytes(data)
         fixed = sync._fix_local_redactions(store, original, redacted)
         self.assertEqual(['goal.md'], fixed)
         self.assertEqual(b'call \n', (store / 'goal.md').read_bytes())
         self.assertEqual(b'clean\n',
-                         (store / 'agents/codex/memory.md').read_bytes())
+                         (store / 'agents/deepseek-harness/memory.md').read_bytes())
 
 
 if __name__ == '__main__':

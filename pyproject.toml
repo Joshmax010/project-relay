@@ -35,6 +35,7 @@ py-modules = [
     "relay_promote",
     "relay_stats",
     "relay_sync",
+    "relay_work",
     "relayctl",
 ]
 

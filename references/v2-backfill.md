@@ -1,5 +1,8 @@
 # project-relay v2 回溯与验收片（卷一 1.15–1.16）
 
+> 历史文档：回溯建档与验收脚本在当前产品中已退役，本文件只保留旧版设计
+> 与测试记录；当前产品只支持 DeepSeek Harness + zip 交接。
+
 > 实现：`scripts/relay_backfill.py`（1.15 回溯建档，标准库 only）与
 > `scripts/relay_accept.py`（1.16 五幕验收剧本），命令经 `scripts/relay.py`
 > 分发（`relay backfill`、`relay accept`）。

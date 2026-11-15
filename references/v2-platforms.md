@@ -29,8 +29,8 @@
 
 ## 3. 真机验证挂起项（与本表相关，仍待用户电脑重跑）
 
-两周实际试用未开始：WorkBuddy 真项目一周 + 另一台电脑 zip 接力一周。
-试用覆盖的 Windows 待确认点：WorkBuddy 是否认用户级 skill 目录、上传
-zip 是否过安全检测、Windows 上 `py -X utf8` 能否跑通 relay.py。
+DeepSeek Harness 真机适配仍在验证：DSH 是否扫描项目级
+`.dsh/skills` 与 `~/.agents/skills`、Windows 上 `py -X utf8` 能否跑通
+relay.py，以及多 Agent 工作树在 DSH 宿主里的真实会话表现。
 （原子写走 mkstemp + os.replace，不用 os.link，没有 NTFS 硬链接问题。）
 核实是代码审计结论，真机重跑是运行结论，两者不互相代替。

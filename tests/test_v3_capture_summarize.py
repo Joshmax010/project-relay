@@ -154,6 +154,9 @@ class TestIsolation(V3Base):
         self.capture(root, 'codex')
         self.summarize(root, 'codex', semantic_text=SEMANTIC)
         self.assertEqual([], self.entries(root, 'claude-code'))
+        # DSH-only init does not create legacy agent dirs; this isolation
+        # test still exercises a second agent, so create its scaffold here.
+        relay.ensure_agent_dir(self.store_dir(root), 'claude-code')
         other_memory = (self.adir(root, 'claude-code') / 'memory.md').read_text(
             encoding='utf-8')
         self.assertIn('正在做什么：未知', other_memory)
@@ -210,6 +213,8 @@ class TestQueueStatus(V3Base):
 
 class TestResume(V3Base):
     def _set_fact(self, root, agent, key, value):
+        store = self.store_dir(root)
+        relay.ensure_agent_dir(store, agent)
         path = self.adir(root, agent) / 'memory.md'
         lines = path.read_text(encoding='utf-8').splitlines()
         idx = lines.index('## 事实')
@@ -257,9 +262,9 @@ class TestResume(V3Base):
         root = self.init()
         self.confirm_goal(root)
         store = self.store_dir(root)
-        # All four agents are active now: stamp each one's goal against the
-        # current overall-goal hash so the alignment check sees a full match.
-        for agent in ('codex', 'claude-code', 'workbuddy', 'deepseek-harness'):
+        # DSH is the only active agent: stamp its goal against the current
+        # overall-goal hash so the alignment check sees a full match.
+        for agent in ('deepseek-harness',):
             relay.write_agent_goal(store, agent, '负责自己那份。\n')
         text = self.resume_text(root)
         self.assertIn('目标对齐', text)
