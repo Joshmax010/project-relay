@@ -68,8 +68,9 @@ class TestInitAgents(CLIBase):
         code, out, err = self.cli_err('--root', root, 'agents')
         self.assertEqual(0, code, err)
         self.assertIn('指路表', out)
-        for agent in ('codex', 'claude-code', 'workbuddy'):
-            self.assertIn(agent, out)
+        self.assertIn('deepseek-harness', out)
+        for old in ('codex', 'claude-code', 'workbuddy'):
+            self.assertNotIn('agents/%s/' % old, out)
 
 
 class TestGoalFlow(CLIBase):
@@ -191,12 +192,12 @@ class TestEndToEnd(CLIBase):
         code, out, err = self.cli_err('--root', root, 'goal', 'confirm')
         self.assertEqual(0, code, err)
         code, out, err = self.cli_err('--root', root, 'capture',
-                                      '--agent', 'codex',
+                                      '--agent', 'deepseek-harness',
                                       '--message', 'did demo work')
         self.assertEqual(0, code, err)
         self.assertIn('采集条目：cap-0001', out)
         code, out, err = self.cli_err('--root', root, 'summarize',
-                                      '--agent', 'codex')
+                                      '--agent', 'deepseek-harness')
         self.assertEqual(0, code, err)
         self.assertIn('汇总序号：1', out)
         code, out, err = self.cli_err('--root', root, 'resume')
@@ -211,7 +212,7 @@ class TestEndToEnd(CLIBase):
         # is gitignored), import, resume reads the real brief.
         root = self.init()
         self.confirm_goal(root)
-        self.capture(root, 'codex', message='did demo work')
+        self.capture(root, 'deepseek-harness', message='did demo work')
         zip_path = Path(self.temp.name) / 'bundle.zip'
         code, out, err = self.cli_err('--root', root, 'export-zip',
                                       '--zip', zip_path)
@@ -224,7 +225,7 @@ class TestEndToEnd(CLIBase):
         code, out, err = self.cli_err('--root', clone, 'import-zip',
                                       '--zip', zip_path, '--confirm')
         self.assertEqual(0, code, err)
-        self.assertTrue((clone / '.project-relay' / 'agents' / 'codex'
+        self.assertTrue((clone / '.project-relay' / 'agents' / 'deepseek-harness'
                          / 'raw' / 'cap-0001.md').is_file())
         code, out, err = self.cli_err('--root', clone, 'resume')
         self.assertEqual(0, code, err)
