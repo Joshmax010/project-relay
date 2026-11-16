@@ -2,6 +2,8 @@
 
 给 Git 代码项目建一份项目记忆。会话、设备或 Agent 换了，都不用重新交代。只有项目目标需要人确认；代码合并需要你批准。
 
+当前技能包版本：**0.2.0**。
+
 Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了、为什么这么写、下一步该干什么，并给多个 Agent 提供互不干扰的 Git 分支和工作树。
 
 本版只适配 **DeepSeek Harness**。旧版其他 Agent 的代码只保留为读取旧档案的兼容层，产品面不再创建、不再安装。
@@ -53,22 +55,33 @@ relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
 
 ## 安装（DeepSeek Harness）
 
-需要 Git 和 Python 3.8+。仓库在 https://github.com/Joshmax010/project-relay.git。
+需要 Git 和 Python 3.8+。技能包版本 0.2.0。
 
-在项目根运行：
+### 方式一：下载发行 zip（推荐普通 DSH 用户）
+
+下载 `project-relay-dsh-skill-v0.2.0.zip`，解压后把整个 `project-relay/` 文件夹放到：
+
+- Windows：`%USERPROFILE%\.agents\skills\project-relay`
+- macOS / Linux：`~/.agents/skills/project-relay`
+- 或项目级：`<项目根>/.dsh/skills/project-relay`
+
+重启 DSH 会话即可。zip 里自带 `SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`，不依赖额外 clone。
+
+### 方式二：从源码安装（开发或自定义）
 
 ```bash
-relay init
-python scripts/relay.py recipe install --tool deepseek-harness
+git clone https://github.com/Joshmax010/project-relay.git
+cd project-relay
+
+# 给某个项目安装（项目级）
+python scripts/relay.py --root <项目根> init
+python scripts/relay.py --root <项目根> recipe install --tool deepseek-harness
+
+# 给整台机器安装（用户级）
+python scripts/relay.py --root <项目根> recipe install --tool deepseek-harness --home <用户目录>
 ```
 
-默认写项目级 `<项目根>/.dsh/skills/project-relay/SKILL.md`，这是 DSH 扫描的项目技能目录。要给整台机器安装：
-
-```bash
-python scripts/relay.py recipe install --tool deepseek-harness --home <用户目录>
-```
-
-这会写 `<用户目录>/.agents/skills/project-relay/SKILL.md`。DSH 会扫描项目级 `.dsh/skills`、`.agents/skills` 和用户级 `~/.dsh/skills`、`~/.agents/skills`；DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
+`recipe install` 会复制**完整技能包**：`SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`。默认项目级路径是 `<项目根>/.dsh/skills/project-relay/`；`--home` 写 `<用户目录>/.agents/skills/project-relay/`。DSH 会扫描项目级 `.dsh/skills`、`.agents/skills` 和用户级 `~/.dsh/skills`、`~/.agents/skills`。卸载用 `recipe uninstall --tool deepseek-harness`。
 
 ## 快速开始
 

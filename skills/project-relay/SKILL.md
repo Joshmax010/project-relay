@@ -102,7 +102,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 1. 在项目根跑 `relay init`（如果还没建档）。
 2. 跑 `python scripts/relay.py recipe install --tool deepseek-harness`。
 
-默认写项目级 `<项目根>/.dsh/skills/project-relay/SKILL.md`，这是 DSH 扫描的路径。要给整台机器装，用 `--home <用户目录>` 写 `<用户目录>/.agents/skills/project-relay/SKILL.md`；两种路径 DSH 都会扫。装完 DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
+默认会把完整技能写到项目级 `<项目根>/.dsh/skills/project-relay/`（SKILL.md、scripts、assets/template-v2、references）。要给整台机器装，用 `--home <用户目录>` 写 `<用户目录>/.agents/skills/project-relay/`；两种路径 DSH 都会扫。也可以直接把发行 zip 解压到这两个目录之一。装完 DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
 
 ## 边界
 
@@ -114,7 +114,7 @@ description: 接手或交接 Git 代码项目，不用重新交代。用户想�
 
 ## 命令参考
 
-命令一律在项目根目录跑 `python3 scripts/relay.py ...`（Windows 用 `python`）。
+命令都在**本 SKILL.md 所在目录**（技能目录）下跑 `python scripts/relay.py ...`（Windows 用 `python`）。项目级安装的技能目录通常是 `<项目根>/.dsh/skills/project-relay`；用户级通常是 `<用户目录>/.agents/skills/project-relay`。如果当前会话在项目根，也可以直接用 `.dsh/skills/project-relay/scripts/relay.py`。
 
 - `relay init`：建 `.project-relay/`
 - `relay resume` / `relay capture` / `relay summarize` / `relay scales`

@@ -921,7 +921,7 @@ def _print_sync_project(entry):
 def _parser():
     p = argparse.ArgumentParser(prog='relay', description='项目根目录下的共享记忆，分 Agent 存放（v3）')
     p.add_argument('--root', default='.', help='项目根目录（默认当前目录）')
-    p.add_argument('--version', action='version', version='relay 3.0.0')
+    p.add_argument('--version', action='version', version='relay 3.1.0')
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
     sub.add_parser('agents')

@@ -70,6 +70,17 @@ class TestDshRecipe(unittest.TestCase):
         self.assertFalse(skill.exists())
         self.assertEqual(str(repo / '.dsh' / 'skills' / 'project-relay'), out['removed'])
 
+    def test_install_copies_engine_and_templates(self):
+        from v3_helpers import relay, flow
+        repo = _repo(self)
+        relay.init(repo)
+        info = flow.install_deepseek_harness(repo)
+        skill_dir = Path(info['skill_dir'])
+        self.assertTrue((skill_dir / 'scripts' / 'relay.py').is_file())
+        self.assertTrue((skill_dir / 'scripts' / 'relay_work.py').is_file())
+        self.assertTrue((skill_dir / 'assets' / 'template-v2' / 'memory.md').is_file())
+        self.assertTrue((skill_dir / 'references' / 'v2-flow.md').is_file())
+
     def test_home_install_writes_user_agents_skills(self):
         from v3_helpers import relay, flow
         repo = _repo(self)
