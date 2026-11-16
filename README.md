@@ -59,7 +59,7 @@ relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
 
 ### 方式一：下载发行 zip（推荐普通 DSH 用户）
 
-下载 `project-relay-dsh-skill-v0.2.0.zip`，解压后把整个 `project-relay/` 文件夹放到：
+下载 [project-relay-dsh-skill-v0.2.0.zip](https://github.com/Joshmax010/project-relay/releases/tag/v0.2.0)，解压后把整个 `project-relay/` 文件夹放到：
 
 - Windows：`%USERPROFILE%\.agents\skills\project-relay`
 - macOS / Linux：`~/.agents/skills/project-relay`
