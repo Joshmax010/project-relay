@@ -1,6 +1,0 @@
-interface:
-  display_name: "Project Relay（项目接力）"
-  short_description: "为 Git 代码项目维护跨工具记忆、人审文档与提交前同步检查"
-  default_prompt: "使用 $project-relay 初始化或接手这个 Git 代码项目，按人审流程起草文档并在提交前核对同步。"
-  icon_small: "./assets/icon.svg"
-  icon_large: "./assets/icon.svg"

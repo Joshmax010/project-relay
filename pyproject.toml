@@ -24,19 +24,12 @@ relay = "relay:main"
 [tool.setuptools]
 package-dir = {"" = "scripts"}
 py-modules = [
-    "init_project",
     "relay",
-    "relay_accept",
-    "relay_backfill",
-    "relay_cursor",
     "relay_flow",
     "relay_fork",
-    "relay_parser_registry",
-    "relay_promote",
     "relay_stats",
     "relay_sync",
     "relay_work",
-    "relayctl",
 ]
 
 # The archive skeletons `relay init` copies (assets/template-v2). Installed

@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 .venv/
 .DS_Store
-project-relay-workbuddy.zip
 build/
 *.egg-info/
 .project-relay/
