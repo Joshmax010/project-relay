@@ -350,6 +350,29 @@ class TestZipHandoff(V3Base):
             sync.verify_bundle(bundle)
         self.assertIn('projects', str(ctx.exception))
 
+    def test_verify_bundle_rejects_foreign_project_entry(self):
+        bundle = self._bundle_dir()
+        other = bundle / 'projects' / 'other'
+        other.mkdir(parents=True)
+        data = b'# other\n'
+        (other / 'goal.md').write_bytes(data)
+        path = bundle / 'manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        rel = 'projects/other/goal.md'
+        manifest['files'][rel] = _sha256(data)
+        manifest['projects'][0]['files'].append(rel)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('其它项目', str(ctx.exception))
+
+    def test_verify_bundle_rejects_absolute_project_slug(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, projects=[{'slug': '../escape', 'files': []}])
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('项目名非法', str(ctx.exception))
+
     def test_verify_bundle_rejects_bad_hash_format(self):
         bundle = self._bundle_dir()
         manifest = json.loads((bundle / 'manifest.json').read_text(encoding='utf-8'))

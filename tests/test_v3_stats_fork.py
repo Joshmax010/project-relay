@@ -406,7 +406,8 @@ class TestFingerprintCache(V3Base):
 
     The cache file lives at <store>/state/fingerprint-cache.json and
     the excludes/threshold knobs come from <store>/state/config.json
-    (load_config), not the outer config.json the fuse reads.
+    (load_config). The fuse now reads the same state file first, falling
+    back to the legacy outer config.json.
     """
 
     def test_second_snapshot_hits_cache_and_matches_first(self):

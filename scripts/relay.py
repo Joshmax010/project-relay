@@ -178,6 +178,44 @@ CHECKSUM_MANIFEST = 'checksum-manifest.json'
 # still verify).
 ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
 
+# 本机状态文件：不进 ZIP 载荷，也不进完整性清单。清单若把它们算进去，
+# 正常的 capture/precompress/fingerprint 每次都会改这些文件，下一次
+# resume 就会误报“档案被损坏/截断”。relay_sync 复用同一组定义，避免
+# “打包排除”与“校验排除”两套标准漂移。
+LOCAL_ONLY_OUTER = frozenset({
+    'config.json',
+    'state/config.json',
+    'state/fingerprint-cache.json',
+    'state/device-notice.json',
+    'state/goal-conflict.json',
+    'state/goal-imported.json',
+    'state/rollback-note.json',
+})
+LOCAL_ONLY_AGENT_STATE = frozenset({
+    'cursor.json', 'baseline.json', 'numbers.json', 'digest.json',
+    'enforce.json', 'forks.json', 'backlog-notice.json',
+    'fingerprint-cache.json',
+})
+LOCAL_ONLY_AGENT_FILES = frozenset({'recipe.json'})
+LOCAL_ONLY_AGENT_DIRS = frozenset({'tx', 'backups', 'stats'})
+
+
+def is_local_only_path(rel):
+    """True for archive paths that are machine-local, not shared payload."""
+    if rel in LOCAL_ONLY_OUTER:
+        return True
+    if not rel.startswith('agents/'):
+        return False
+    parts = rel.split('/')
+    if len(parts) >= 3 and parts[2] in LOCAL_ONLY_AGENT_DIRS:
+        return True
+    if (len(parts) >= 4 and parts[2] == 'state'
+            and parts[3] in LOCAL_ONLY_AGENT_STATE):
+        return True
+    if len(parts) == 3 and parts[2] in LOCAL_ONLY_AGENT_FILES:
+        return True
+    return False
+
 
 def _resolve_templates_dir():
     """Find template-v2 in a source checkout, a DSH skill, or a pip install.
@@ -280,24 +318,39 @@ class _StoreLock:
         self._fh = None
 
     def __enter__(self):
+        self._fh = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, 'a+')
-        if os.name == 'nt':
-            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            fcntl.flock(self._fh, fcntl.LOCK_EX)
+        fh = open(self.path, 'a+')
+        try:
+            if os.name == 'nt':
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+        except BaseException:
+            # 加锁失败不能让文件句柄悬空：否则 __exit__ 或下一次 __enter__
+            # 会拿到一个没锁住、也没关掉的句柄。
+            try:
+                fh.close()
+            finally:
+                self._fh = None
+            raise
+        self._fh = fh
         return self
 
     def __exit__(self, *exc):
+        fh = self._fh
+        if fh is None:
+            return False
+        self._fh = None
         try:
             if os.name == 'nt':
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                fcntl.flock(self._fh, fcntl.LOCK_UN)
-        except OSError:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except (OSError, ValueError):
             pass
         finally:
-            self._fh.close()
+            fh.close()
         return False
 
 
@@ -442,6 +495,7 @@ def read_stack(store_dir):
 
 def write_stack(store_dir, text):
     atomic(_outer_doc(store_dir, 'stack.md'), text.encode('utf-8'))
+    update_checksum_manifest(store_dir)
     return _outer_doc(store_dir, 'stack.md')
 
 
@@ -452,6 +506,7 @@ def read_outlook(store_dir):
 
 def write_outlook(store_dir, text):
     atomic(_outer_doc(store_dir, 'outlook.md'), text.encode('utf-8'))
+    update_checksum_manifest(store_dir)
     return _outer_doc(store_dir, 'outlook.md')
 
 
@@ -542,9 +597,10 @@ def _manifest_files(store_dir):
     """Every file under .project-relay/, as {relative path: bytes}.
 
     完整性清单覆盖整棵树（外层 + 各家目录）。清单本身、锁文件、
-    回滚残留（rollback-trash）、记账（stats/）不计入：锁文件是空的
-    排队标记，残留本来就不属于正式档案，记账是本机才有的行记录、
-    随写随增（capture/summarize 写行时不刷新清单）。"""
+    回滚残留（rollback-trash）、记账（stats/）与 is_local_only_path()
+    认定的本机状态不计入：锁文件是空的排队标记，残留本来就不属于
+    正式档案，本机状态随写随增（config、fingerprint-cache、cursor、
+    digest 等），若算进清单，正常采集后下一次 resume 就会误报。"""
     out = {}
     for p in sorted(Path(store_dir).rglob('*')):
         if not p.is_file() or p.is_symlink():
@@ -555,6 +611,8 @@ def _manifest_files(store_dir):
         if rel.startswith(ROLLBACK_TRASH_PREFIX):
             continue
         if rel.startswith('stats/'):
+            continue
+        if is_local_only_path(rel):
             continue
         out[rel] = p.read_bytes()
     return out
@@ -587,6 +645,10 @@ def verify_checksum_manifest(store_dir):
                        'actual': '损坏'}]
     mismatches = []
     for rel, expected in (manifest.get('files') or {}).items():
+        # Old manifests (pre-0.3) listed machine-local files; they must
+        # not turn normal config/cache churn into a corruption report.
+        if is_local_only_path(rel):
+            continue
         p = store_dir / rel
         if not p.exists():
             mismatches.append({'file': rel, 'expected': expected, 'actual': None})
@@ -1166,8 +1228,9 @@ def main(argv=None):
                 current = read_agent_goal(store_dir, a.agent)
                 print(current if current else '（空）')
             else:
-                with agent_lock(store_dir, a.agent):
-                    write_agent_goal(store_dir, a.agent, text)
+                with outer_lock(store_dir):
+                    with agent_lock(store_dir, a.agent):
+                        write_agent_goal(store_dir, a.agent, text)
                 print('%s 的目标已写入（已记当前总目标哈希备查）' % a.agent)
         elif a.command in ('export-zip', 'import-zip', 'sync-resolve'):
             # The sync branch wraps its own errors (belt and braces):
@@ -1248,8 +1311,10 @@ def main(argv=None):
         elif a.command == 'log':
             store_dir = resolve_store_dir(a.root)
             if a.append is not None:
-                with agent_lock(store_dir, a.agent):
-                    append_agent_log(store_dir, a.agent, 'note', a.append)
+                with outer_lock(store_dir):
+                    with agent_lock(store_dir, a.agent):
+                        append_agent_log(store_dir, a.agent, 'note', a.append)
+                        update_checksum_manifest(store_dir)
                 print('日志已追加到 agents/%s/log.jsonl' % a.agent)
             else:
                 rows = read_agent_log(store_dir, a.agent, limit=a.limit)

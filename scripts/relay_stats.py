@@ -70,21 +70,32 @@ def _stats_dir(store_dir):
 
 
 def _read_config(store_dir):
-    """Fuse config, v3: the outer config.json at the store root.
+    """Fuse config, v3: state/config.json (the documented knob file),
+    falling back to the legacy outer config.json.
 
     Only monthly_llm_token_cap is read here (the fuse's soft cap); the
-    other caps live in the same file but are owned by relay_flow.
+    other caps live in the same file but are owned by relay_flow. The
+    state file wins when both exist, because that is where the docs and
+    relay_flow's defaults tell users to put knobs.
     Returns (cfg, path).
     """
     cfg = {'monthly_llm_token_cap': None}
-    path = Path(store_dir) / 'config.json'
-    if path.exists():
+    outer = Path(store_dir) / 'config.json'
+    state = Path(store_dir) / 'state' / 'config.json'
+    path = outer
+    for candidate in (outer, state):
+        if not candidate.exists():
+            continue
         try:
-            value = read_json(path)
+            value = read_json(candidate)
         except ValueError:
             value = {}
         if isinstance(value, dict):
             cfg.update(value)
+            path = candidate
+    cap = cfg.get('monthly_llm_token_cap')
+    if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap < 0):
+        cfg['monthly_llm_token_cap'] = None
     return cfg, path
 
 

@@ -80,18 +80,12 @@ FORK_NOTE_RE = re.compile(r'^- 分叉待裁：(.+?)（对方）：(.*)$')
 _PROJECT_SLUG_RE = re.compile(r'^[a-z0-9._-]+$')
 
 # Device-local files inside the store: never shipped, never merged.
-_LOCAL_ONLY_OUTER = {
-    'config.json', 'state/device-notice.json',
-    'state/goal-conflict.json', 'state/goal-imported.json',
-    'state/rollback-note.json',
-}
-# Per-agent device-local state (measurement / recovery working files).
-_LOCAL_ONLY_AGENT_STATE = {'cursor.json', 'baseline.json',
-                           'numbers.json', 'digest.json', 'enforce.json',
-                           'forks.json'}
-# Per-agent device-local files at the agent dir root (install records).
-_LOCAL_ONLY_AGENT_FILES = {'recipe.json'}
-_LOCAL_ONLY_AGENT_DIRS = {'tx', 'backups', 'stats'}
+# The sets live in relay.py so the ZIP payload and the checksum manifest
+# use exactly the same definition of "machine-local".
+_LOCAL_ONLY_OUTER = relay.LOCAL_ONLY_OUTER
+_LOCAL_ONLY_AGENT_STATE = relay.LOCAL_ONLY_AGENT_STATE
+_LOCAL_ONLY_AGENT_FILES = relay.LOCAL_ONLY_AGENT_FILES
+_LOCAL_ONLY_AGENT_DIRS = relay.LOCAL_ONLY_AGENT_DIRS
 
 
 def _is_payload_file(rel):
@@ -103,9 +97,10 @@ def _is_payload_file(rel):
     machine state. Device-local files never ship: lock files, the
     checksum manifest (regenerated after landing), rollback trash,
     outer config + adjudication markers, per-agent measurement state
-    (cursor/baseline/numbers/digest/enforce/forks), recovery state
-    (tx/backups), per-agent stats (stats/), and install records
-    (recipe.json).
+    (cursor/baseline/numbers/digest/enforce/forks/backlog-notice),
+    recovery state (tx/backups), per-agent stats (stats/), install
+    records (recipe.json); config.json and state/fingerprint-cache.json
+    are machine-local too.
     """
     if rel.endswith('.lock'):
         return False
@@ -113,19 +108,9 @@ def _is_payload_file(rel):
         return False
     if 'rollback-trash/' in rel:
         return False
-    if rel in _LOCAL_ONLY_OUTER:
+    if relay.is_local_only_path(rel):
         return False
     if rel.startswith('agents/'):
-        parts = rel.split('/')
-        if len(parts) < 3:
-            return False
-        if parts[2] in _LOCAL_ONLY_AGENT_DIRS:
-            return False
-        if len(parts) >= 4 and parts[2] == 'state' \
-                and parts[3] in _LOCAL_ONLY_AGENT_STATE:
-            return False
-        if len(parts) == 3 and parts[2] in _LOCAL_ONLY_AGENT_FILES:
-            return False
         return True
     if rel.startswith('receipts/'):
         return True
@@ -990,11 +975,15 @@ def verify_bundle(bundle_dir):
             and isinstance(projects[0].get('slug'), str)
             and projects[0]['slug'].strip(),
             'manifest 的项目缺少 slug，拒绝导入')
+    slug = projects[0]['slug']
+    require(_PROJECT_SLUG_RE.match(slug) is not None and slug not in ('.', '..'),
+            'manifest 的项目名非法：%r' % (slug,))
+    prefix = 'projects/%s/' % slug
     listed = manifest.get('files')
     require(isinstance(listed, dict) and listed, 'manifest 缺少文件清单，拒绝导入')
     for rel in listed:
         _jail_check(rel)
-        require(rel.startswith('projects/'), '清单含非项目文件，拒绝导入：' + rel)
+        require(rel.startswith(prefix), '清单含其它项目文件，拒绝导入：' + rel)
         require(isinstance(listed[rel], str)
                 and re.fullmatch(r'[0-9a-f]{64}', listed[rel]) is not None,
                 '清单哈希格式非法，拒绝导入：' + rel)

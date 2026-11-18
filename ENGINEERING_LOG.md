@@ -70,3 +70,36 @@
 
 - 旧 Claude Code / Codex / WorkBuddy 代码仍保留为只读兼容层，不进入新产品路径。
 - 仍未处理的小项：`_StoreLock.__enter__` 在加锁失败时可能泄漏已打开的文件句柄；`smoke_command` 仅执行本地 config；zip 解包失败时可能保留部分临时目录。均为 P3，留待下一轮评估。
+
+## 2026-11-18 · 第 3 轮
+
+### 范围
+
+- 基线：第 2 轮提交 `067fe84`，全量 223 tests OK。
+- 本轮审计完整性清单边界、配置读取健壮性、锁句柄生命周期、ZIP manifest 形状与统计配置来源。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 完整性 | 正常 capture→summarize→capture 后 checksum 清单报 `agents/deepseek-harness/log.jsonl` 与 `state/fingerprint-cache.json` 不符：本机状态文件被纳入 manifest | 在 `relay.py` 增加 `LOCAL_ONLY_OUTER`、`LOCAL_ONLY_AGENT_STATE`、`LOCAL_ONLY_AGENT_FILES`、`LOCAL_ONLY_AGENT_DIRS` 与 `is_local_only_path`；清单与 `relay_sync` 共用同一组“本机文件”定义；capture/summarize/log/agent-goal/stack/outlook 写后刷新清单 |
+| P2 可维护性 | `relay_sync` 自己维护 `_LOCAL_ONLY_*` 集合，容易与 manifest 规则漂移 | 改为 `relay.LOCAL_ONLY_*` 别名，`_is_payload_file` 统一调用 `relay.is_local_only_path` |
+| P2 健壮性 | `load_config` 只校验 dict，`pending_cap` 等字段为字符串/列表时后续比较或除法抛 TypeError | 新增 `_is_int` / `_validate_config`，校验所有数值、列表、可空字符串配置项；非法 JSON 转 `RelayError` |
+| P2 配置 | `relay_stats._read_config` 只读外层 `config.json`，文档与 `relay_flow` 的 knob 在 `state/config.json`，月度 token 上限不生效 | 先读外层再叠加 `state/config.json`（state 优先），非法 cap 置 None |
+| P3 锁 | `_StoreLock.__enter__` 在 open/加锁失败时可能泄漏句柄，`__exit__` 对未初始化句柄不安全 | 局部 `fh` 成功后才赋 `self._fh`，异常时关闭并置 None；`__exit__` 先判空，解锁异常收窄为 `OSError/ValueError` |
+| P3 完整性 | `stack --set` / `outlook --set` 写外层正式文件后不刷新 checksum，下一次 resume 会误报 | `write_stack` / `write_outlook` 写后调用 `update_checksum_manifest` |
+| P3 ZIP | `verify_bundle` 只要求清单路径以 `projects/` 开头，`projects/other/` 文件会被静默丢弃；项目 slug 未在验证阶段约束 | 校验 slug 匹配 `_PROJECT_SLUG_RE` 且非 `.`/`..`，所有清单文件必须在 `projects/<slug>/` 前缀下 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_manifest_config -v`：13 tests OK（manifest 本机状态、旧清单兼容、capture-after-summarize、log/stack/outlook 刷新、锁句柄、配置校验、stats 月度 cap）
+- `python -m unittest tests.test_v3_zip -v`：28 tests OK（含新增 2 条其它项目/非法 slug 校验）
+- `python -m unittest tests.test_v3_layout -v`：18 tests OK
+- 定向回归（zip/merge/capture_summarize/stats_fork/redact）：124 tests OK（218.348s）
+- 全量回归：`python -m unittest discover -s tests -v` → **238 tests OK**（323.600s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round3-final2-tests.log`）
+- `git diff --check`：通过
+
+### 说明与后续
+
+- 本轮不改变 ZIP 包格式；只加严 manifest 校验与本机文件边界。
+- 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；zip 解包失败时可能保留部分临时目录；均属 P3，下一轮评估。
