@@ -1,10 +1,10 @@
-# Project Relay · 项目接力（DeepSeek Harness 版）
+# Project Relay · 让 Agent 住进项目里（DeepSeek Harness 版）
 
-给 Git 代码项目建一份项目记忆。会话、设备或 Agent 换了，都不用重新交代。只有项目目标需要人确认；代码合并需要你批准。
+给 Git 代码项目建一份项目记忆，让 Agent 住进项目里。项目是宿主，Agent 是住户：项目记忆归项目所有，不是某个 Agent 的全部记忆。会话、设备或 Agent 换了，都不用重新交代；只有项目目标需要人确认，代码合并需要你批准。
 
 当前技能包版本：**0.2.0**。
 
-Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了、为什么这么写、下一步该干什么，并给多个 Agent 提供互不干扰的 Git 分支和工作树。
+Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了、为什么这么写、下一步该干什么，并给多个 Agent 提供互不干扰的 Git 分支和工作树。单 Agent 是正常模式，多 Agent 不是门槛；每个 Agent 只写自己的活动分区，不拥有整份项目记忆。
 
 本版只适配 **DeepSeek Harness**。旧版其他 Agent 的代码只保留为读取旧档案的兼容层，产品面不再创建、不再安装。
 
