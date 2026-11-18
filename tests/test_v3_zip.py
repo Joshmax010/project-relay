@@ -207,6 +207,27 @@ class TestZipHandoff(V3Base):
             sync.export_zip(root, zip_path)
         self.assertEqual(b'old bundle\n', zip_path.read_bytes())
 
+    def test_export_zip_rechecks_target_under_lock(self):
+        root = self._setup_a()
+        zip_path = Path(self.temp.name) / 'raced.zip'
+        real_outer = sync.relay.outer_lock
+
+        class RacingLock:
+            def __enter__(self):
+                zip_path.write_bytes(b'race winner')
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        sync.relay.outer_lock = lambda _store: RacingLock()
+        try:
+            with self.assertRaises(SyncError):
+                sync.export_zip(root, zip_path)
+        finally:
+            sync.relay.outer_lock = real_outer
+        self.assertEqual(b'race winner', zip_path.read_bytes())
+
     def test_export_zip_requires_an_archive(self):
         root = self.make_repo('proj')  # never relay.init'd
         with self.assertRaises(SyncError):

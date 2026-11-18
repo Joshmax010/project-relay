@@ -180,3 +180,27 @@
 
 - `relay_work.py` 的 enter/status/review/merge 本轮未发现高严重度问题；`relay_work.merge` 仍依赖宿主机 Git identity（本地已配置 `DSH Agent <dsh@local.invalid>`）。
 - 下一轮继续审计统计/分叉模块和 CLI 错误路径；发现低风险问题直接修复并补回归。
+
+## 2026-11-18 · 第 7 轮
+
+### 范围
+
+- 基线：第 6 轮提交 `7430eaa`，全量 244 tests OK（skipped=1）。
+- 本轮继续审计 `relay_sync.py` 的并发导出路径与目标文件保护。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 并发 | `export_zip` 的目标 zip 已存在检查在获取 `relay.outer_lock` 之前；另一个导出进程可在检查与真正写入之间创建目标，随后 `write_bundle_zip` 的 `os.replace` 会静默覆盖已有 zip | 在 `with relay.outer_lock(store_dir):` 内再次检查 `zip_path.exists()`，不存在才继续写；新增 `test_export_zip_rechecks_target_under_lock` 覆盖竞争窗口 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip -v`：32 tests OK（28.365s）。
+- 全量回归：**245 tests OK**（346.266s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round7-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮仅收紧导出目标文件保护，不改变 ZIP 包格式。
+- 下一轮继续审计分叉/统计/CLI 错误路径。

@@ -1361,6 +1361,9 @@ def export_zip(toplevel, zip_path, device_name=None, device_id=None,
     # a concurrent capture/summarize cannot change bytes between the
     # redaction snapshot and the local writeback.
     with relay.outer_lock(store_dir):
+        # Re-check under the lock: another export process can create the
+        # target after the fast pre-check above but before we acquire.
+        require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
         zip_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix='relay-export-zip-') as tmp:
             bundle_dir = Path(tmp) / 'bundle'
