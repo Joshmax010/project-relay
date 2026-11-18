@@ -350,6 +350,15 @@ class TestForkSummaries(V3Base):
             json.dumps({'seq': seq, 'source': 'manual'}, ensure_ascii=False),
             encoding='utf-8')
 
+    def test_malformed_chain_package_does_not_crash(self):
+        root = self.init()
+        adir = self.adir(root, 'codex')
+        chain_dir = adir / 'state' / 'chain-archives'
+        chain_dir.mkdir(parents=True)
+        (chain_dir / 'bad.json').write_text('[]', encoding='utf-8')
+        (chain_dir / 'bad2.json').write_text('{"records": {"a": 1}}', encoding='utf-8')
+        self.assertEqual([], fork.list_summaries(adir))
+
     def test_latest_summary_and_packaged_seqs(self):
         root = self.init()
         adir = self.adir(root, 'codex')

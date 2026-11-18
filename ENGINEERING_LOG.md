@@ -204,3 +204,27 @@
 
 - 本轮仅收紧导出目标文件保护，不改变 ZIP 包格式。
 - 下一轮继续审计分叉/统计/CLI 错误路径。
+
+## 2026-11-18 · 第 8 轮
+
+### 范围
+
+- 基线：第 7 轮提交 `5bc4c47`，全量 245 tests OK（skipped=1）。
+- 本轮继续审计 `relay_fork.py` 的分叉链读取容错。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 稳定性 | `_package_records` 对 `state/chain-archives/*.json` 只捕获 JSON 解析错误；合法 JSON 但顶层为列表或 `records` 非列表时会在 `pkg.get(...)` / 迭代时崩溃，导致 `resume` / `detect_forks` / `list_summaries` 失败 | 读取后校验顶层为 dict、`records` 为 list；不合法包安全跳过。新增 `test_malformed_chain_package_does_not_crash` |
+
+### 验证
+
+- `python -m unittest tests.test_v3_stats_fork -v`：31 tests OK（23.289s）。
+- 全量回归：**246 tests OK**（353.152s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round8-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 分叉链包格式不变；只是损坏数据不再阻断 resume。
+- 下一轮继续审计 CLI 错误路径与统计/分叉的剩余边界。

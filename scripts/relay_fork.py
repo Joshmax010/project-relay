@@ -112,7 +112,12 @@ def _package_records(store_dir):
             pkg = read_json(p)
         except ValueError:
             continue
-        for rec in pkg.get('records', []):
+        if not isinstance(pkg, dict):
+            continue
+        records = pkg.get('records')
+        if not isinstance(records, list):
+            continue
+        for rec in records:
             if isinstance(rec, dict) and isinstance(rec.get('seq'), int):
                 out.append(rec)
     return out
