@@ -223,11 +223,39 @@ def store_dir_for(toplevel):
     return main_worktree(toplevel) / STORE_DIRNAME
 
 
+def _reject_store_symlinks(store_dir):
+    """Reject a .project-relay tree whose controlled directories are symlinks.
+
+    safe() already protects payload paths, but many writers address
+    store_dir/rel directly; a repo-committed .project-relay symlink could
+    redirect those writes outside the project. Check the store root and
+    every directory level we create/manage before returning it.
+    """
+    store_dir = Path(store_dir)
+    require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
+    for name in ('agents', 'receipts', 'state', 'archive'):
+        p = store_dir / name
+        if p.is_symlink() or p.exists():
+            require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
+    agents = store_dir / 'agents'
+    if agents.is_dir() and not agents.is_symlink():
+        for child in agents.iterdir():
+            if child.is_symlink():
+                require(False, '拒绝符号链接: ' + str(child))
+            if not child.is_dir():
+                continue
+            for name in ('raw', 'state', 'tx', 'backups'):
+                p = child / name
+                if p.is_symlink() or p.exists():
+                    require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
+
+
 def resolve_store_dir(toplevel):
     """Return the project store dir; fail closed when the project has no archive yet."""
     store_dir = store_dir_for(toplevel)
     require(store_dir.is_dir(),
             '项目尚未建仓，先运行 relay init（档案在 <项目根目录>/.project-relay/）')
+    _reject_store_symlinks(store_dir)
     return store_dir
 
 
@@ -274,7 +302,12 @@ class _StoreLock:
 
 
 def outer_lock(store_dir):
-    """外层写锁：目标确认、新 Agent 加入、resume 写 state.md 时拿。"""
+    """档案级写锁：跨 Agent 的整档案事务都拿它。
+
+    目标确认、新 Agent 加入、resume 写 state.md 这类外层写入要拿；
+    capture/summarize 与 export-zip/import-zip 也整段持有，确保压缩包
+    落盘和任何档案写入不会交错。单 Agent 自己的目录锁仍在其内层。
+    """
     return _StoreLock(Path(store_dir) / '.write.lock')
 
 
@@ -468,6 +501,7 @@ def init(toplevel):
     兜底。项目根目录就是身份，没有项目键、没有注册表。"""
     root = Path(main_worktree(toplevel))
     store_dir = root / STORE_DIRNAME
+    require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
     (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
     for agent in ACTIVE_AGENTS:

@@ -78,6 +78,13 @@ class TestZipHandoff(V3Base):
             encoding='utf-8')
         return dest
 
+    def _mutate_manifest(self, bundle, **changes):
+        path = bundle / 'manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        manifest.update(changes)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                        encoding='utf-8')
+
     def _build_zip(self, zip_name='handoff.zip', **kw):
         bundle = self._bundle_dir(**kw)
         zip_path = Path(self.temp.name) / zip_name
@@ -143,6 +150,32 @@ class TestZipHandoff(V3Base):
                          'dry-run must not create .project-relay')
         self.assertFalse((root / '.gitignore').exists(),
                          'dry-run must not write .gitignore')
+
+    def test_land_project_rolls_back_payload_and_flags_on_failure(self):
+        root = self.init()
+        store = self.store_dir(root)
+        target = store / 'state' / 'land-test.txt'
+        target.write_bytes(b'old')
+        relay.update_checksum_manifest(store)
+        result = {
+            'merged_files': {'state/land-test.txt': b'new'},
+            'conflicts': [], 'counts': {}, 'goal_action': 'none',
+            'discarded': [], 'notes': [], 'pending_info': None,
+        }
+        original = sync._merge_log_path
+        sync._merge_log_path = lambda _store: (_ for _ in ()).throw(
+            RuntimeError('boom after landing'))
+        try:
+            with self.assertRaises(RuntimeError):
+                sync._land_project(store, result,
+                                   {'device': 'peer', 'device_id': 'x',
+                                    'seq': None})
+        finally:
+            sync._merge_log_path = original
+        self.assertEqual(b'old', target.read_bytes())
+        backups = list((store / 'archive' / 'rollback-trash').glob('land-*'))
+        self.assertTrue(backups, 'failed landing must keep its rollback backup')
+        self.assertEqual([], relay.verify_checksum_manifest(store)[1])
 
     def test_export_clone_import_resume_round_trip(self):
         # The full handoff: export from A, clone A (no .project-relay/ --
@@ -215,6 +248,47 @@ class TestZipHandoff(V3Base):
         with self.assertRaises(SyncError):
             sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'evil-out')
 
+    def test_read_bundle_zip_rejects_entry_count_limit(self):
+        zip_path = Path(self.temp.name) / 'many.zip'
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'a')
+            zf.writestr('b.txt', b'b')
+        old = sync.MAX_BUNDLE_ENTRIES
+        sync.MAX_BUNDLE_ENTRIES = 1
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'many-out')
+        finally:
+            sync.MAX_BUNDLE_ENTRIES = old
+        self.assertIn('条目过多', str(ctx.exception))
+
+    def test_read_bundle_zip_rejects_declared_total_limit(self):
+        zip_path = Path(self.temp.name) / 'total.zip'
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'aaaa')
+            zf.writestr('b.txt', b'bbbb')
+        old = sync.MAX_BUNDLE_TOTAL_BYTES
+        sync.MAX_BUNDLE_TOTAL_BYTES = 7
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'total-out')
+        finally:
+            sync.MAX_BUNDLE_TOTAL_BYTES = old
+        self.assertIn('解压总量', str(ctx.exception))
+
+    def test_read_bundle_zip_rejects_suspicious_compression_ratio(self):
+        zip_path = Path(self.temp.name) / 'ratio.zip'
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('zeros.bin', b'\x00' * 65536)
+        old = sync.MAX_BUNDLE_COMPRESSION_RATIO
+        sync.MAX_BUNDLE_COMPRESSION_RATIO = 2
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'ratio-out')
+        finally:
+            sync.MAX_BUNDLE_COMPRESSION_RATIO = old
+        self.assertIn('压缩比', str(ctx.exception))
+
     # ---- verify_bundle: the import gate (pure, works today) ----
 
     def test_verify_bundle_accepts_wellformed_bundle(self):
@@ -254,6 +328,38 @@ class TestZipHandoff(V3Base):
         (bundle / 'projects' / 'proj' / 'extra.md').write_bytes(b'x')
         with self.assertRaises(SyncError):
             sync.verify_bundle(bundle)
+
+    def test_verify_bundle_rejects_missing_source_device(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, source_device='')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('source_device', str(ctx.exception))
+
+    def test_verify_bundle_rejects_missing_exported_at(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, exported_at=None)
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('exported_at', str(ctx.exception))
+
+    def test_verify_bundle_rejects_bad_projects_shape(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, projects=[])
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('projects', str(ctx.exception))
+
+    def test_verify_bundle_rejects_bad_hash_format(self):
+        bundle = self._bundle_dir()
+        manifest = json.loads((bundle / 'manifest.json').read_text(encoding='utf-8'))
+        first = sorted(manifest['files'])[0]
+        manifest['files'][first] = 'not-a-sha256'
+        (bundle / 'manifest.json').write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('哈希格式', str(ctx.exception))
 
     # ---- export quality gate (pure: runs without _flow) ----
 

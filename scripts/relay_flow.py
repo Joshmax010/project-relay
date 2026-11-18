@@ -670,26 +670,26 @@ def _capture_inner(toplevel, agent, store_dir, adir, session=None,
 
 
 def capture(toplevel, agent, session=None, message=None, filename_tag=None):
-    """Public capture: new-agent join + agent-dir lock + agent log.
+    """Public capture: new-agent join + archive lock + agent lock + log.
 
     A first capture for an unknown agent IS the join event: the agent
-    dir is created and the routing table updated (outer lock, once).
-    The capture itself runs under that agent's own directory lock, so
-    two agents never block each other; two sessions of the same agent
-    queue on the small lock.
+    dir is created and the routing table updated. The archive-wide lock
+    is taken for the whole capture so a concurrent import/export cannot
+    interleave with the raw entry and its later manifest refresh. The
+    per-agent lock still serializes two sessions of the same agent.
     """
     store_dir = relay.resolve_store_dir(toplevel)
     toplevel = relay.git_toplevel(toplevel)
     adir = relay.agent_dir(store_dir, agent)
-    if not adir.is_dir():
-        with relay.outer_lock(store_dir):
+    with relay.outer_lock(store_dir):
+        if not adir.is_dir():
             relay.ensure_agent_dir(store_dir, agent)
-    with relay.agent_lock(store_dir, agent):
-        info = _capture_inner(toplevel, agent, store_dir, adir, session,
-                              message, filename_tag)
-        if not info.get('deduped'):
-            relay.append_agent_log(store_dir, agent, 'capture',
-                                   'cap-%04d' % info['seq'])
+        with relay.agent_lock(store_dir, agent):
+            info = _capture_inner(toplevel, agent, store_dir, adir, session,
+                                  message, filename_tag)
+            if not info.get('deduped'):
+                relay.append_agent_log(store_dir, agent, 'capture',
+                                       'cap-%04d' % info['seq'])
     return info
 
 
@@ -2021,50 +2021,51 @@ def summarize(toplevel, agent, source='manual', semantic_text=None, session=None
               semantic_auto=False, trigger=None, llm_usage=None):
     """Public summarize: one agent's queue into that agent's own memory.
 
-    New-agent join + that agent's directory lock + changes.md section +
-    agent log (both inside the same lock). The checksum manifest refresh
-    and any stale device notice clear are outer-layer work and happen in
-    _summarize_locked. Batch 3.4: trigger names the scale class for the
-    stats row (None derives it from source); llm_usage is an optional
-    caller-reported {calls, input_tokens, output_tokens} object that turns
-    the LLM figures from estimates into measured values. When the cost
-    fuse is tripped, caller-supplied (non-auto) semantic text is dropped
-    and the run degrades to assembled-only; tool-generated auto text
-    (zero model calls by construction) passes through.
+    Archive lock + that agent's directory lock + changes.md section +
+    agent log (both inside the same lock). The archive-wide lock matches
+    import/export so a zip landing cannot interleave with a summarize's
+    memory/changes writes and manifest refresh. Batch 3.4: trigger names
+    the scale class for the stats row (None derives it from source);
+    llm_usage is an optional caller-reported {calls, input_tokens,
+    output_tokens} object that turns the LLM figures from estimates into
+    measured values. When the cost fuse is tripped, caller-supplied
+    (non-auto) semantic text is dropped and the run degrades to
+    assembled-only; tool-generated auto text (zero model calls by
+    construction) passes through.
     """
     store_dir = relay.resolve_store_dir(toplevel)
     toplevel = relay.git_toplevel(toplevel)
     adir = relay.agent_dir(store_dir, agent)
-    if not adir.is_dir():
-        with relay.outer_lock(store_dir):
+    with relay.outer_lock(store_dir):
+        if not adir.is_dir():
             relay.ensure_agent_dir(store_dir, agent)
-    with relay.agent_lock(store_dir, agent):
-        record = _summarize_locked(toplevel, agent, store_dir, adir, source,
-                                   semantic_text, session, semantic_auto,
-                                   trigger, llm_usage)
-        if record.get('noop'):
+        with relay.agent_lock(store_dir, agent):
+            record = _summarize_locked(toplevel, agent, store_dir, adir, source,
+                                       semantic_text, session, semantic_auto,
+                                       trigger, llm_usage)
+            if record.get('noop'):
+                return record
+            if record.get('degraded'):
+                relay.append_agent_log(store_dir, agent, 'summarize-degraded',
+                                       's%04d' % record.get('seq', 0))
+                return record
+            if record.get('branched'):
+                # A branched product wrote no archive file (its seq is not a
+                # summary seq), so there is no changes.md section and nothing
+                # to refresh -- just log the branch.
+                relay.append_agent_log(store_dir, agent, 'summarize-branched',
+                                       record['branch'])
+                return record
+            _append_changes_record(store_dir, agent, record)
+            relay.append_agent_log(store_dir, agent, 'summarize',
+                                   's%04d' % record['seq'])
+            # The manifest invariant: once a manifest exists, EVERY archive
+            # writer must refresh it, or the next resume correctly reports a
+            # stale manifest as corruption. This runs last, after the
+            # changes.md section and the log line above.
+            relay.update_checksum_manifest(store_dir)
+            (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
             return record
-        if record.get('degraded'):
-            relay.append_agent_log(store_dir, agent, 'summarize-degraded',
-                                   's%04d' % record.get('seq', 0))
-            return record
-        if record.get('branched'):
-            # A branched product wrote no archive file (its seq is not a
-            # summary seq), so there is no changes.md section and nothing
-            # to refresh -- just log the branch.
-            relay.append_agent_log(store_dir, agent, 'summarize-branched',
-                                   record['branch'])
-            return record
-        _append_changes_record(store_dir, agent, record)
-        relay.append_agent_log(store_dir, agent, 'summarize',
-                               's%04d' % record['seq'])
-        # The manifest invariant: once a manifest exists, EVERY archive
-        # writer must refresh it, or the next resume correctly reports a
-        # stale manifest as corruption. This runs last, after the
-        # changes.md section and the log line above.
-        relay.update_checksum_manifest(store_dir)
-        (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
-        return record
 
 
 def _summarize_locked(toplevel, agent, store_dir, adir, source='manual',
@@ -3209,19 +3210,30 @@ def resume(toplevel):
         if corrections:
             sec4 += '\n对账纠正 %d 条已记入总记忆（见一段现算结果）' % len(corrections)
     # Overall memory: computed from the agents' files, then persisted to
-    # outer state.md (the one bounded write outside section 4).
-    try:
-        state_text, cross_check = _compute_overall_memory(
-            store_dir, toplevel, agents, corrections)
-        with relay.outer_lock(store_dir):
-            atomic(store_dir / 'state.md', state_text.encode('utf-8'))
-        relay.update_checksum_manifest(store_dir)
-    except Exception as exc:
-        state_text = (store_dir / 'state.md').read_text(encoding='utf-8') \
-            if (store_dir / 'state.md').exists() else ''
-        cross_check = {'conflicts': [], 'facts': {}, 'error': repr(exc)}
-        banner = ('【带病接手】总记忆现算失败：%r，已用上次落盘的 state.md 继续。' % exc) \
-            + ('\n' + banner if banner else '')
+    # outer state.md (the one bounded write outside section 4). When the
+    # checksum manifest is already mismatched, do NOT persist a recomputed
+    # state.md or refresh the manifest: that would launder a corrupted
+    # archive into a fresh baseline and hide the damage from the next
+    # resume. Keep the last good state for the report and leave the
+    # archive byte-for-byte as found.
+    if manifest_mismatches:
+        state_path = store_dir / 'state.md'
+        state_text = state_path.read_text(encoding='utf-8') \
+            if state_path.exists() else ''
+        cross_check = {'conflicts': [], 'facts': {}, 'error': 'checksum-mismatch'}
+    else:
+        try:
+            state_text, cross_check = _compute_overall_memory(
+                store_dir, toplevel, agents, corrections)
+            with relay.outer_lock(store_dir):
+                atomic(store_dir / 'state.md', state_text.encode('utf-8'))
+            relay.update_checksum_manifest(store_dir)
+        except Exception as exc:
+            state_text = (store_dir / 'state.md').read_text(encoding='utf-8') \
+                if (store_dir / 'state.md').exists() else ''
+            cross_check = {'conflicts': [], 'facts': {}, 'error': repr(exc)}
+            banner = ('【带病接手】总记忆现算失败：%r，已用上次落盘的 state.md 继续。' % exc) \
+                + ('\n' + banner if banner else '')
     # Section 1: archive summary, from the computed state.
     gstate, ginfo = relay.goal_status(toplevel)
     gstate_display = '待本机确认' if gstate == 'imported' else gstate
