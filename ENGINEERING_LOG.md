@@ -156,3 +156,27 @@
 
 - 本轮不改变导出包格式或 manifest 结构。
 - 仍未处理的小项：`relay_work.merge` 在无 Git 身份宿主机上会因 `Author identity unknown` 失败；`smoke_command` 仅执行本地 config（本地配置，不是远程输入）；下一轮评估。
+
+## 2026-11-18 · 第 6 轮
+
+### 范围
+
+- 基线：第 5 轮提交 `9193092`，全量 243 tests OK。
+- 本轮审计 `relay.py` 的 `init` 档案目录边界，并复核 `relay_work.py` 的 enter/status/review/merge 分支逻辑。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 安全 | `relay.init` 只拒绝 `.project-relay` 根 symlink，未拒绝已存在的 `agents`/`receipts`/`state`/`archive` 子目录 symlink；仓库预置 `.project-relay/agents` 指向外部时，init 会写入仓库外 | 在 init 写骨架前，若 store 已存在则调用 `_reject_store_symlinks(store_dir)`；补 `test_init_rejects_symlinked_agent_dir`（宿主不支持 symlink 时 skip） |
+
+### 验证
+
+- `python -m unittest tests.test_v3_layout -v`：19 tests OK（1 skipped：宿主不支持创建 symlink）。
+- 全量回归：**244 tests OK**（332.140s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round6-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- `relay_work.py` 的 enter/status/review/merge 本轮未发现高严重度问题；`relay_work.merge` 仍依赖宿主机 Git identity（本地已配置 `DSH Agent <dsh@local.invalid>`）。
+- 下一轮继续审计统计/分叉模块和 CLI 错误路径；发现低风险问题直接修复并补回归。

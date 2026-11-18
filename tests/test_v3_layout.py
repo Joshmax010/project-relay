@@ -38,6 +38,19 @@ class TestInitLayout(V3Base):
                                 'missing agents/%s/%s/' % (agent, d))
             self.assertTrue((adir / 'log.jsonl').is_file())
 
+    def test_init_rejects_symlinked_agent_dir(self):
+        root = self.make_repo('proj')
+        store = root / '.project-relay'
+        store.mkdir()
+        outside = Path(self.temp.name) / 'outside'
+        outside.mkdir()
+        try:
+            (store / 'agents').symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink not supported on this host')
+        with self.assertRaises(RelayError):
+            relay.init(root)
+
     def test_init_is_idempotent_and_keeps_content(self):
         root = self.init()
         store = self.store_dir(root)

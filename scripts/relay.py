@@ -557,6 +557,8 @@ def init(toplevel):
     root = Path(main_worktree(toplevel))
     store_dir = root / STORE_DIRNAME
     require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
+    if store_dir.exists():
+        _reject_store_symlinks(store_dir)
     (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
     for agent in ACTIVE_AGENTS:
