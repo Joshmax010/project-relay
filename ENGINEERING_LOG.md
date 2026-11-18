@@ -103,3 +103,31 @@
 
 - 本轮不改变 ZIP 包格式；只加严 manifest 校验与本机文件边界。
 - 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；zip 解包失败时可能保留部分临时目录；均属 P3，下一轮评估。
+
+## 2026-11-18 · 第 4 轮
+
+### 范围
+
+- 基线：第 3 轮提交 `8a4365c`，全量 238 tests OK。
+- 本轮审计 ZIP 导出/导入辅助函数的失败原子性，以及 `export_bundle` 的 strict 质量门执行顺序。
+- 所有改动仍在 worktree `D:\AAAAA\dsh\worktrees\project-relay\deepseek-harness` 的分支 `agent/deepseek-harness/engineering-audit` 上；主工作树保持 `main` 干净。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 数据完整性 | `write_bundle_zip` 直接写目标 zip，打包中途失败会留下半成品；`export_zip` 又拒绝覆盖已存在目标，半成品会成为永久障碍 | 改为先写同目录 `tempfile.mkstemp` 临时文件，全部条目写完后 `os.replace` 原子发布；异常时删除临时文件并重新抛出 |
+| P1 数据安全 | `read_bundle_zip` 直接向目标目录逐条解压，校验通过但后面某条解压损坏时会留下前面的文件 | 改为在同级 `.relay-unzip-*` 临时目录解压，全部成功后再替换目标目录；任何异常清理临时目录并重新抛出，保留原有条目数/大小/压缩比限制 |
+| P2 质量门 | `export_bundle` 先创建目标目录并写入 payload，最后才检查 strict 阻断项；直接调用时 strict 拒绝会留下部分导出文件 | 把 strict 阻断检查提前到 payload 写入之前，阻断时只可能留下空目标目录，不写任何文件 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip -v`：31 tests OK（新增 3 条失败原子性/空目标回归）。
+- 全量回归：`python -m unittest discover -s tests -v` → **241 tests OK**（325.913s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round4-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮不改变 ZIP 包格式，也不改变 manifest 结构；只修失败路径上的临时文件/半成品清理。
+- `export_bundle` strict 拒绝时目标目录可能为空目录（`export_zip` 使用临时目录，不受影响）；后续可考虑连空目录也不创建。
+- 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；`relay_work.merge` 在无 Git 身份的宿主机上会因 `Author identity unknown` 失败；均属环境/低风险项，下一轮评估。

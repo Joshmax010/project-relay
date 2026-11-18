@@ -869,14 +869,35 @@ def _restore_land_backup(local_dir, merged_files, backup):
 
 
 def write_bundle_zip(bundle_dir, zip_path):
-    """Pack a bundle directory into a zip with identical internal layout."""
+    """Pack a bundle directory into a zip with identical internal layout.
+
+    The archive is written to a sibling temp file and published with
+    os.replace only after every entry is written.  A failed pack therefore
+    never leaves a partial target zip behind -- export_zip refuses to
+    overwrite an existing target, so a partial file would otherwise be a
+    permanent obstacle until removed by hand.
+    """
     bundle = Path(bundle_dir)
+    zip_path = Path(zip_path)
     require((bundle / 'manifest.json').exists(), '非导出包目录：' + str(bundle))
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(bundle.rglob('*')):
-            if path.is_file():
-                zf.write(path, path.relative_to(bundle).as_posix())
-    return Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=zip_path.name + '.',
+                                    suffix='.tmp', dir=str(zip_path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(bundle.rglob('*')):
+                if path.is_file():
+                    zf.write(path, path.relative_to(bundle).as_posix())
+        os.replace(tmp_path, zip_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return zip_path
 
 
 def read_bundle_zip(zip_path, dest_dir):
@@ -886,50 +907,67 @@ def read_bundle_zip(zip_path, dest_dir):
     anything is written -- the old code checked-and-wrote one entry at
     a time, so a bad entry late in the list left earlier entries on
     disk. Directory entries are skipped (our writer never emits them);
-    duplicate names are refused."""
+    duplicate names are refused.
+
+    Extraction is staged in a sibling temp directory and published with
+    os.replace only after every entry has been read and written.  A
+    corrupt/truncated entry late in the zip therefore cannot leave a
+    partial destination behind.
+    """
     dest = Path(dest_dir)
     require(not dest.exists() or not any(dest.iterdir()), '解包目标目录非空：' + str(dest))
-    dest.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        infos = [info for info in zf.infolist()
-                 if not info.is_dir() and not info.filename.endswith('/')]
-        require(len(infos) <= MAX_BUNDLE_ENTRIES,
-                '包内条目过多（%d > %d），拒绝解包'
-                % (len(infos), MAX_BUNDLE_ENTRIES))
-        names = [info.filename for info in infos]
-        require(len(set(names)) == len(names), '包内有重名条目，拒绝解包')
-        declared_total = 0
-        for info in infos:
-            _jail_check(info.filename)
-            if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                raise RelayError('包内含符号链接条目：' + info.filename)
-            require(info.file_size <= MAX_BUNDLE_FILE_BYTES,
-                    '包内单文件过大（%s），拒绝解包：%s'
-                    % (info.file_size, info.filename))
-            declared_total += info.file_size
-            require(declared_total <= MAX_BUNDLE_TOTAL_BYTES,
-                    '包内解压总量过大（> %d 字节），拒绝解包'
-                    % MAX_BUNDLE_TOTAL_BYTES)
-            if info.compress_size > 0 and info.file_size > 0:
-                ratio = info.file_size / info.compress_size
-                require(ratio <= MAX_BUNDLE_COMPRESSION_RATIO,
-                        '包内条目压缩比异常（%.0f:1），拒绝解包：%s'
-                        % (ratio, info.filename))
-        written_total = 0
-        for info in infos:
-            # Read one byte past the per-file cap instead of zf.read(info):
-            # the central-directory size can lie, and an unbounded read
-            # would allocate the whole decompressed bomb in memory first.
-            with zf.open(info) as src:
-                data = src.read(MAX_BUNDLE_FILE_BYTES + 1)
-            require(len(data) <= MAX_BUNDLE_FILE_BYTES,
-                    '包内单文件实际过大，拒绝解包：' + info.filename)
-            written_total += len(data)
-            require(written_total <= MAX_BUNDLE_TOTAL_BYTES,
-                    '包内解压总量实际过大，拒绝解包')
-            target = dest / info.filename
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.relay-unzip-', dir=str(dest.parent)))
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = [info for info in zf.infolist()
+                     if not info.is_dir() and not info.filename.endswith('/')]
+            require(len(infos) <= MAX_BUNDLE_ENTRIES,
+                    '包内条目过多（%d > %d），拒绝解包'
+                    % (len(infos), MAX_BUNDLE_ENTRIES))
+            names = [info.filename for info in infos]
+            require(len(set(names)) == len(names), '包内有重名条目，拒绝解包')
+            declared_total = 0
+            for info in infos:
+                _jail_check(info.filename)
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RelayError('包内含符号链接条目：' + info.filename)
+                require(info.file_size <= MAX_BUNDLE_FILE_BYTES,
+                        '包内单文件过大（%s），拒绝解包：%s'
+                        % (info.file_size, info.filename))
+                declared_total += info.file_size
+                require(declared_total <= MAX_BUNDLE_TOTAL_BYTES,
+                        '包内解压总量过大（> %d 字节），拒绝解包'
+                        % MAX_BUNDLE_TOTAL_BYTES)
+                if info.compress_size > 0 and info.file_size > 0:
+                    ratio = info.file_size / info.compress_size
+                    require(ratio <= MAX_BUNDLE_COMPRESSION_RATIO,
+                            '包内条目压缩比异常（%.0f:1），拒绝解包：%s'
+                            % (ratio, info.filename))
+            written_total = 0
+            for info in infos:
+                # Read one byte past the per-file cap instead of zf.read(info):
+                # the central-directory size can lie, and an unbounded read
+                # would allocate the whole decompressed bomb in memory first.
+                with zf.open(info) as src:
+                    data = src.read(MAX_BUNDLE_FILE_BYTES + 1)
+                require(len(data) <= MAX_BUNDLE_FILE_BYTES,
+                        '包内单文件实际过大，拒绝解包：' + info.filename)
+                written_total += len(data)
+                require(written_total <= MAX_BUNDLE_TOTAL_BYTES,
+                        '包内解压总量实际过大，拒绝解包')
+                target = staging / info.filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        if dest.exists():
+            try:
+                dest.rmdir()
+            except OSError:
+                raise RelayError('解包目标目录非空：' + str(dest))
+        os.replace(staging, dest)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return dest
 
 
@@ -1251,6 +1289,13 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
     payload = _collect_payload(store_dir)
     redacted, hits = _redact_payload(payload)
     quality_gaps = _export_quality_gaps(store_dir.parent, redacted)
+    if strict:
+        blocked = [g for g in quality_gaps
+                   if g.get('severity') == QUALITY_BLOCK]
+        if blocked:
+            raise RelayError(
+                '导出前置检查未通过（%d 项阻断）：%s'
+                % (len(blocked), '；'.join(g['message'] for g in blocked)))
     manifest_files = {}
     entry_count = 0
     proj_dir = dest / 'projects' / slug
@@ -1285,13 +1330,6 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
         # side is where the gaps become visible before anyone ships it.
         'quality_gaps': quality_gaps,
     }
-    if strict:
-        blocked = [g for g in quality_gaps
-                   if g.get('severity') == QUALITY_BLOCK]
-        if blocked:
-            raise RelayError(
-                '导出前置检查未通过（%d 项阻断）：%s'
-                % (len(blocked), '；'.join(g['message'] for g in blocked)))
     # All gates passed: only now repair the local copies, then refresh the
     # checksum manifest. A strict rejection above leaves local bytes and
     # the old manifest exactly as they were.

@@ -241,6 +241,87 @@ class TestZipHandoff(V3Base):
         self.assertEqual(2, manifest['format_major'])
         self.assertEqual('project-relay-export', manifest['format'])
 
+    def test_write_bundle_zip_failure_leaves_target_absent(self):
+        bundle = self._bundle_dir(files={'goal.md': b'# goal\n'})
+        zip_path = Path(self.temp.name) / 'candidate.zip'
+        real = sync.zipfile.ZipFile
+
+        class BoomZip:
+            def __init__(self, file, mode='r', *args, **kwargs):
+                self._z = real(file, mode, *args, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._z.close()
+                return False
+
+            def write(self, *args, **kwargs):
+                self._z.write(*args, **kwargs)
+                raise OSError('simulated pack failure')
+
+        sync.zipfile.ZipFile = BoomZip
+        try:
+            with self.assertRaises(OSError):
+                sync.write_bundle_zip(bundle, zip_path)
+        finally:
+            sync.zipfile.ZipFile = real
+        self.assertFalse(zip_path.exists(),
+                         'a failed pack must not publish a partial target')
+        self.assertEqual([], list(zip_path.parent.glob(zip_path.name + '.*')),
+                         'a failed pack must clean its sibling temp file')
+
+    def test_read_bundle_zip_corrupt_entry_leaves_no_partial_destination(self):
+        zip_path = Path(self.temp.name) / 'corrupt.zip'
+        real = sync.zipfile.ZipFile
+        with real(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'a')
+            zf.writestr('b.txt', b'b')
+
+        class BoomZip:
+            def __init__(self, file, *args, **kwargs):
+                self._z = real(file, *args, **kwargs)
+                self._opened = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._z.close()
+                return False
+
+            def infolist(self):
+                return self._z.infolist()
+
+            def open(self, info):
+                self._opened += 1
+                if self._opened == 2:
+                    raise OSError('simulated corrupt entry')
+                return self._z.open(info)
+
+        dest = Path(self.temp.name) / 'corrupt-out'
+        sync.zipfile.ZipFile = BoomZip
+        try:
+            with self.assertRaises(OSError):
+                sync.read_bundle_zip(zip_path, dest)
+        finally:
+            sync.zipfile.ZipFile = real
+        self.assertFalse(dest.exists(),
+                         'a late corrupt entry must not leave a partial destination')
+        self.assertEqual([], list(dest.parent.glob('.relay-unzip-*')),
+                         'a failed unpack must remove its staging directory')
+
+    def test_export_bundle_strict_failure_leaves_no_payload(self):
+        root = self.init()
+        self.confirm_goal(root)
+        self.capture(root, 'codex')
+        dest = Path(self.temp.name) / 'strict-bundle'
+        with self.assertRaises(SyncError):
+            sync.export_bundle(self.store_dir(root), dest, 'dev', 'dev-1', strict=True)
+        self.assertFalse(dest.exists() and any(dest.iterdir()),
+                         'strict rejection must happen before payload writes')
+
     def test_read_bundle_zip_rejects_escaping_entry(self):
         zip_path = Path(self.temp.name) / 'evil.zip'
         with zipfile.ZipFile(zip_path, 'w') as zf:
