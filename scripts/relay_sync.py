@@ -22,6 +22,7 @@ import importlib.util
 import hashlib
 import io
 import json
+from contextlib import nullcontext
 import os
 import re
 import secrets
@@ -62,6 +63,13 @@ BUNDLE_FORMAT = 'project-relay-export'
 FORMAT_MAJOR = 2
 FORMAT_MINOR = 0
 TOOL_VERSION = 'project-relay-v3'
+# Local zip import is user-mediated, but a malformed or malicious zip
+# must not exhaust memory/disk before manifest verification. These are
+# deliberately generous for a text archive and still bound a zip bomb.
+MAX_BUNDLE_ENTRIES = 20000
+MAX_BUNDLE_FILE_BYTES = 128 * 1024 * 1024
+MAX_BUNDLE_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_BUNDLE_COMPRESSION_RATIO = 1000
 
 MARKER_PREFIXES = ('<<<<<<<', '=======', '>>>>>>>')
 _PROTECTED_HEADER_FIELDS = ('fingerprint', 'fact_hash', 'backfill', 'anchor')
@@ -72,18 +80,12 @@ FORK_NOTE_RE = re.compile(r'^- 分叉待裁：(.+?)（对方）：(.*)$')
 _PROJECT_SLUG_RE = re.compile(r'^[a-z0-9._-]+$')
 
 # Device-local files inside the store: never shipped, never merged.
-_LOCAL_ONLY_OUTER = {
-    'config.json', 'state/device-notice.json',
-    'state/goal-conflict.json', 'state/goal-imported.json',
-    'state/rollback-note.json',
-}
-# Per-agent device-local state (measurement / recovery working files).
-_LOCAL_ONLY_AGENT_STATE = {'cursor.json', 'baseline.json',
-                           'numbers.json', 'digest.json', 'enforce.json',
-                           'forks.json'}
-# Per-agent device-local files at the agent dir root (install records).
-_LOCAL_ONLY_AGENT_FILES = {'recipe.json'}
-_LOCAL_ONLY_AGENT_DIRS = {'tx', 'backups', 'stats'}
+# The sets live in relay.py so the ZIP payload and the checksum manifest
+# use exactly the same definition of "machine-local".
+_LOCAL_ONLY_OUTER = relay.LOCAL_ONLY_OUTER
+_LOCAL_ONLY_AGENT_STATE = relay.LOCAL_ONLY_AGENT_STATE
+_LOCAL_ONLY_AGENT_FILES = relay.LOCAL_ONLY_AGENT_FILES
+_LOCAL_ONLY_AGENT_DIRS = relay.LOCAL_ONLY_AGENT_DIRS
 
 
 def _is_payload_file(rel):
@@ -95,9 +97,10 @@ def _is_payload_file(rel):
     machine state. Device-local files never ship: lock files, the
     checksum manifest (regenerated after landing), rollback trash,
     outer config + adjudication markers, per-agent measurement state
-    (cursor/baseline/numbers/digest/enforce/forks), recovery state
-    (tx/backups), per-agent stats (stats/), and install records
-    (recipe.json).
+    (cursor/baseline/numbers/digest/enforce/forks/backlog-notice),
+    recovery state (tx/backups), per-agent stats (stats/), install
+    records (recipe.json); config.json and state/fingerprint-cache.json
+    are machine-local too.
     """
     if rel.endswith('.lock'):
         return False
@@ -105,19 +108,9 @@ def _is_payload_file(rel):
         return False
     if 'rollback-trash/' in rel:
         return False
-    if rel in _LOCAL_ONLY_OUTER:
+    if relay.is_local_only_path(rel):
         return False
     if rel.startswith('agents/'):
-        parts = rel.split('/')
-        if len(parts) < 3:
-            return False
-        if parts[2] in _LOCAL_ONLY_AGENT_DIRS:
-            return False
-        if len(parts) >= 4 and parts[2] == 'state' \
-                and parts[3] in _LOCAL_ONLY_AGENT_STATE:
-            return False
-        if len(parts) == 3 and parts[2] in _LOCAL_ONLY_AGENT_FILES:
-            return False
         return True
     if rel.startswith('receipts/'):
         return True
@@ -329,12 +322,22 @@ def _fix_local_redactions(store_dir, original, redacted):
 
     Bundle-only redaction would make the next pack re-export the unredacted
     originals and manufacture merge conflicts on the peer, so a rescan hit
-    repairs the local copy too (atomic write, counted in the receipt)."""
+    repairs the local copy too (atomic write, counted in the receipt).
+    All writes are rolled back if one fails, so a partial repair cannot
+    leave the local archive half-redacted with a stale manifest."""
+    changed = [rel for rel in sorted(original) if original[rel] != redacted[rel]]
     fixed = []
-    for rel in sorted(original):
-        if original[rel] != redacted[rel]:
+    try:
+        for rel in changed:
             atomic(store_dir / rel, redacted[rel])
             fixed.append(rel)
+    except Exception:
+        for rel in fixed:
+            try:
+                atomic(store_dir / rel, original[rel])
+            except Exception:
+                pass
+        raise
     return fixed
 
 
@@ -611,18 +614,12 @@ def _merge_state_md(local_text, incoming_text, filename='archive/state.md'):
     conflicts = []
     notes = []
     display = filename.rsplit('/', 1)[-1]
-    # Batch 10: a fresh-device import used to be noisy. Two leftovers
-    # from that shape are cleaned here, before any merge decision:
-    #   1. 分叉待裁 notes left by a previous import (they describe a
-    #      fork that no longer exists once the archive is adopted);
-    #   2. the whole local file still being the init template, where
-    #      'adopting the incoming block' is the only sensible outcome.
-    # Neither changes the safety rule: real content conflicts still keep
-    # the local value and still produce a fork note.
-    stale_fork = re.compile(r'^- 分叉待裁：.*\n?', re.MULTILINE)
-    if STATE_END in local_text and stale_fork.search(local_text):
-        local_text = stale_fork.sub('', local_text)
-        notes.append('%s 清理了上一次导入遗留的「分叉待裁」记录' % display)
+    # Batch 10/Batch 19: do NOT blanket-delete 分叉待裁 notes here. An
+    # unresolved fork may still be waiting for sync_resolve; deleting it
+    # made the conflict disappear from list_pending_resolutions without a
+    # decision. Existing notes are parsed after the block is split and
+    # only dropped when this merge proves them resolved (local value now
+    # equals incoming) or stale (the peer's value changed again).
     if STATE_BEGIN not in local_text or STATE_END not in local_text:
         if local_text != incoming_text:
             conflicts.append({'file': filename,
@@ -639,6 +636,17 @@ def _merge_state_md(local_text, incoming_text, filename='archive/state.md'):
     i_stop = incoming_text.index(STATE_END) + len(STATE_END)
     i_block = incoming_text[i_start:i_stop]
     i_before, i_after = incoming_text[:i_start], incoming_text[i_stop:]
+    # Pull existing 分叉待裁 notes out of the outside-block text. They are
+    # re-added only if still unresolved after this merge (see below).
+    existing_fork = []
+    kept_after = []
+    for line in l_after.splitlines(True):
+        m = FORK_NOTE_RE.match(line.strip())
+        if m:
+            existing_fork.append((m.group(1), m.group(2), line.rstrip('\r\n')))
+        else:
+            kept_after.append(line)
+    l_after = ''.join(kept_after)
     if (l_before, l_after) != (i_before, i_after):
         # Batch 10: on a fresh device the outside-block text is the init
         # template's explanatory prose, so 'different' means 'local never
@@ -706,7 +714,7 @@ def _merge_state_md(local_text, incoming_text, filename='archive/state.md'):
                 merged_values[key] = i_values[key]
                 notes.append('%s 的 %s 本机为空，采纳对方内容' % (display, key))
                 continue
-            fork_notes.append('- 分叉待裁：%s（对方）：%s' % (key, i_values[key]))
+            fork_notes.append((key, '- 分叉待裁：%s（对方）：%s' % (key, i_values[key])))
             conflicts.append({'file': filename, 'key': key,
                               'rule': 'fork-note-kept-local',
                               'local': l_values[key], 'incoming': i_values[key]})
@@ -714,13 +722,35 @@ def _merge_state_md(local_text, incoming_text, filename='archive/state.md'):
         if key not in merged_values:
             order.append(key)
             merged_values[key] = i_values[key]
+    # Existing 分叉待裁 notes: keep only those still unresolved. A note is
+    # resolved when the merged value now equals the peer's value; it is
+    # stale when the peer has since changed again (the loop above then
+    # emits a fresh note for the current values).
+    kept_existing = []
+    kept_keys = set()
+    dropped_existing = 0
+    for key, old_incoming, line in existing_fork:
+        if key in i_values:
+            if merged_values.get(key) == i_values[key]:
+                dropped_existing += 1
+                continue
+            if i_values[key] != old_incoming:
+                dropped_existing += 1
+                continue
+        kept_existing.append(line)
+        kept_keys.add(key)
+    if dropped_existing:
+        notes.append('%s 清理了 %d 条已裁决或过期的「分叉待裁」记录'
+                     % (display, dropped_existing))
     block_lines = [STATE_BEGIN]
     for key in order:
         block_lines.append('- %s：%s' % (key, merged_values[key]))
     block_lines.append(STATE_END)
     merged = l_before + '\n'.join(block_lines)
-    if fork_notes:
-        merged += '\n' + '\n'.join(fork_notes)
+    all_fork_lines = kept_existing + [line for key, line in fork_notes
+                                      if key not in kept_keys]
+    if all_fork_lines:
+        merged += '\n' + '\n'.join(all_fork_lines)
     merged += l_after
     return merged, conflicts, notes
 
@@ -746,16 +776,30 @@ def _map_queue(incoming_queue):
 
 
 def _shadow_copy(local_dir):
-    """Copy the whole project store to a scratch dir (symlinks refused)."""
+    """Copy the formal project store to a scratch dir (symlinks refused).
+
+    Lock files and rollback-trash are skipped: they are not archive payload,
+    and a persistent land backup can be large. Every *.lock is skipped, not
+    just the archive-wide one, because another writer may hold an agent lock
+    open (Windows refuses to read a locked file)."""
     local_dir = Path(local_dir)
     shadow = Path(tempfile.mkdtemp(prefix='relay-merge-'))
     for root, dirs, files in os.walk(local_dir):
         root = Path(root)
+        kept_dirs = []
         for d in dirs:
-            if (root / d).is_symlink():
-                raise RelayError('本地仓含符号链接，拒绝合并：' + str(root / d))
+            here = root / d
+            rel_parts = here.relative_to(local_dir).parts
+            if rel_parts[:2] == ('archive', 'rollback-trash'):
+                continue
+            if here.is_symlink():
+                raise RelayError('本地仓含符号链接，拒绝合并：' + str(here))
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
         for f in files:
             src = root / f
+            if f.endswith('.lock'):
+                continue
             if src.is_symlink():
                 raise RelayError('本地仓含符号链接，拒绝合并：' + str(src))
             rel = src.relative_to(local_dir)
@@ -765,14 +809,21 @@ def _shadow_copy(local_dir):
     return shadow
 
 
-def _land_files(local_dir, merged_files):
+def _land_files(local_dir, merged_files, backup_dir=None):
     """Atomic-ish landing with full rollback on failure.
 
-    Every replaced file is first backed up to a temp dir; on any error the
-    backups are written back and new files removed, so the store keeps its
-    pre-merge bytes. Returns the backup dir (caller removes on success)."""
+    Every replaced file is first backed up; on any error the backups are
+    written back and new files removed, so the store keeps its pre-merge
+    bytes. Returns the backup dir (caller removes on success). When
+    backup_dir is given, the backup lives under the store's
+    archive/rollback-trash/ so a later post-land failure or process crash
+    still leaves the pre-merge bytes available for recovery."""
     local_dir = Path(local_dir)
-    backup = Path(tempfile.mkdtemp(prefix='relay-land-'))
+    if backup_dir is not None:
+        backup = Path(backup_dir)
+        backup.mkdir(parents=True, exist_ok=True)
+    else:
+        backup = Path(tempfile.mkdtemp(prefix='relay-land-'))
     backed = []
     added = []
     try:
@@ -799,15 +850,54 @@ def _land_files(local_dir, merged_files):
     return backup
 
 
+def _restore_land_backup(local_dir, merged_files, backup):
+    """Best-effort rollback of a landed merge from its persistent backup."""
+    local_dir = Path(local_dir)
+    backup = Path(backup)
+    for rel in sorted(merged_files):
+        snap = backup / rel
+        live = local_dir / rel
+        if snap.exists():
+            atomic(live, snap.read_bytes())
+        else:
+            try:
+                live.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
 def write_bundle_zip(bundle_dir, zip_path):
-    """Pack a bundle directory into a zip with identical internal layout."""
+    """Pack a bundle directory into a zip with identical internal layout.
+
+    The archive is written to a sibling temp file and published with
+    os.replace only after every entry is written.  A failed pack therefore
+    never leaves a partial target zip behind -- export_zip refuses to
+    overwrite an existing target, so a partial file would otherwise be a
+    permanent obstacle until removed by hand.
+    """
     bundle = Path(bundle_dir)
+    zip_path = Path(zip_path)
     require((bundle / 'manifest.json').exists(), '非导出包目录：' + str(bundle))
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for path in sorted(bundle.rglob('*')):
-            if path.is_file():
-                zf.write(path, path.relative_to(bundle).as_posix())
-    return Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=zip_path.name + '.',
+                                    suffix='.tmp', dir=str(zip_path.parent))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for path in sorted(bundle.rglob('*')):
+                if path.is_file():
+                    zf.write(path, path.relative_to(bundle).as_posix())
+        os.replace(tmp_path, zip_path)
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return zip_path
 
 
 def read_bundle_zip(zip_path, dest_dir):
@@ -817,23 +907,67 @@ def read_bundle_zip(zip_path, dest_dir):
     anything is written -- the old code checked-and-wrote one entry at
     a time, so a bad entry late in the list left earlier entries on
     disk. Directory entries are skipped (our writer never emits them);
-    duplicate names are refused."""
+    duplicate names are refused.
+
+    Extraction is staged in a sibling temp directory and published with
+    os.replace only after every entry has been read and written.  A
+    corrupt/truncated entry late in the zip therefore cannot leave a
+    partial destination behind.
+    """
     dest = Path(dest_dir)
     require(not dest.exists() or not any(dest.iterdir()), '解包目标目录非空：' + str(dest))
-    dest.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        infos = [info for info in zf.infolist()
-                 if not info.is_dir() and not info.filename.endswith('/')]
-        names = [info.filename for info in infos]
-        require(len(set(names)) == len(names), '包内有重名条目，拒绝解包')
-        for info in infos:
-            _jail_check(info.filename)
-            if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                raise RelayError('包内含符号链接条目：' + info.filename)
-        for info in infos:
-            target = dest / info.filename
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(info))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix='.relay-unzip-', dir=str(dest.parent)))
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = [info for info in zf.infolist()
+                     if not info.is_dir() and not info.filename.endswith('/')]
+            require(len(infos) <= MAX_BUNDLE_ENTRIES,
+                    '包内条目过多（%d > %d），拒绝解包'
+                    % (len(infos), MAX_BUNDLE_ENTRIES))
+            names = [info.filename for info in infos]
+            require(len(set(names)) == len(names), '包内有重名条目，拒绝解包')
+            declared_total = 0
+            for info in infos:
+                _jail_check(info.filename)
+                if (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    raise RelayError('包内含符号链接条目：' + info.filename)
+                require(info.file_size <= MAX_BUNDLE_FILE_BYTES,
+                        '包内单文件过大（%s），拒绝解包：%s'
+                        % (info.file_size, info.filename))
+                declared_total += info.file_size
+                require(declared_total <= MAX_BUNDLE_TOTAL_BYTES,
+                        '包内解压总量过大（> %d 字节），拒绝解包'
+                        % MAX_BUNDLE_TOTAL_BYTES)
+                if info.compress_size > 0 and info.file_size > 0:
+                    ratio = info.file_size / info.compress_size
+                    require(ratio <= MAX_BUNDLE_COMPRESSION_RATIO,
+                            '包内条目压缩比异常（%.0f:1），拒绝解包：%s'
+                            % (ratio, info.filename))
+            written_total = 0
+            for info in infos:
+                # Read one byte past the per-file cap instead of zf.read(info):
+                # the central-directory size can lie, and an unbounded read
+                # would allocate the whole decompressed bomb in memory first.
+                with zf.open(info) as src:
+                    data = src.read(MAX_BUNDLE_FILE_BYTES + 1)
+                require(len(data) <= MAX_BUNDLE_FILE_BYTES,
+                        '包内单文件实际过大，拒绝解包：' + info.filename)
+                written_total += len(data)
+                require(written_total <= MAX_BUNDLE_TOTAL_BYTES,
+                        '包内解压总量实际过大，拒绝解包')
+                target = staging / info.filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        if dest.exists():
+            try:
+                dest.rmdir()
+            except OSError:
+                raise RelayError('解包目标目录非空：' + str(dest))
+        os.replace(staging, dest)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return dest
 
 
@@ -861,11 +995,36 @@ def verify_bundle(bundle_dir):
     if manifest.get('format_minor') != FORMAT_MINOR:
         warnings.append('包格式次版本 %s 与本工具 %s 不同，未知字段将被忽略'
                         % (manifest.get('format_minor'), FORMAT_MINOR))
+    # Validate the manifest's identity fields BEFORE import_bundle can
+    # init a missing store or land files; these used to be read only after
+    # merging, so a malformed bundle could leave a half-initialized store.
+    require(isinstance(manifest.get('source_device'), str)
+            and manifest['source_device'].strip(),
+            'manifest 缺少 source_device，拒绝导入')
+    require(isinstance(manifest.get('source_device_id'), str),
+            'manifest 的 source_device_id 不是字符串，拒绝导入')
+    require(isinstance(manifest.get('exported_at'), str)
+            and manifest['exported_at'].strip(),
+            'manifest 缺少 exported_at，拒绝导入')
+    projects = manifest.get('projects')
+    require(isinstance(projects, list) and len(projects) == 1,
+            'manifest 的 projects 必须是单项目列表，拒绝导入')
+    require(isinstance(projects[0], dict)
+            and isinstance(projects[0].get('slug'), str)
+            and projects[0]['slug'].strip(),
+            'manifest 的项目缺少 slug，拒绝导入')
+    slug = projects[0]['slug']
+    require(_PROJECT_SLUG_RE.match(slug) is not None and slug not in ('.', '..'),
+            'manifest 的项目名非法：%r' % (slug,))
+    prefix = 'projects/%s/' % slug
     listed = manifest.get('files')
     require(isinstance(listed, dict) and listed, 'manifest 缺少文件清单，拒绝导入')
     for rel in listed:
         _jail_check(rel)
-        require(rel.startswith('projects/'), '清单含非项目文件，拒绝导入：' + rel)
+        require(rel.startswith(prefix), '清单含其它项目文件，拒绝导入：' + rel)
+        require(isinstance(listed[rel], str)
+                and re.fullmatch(r'[0-9a-f]{64}', listed[rel]) is not None,
+                '清单哈希格式非法，拒绝导入：' + rel)
     files = {}
     for path in sorted(bundle.rglob('*')):
         if not path.is_file():
@@ -1118,18 +1277,27 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
 
     dest_dir is created fresh (an existing non-empty directory is
     refused, so a stale bundle can never be mistaken for a new one).
-    Local files repaired by the rescan are written back (see
-    _fix_local_redactions). Returns the manifest dict.
+    Local files repaired by the rescan are written back only after every
+    quality gate has passed (see _fix_local_redactions), so a strict-mode
+    rejection leaves the local archive untouched. Returns the manifest dict.
     """
     dest = Path(dest_dir)
     require(not dest.exists() or not any(dest.iterdir()), '导出目标目录非空：' + str(dest))
-    dest.mkdir(parents=True, exist_ok=True)
     store_dir = Path(store_dir)
     slug = relay.slug_for(store_dir.parent.name)
     payload = _collect_payload(store_dir)
     redacted, hits = _redact_payload(payload)
-    _fix_local_redactions(store_dir, payload, redacted)
     quality_gaps = _export_quality_gaps(store_dir.parent, redacted)
+    if strict:
+        blocked = [g for g in quality_gaps
+                   if g.get('severity') == QUALITY_BLOCK]
+        if blocked:
+            raise RelayError(
+                '导出前置检查未通过（%d 项阻断）：%s'
+                % (len(blocked), '；'.join(g['message'] for g in blocked)))
+    # Create the destination only after every preflight gate has passed:
+    # a strict refusal must not leave an empty directory behind.
+    dest.mkdir(parents=True, exist_ok=True)
     manifest_files = {}
     entry_count = 0
     proj_dir = dest / 'projects' / slug
@@ -1164,13 +1332,11 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
         # side is where the gaps become visible before anyone ships it.
         'quality_gaps': quality_gaps,
     }
-    if strict:
-        blocked = [g for g in quality_gaps
-                   if g.get('severity') == QUALITY_BLOCK]
-        if blocked:
-            raise RelayError(
-                '导出前置检查未通过（%d 项阻断）：%s'
-                % (len(blocked), '；'.join(g['message'] for g in blocked)))
+    # All gates passed: only now repair the local copies, then refresh the
+    # checksum manifest. A strict rejection above leaves local bytes and
+    # the old manifest exactly as they were.
+    if _fix_local_redactions(store_dir, payload, redacted):
+        relay.update_checksum_manifest(store_dir)
     save(dest / 'manifest.json', manifest)
     return manifest
 
@@ -1191,12 +1357,19 @@ def export_zip(toplevel, zip_path, device_name=None, device_id=None,
     zip_path = Path(zip_path)
     require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
     name, did = _zip_device(device_name, device_id)
-    zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix='relay-export-zip-') as tmp:
-        bundle_dir = Path(tmp) / 'bundle'
-        manifest = export_bundle(store_dir, bundle_dir, name, did,
-                                 strict=strict)
-        write_bundle_zip(bundle_dir, zip_path)
+    # Hold the archive-wide lock across read-redact-gate-writeback-pack so
+    # a concurrent capture/summarize cannot change bytes between the
+    # redaction snapshot and the local writeback.
+    with relay.outer_lock(store_dir):
+        # Re-check under the lock: another export process can create the
+        # target after the fast pre-check above but before we acquire.
+        require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='relay-export-zip-') as tmp:
+            bundle_dir = Path(tmp) / 'bundle'
+            manifest = export_bundle(store_dir, bundle_dir, name, did,
+                                     strict=strict)
+            write_bundle_zip(bundle_dir, zip_path)
     return {'zip': str(zip_path), 'source_device': name,
             'source_device_id': did,
             'entry_count': manifest['entry_count'],
@@ -2043,48 +2216,97 @@ def _land_project(store_dir, merge_result, source_info, marker_files=None,
     if problems:
         raise RelayError('影子合并健康检查失败，正式仓未改动（影子目录保留供排查：%s）：%s'
                          % (shadow, '；'.join(problems)))
-    backup = _land_files(store_dir, merge_result['merged_files'])
-    shutil.rmtree(backup, ignore_errors=True)
-    # A merge may have added a new agent dir: re-render the index from
-    # the directories actually present, then refresh the integrity
-    # manifest so the next takeover checks post-merge bytes.
-    relay.write_index(store_dir)
-    relay.update_checksum_manifest(store_dir)
-    if merge_result.get('pending_info') is not None:
-        save(store_dir / 'state' / 'goal-imported.json',
-             merge_result['pending_info'])
-    if any(c.get('file') == 'goal.md' for c in merge_result['conflicts']):
-        save(store_dir / 'state' / 'goal-conflict.json',
-             {'at': utc(), 'source_device': source_info.get('device'),
-              'source_device_id': source_info.get('device_id'),
-              'source_seq': source_info.get('seq')})
-    log = {'at': utc(), 'kind': 'merge',
-           'source_device': source_info.get('device'),
-           'source_device_id': source_info.get('device_id'),
-           'source_seq': source_info.get('seq'),
-           'goal_action': merge_result['goal_action'],
-           'counts': merge_result['counts'],
-           'conflicts': merge_result['conflicts'],
-           'discarded': merge_result['discarded'],
-           'quarantined': sorted(quarantined) if quarantined else [],
-           'notes': merge_result['notes'],
-           'changed_files': sorted(merge_result['merged_files'])}
-    log_path = _merge_log_path(store_dir)
-    save(log_path, log)
-    if marker_files:
-        conflicted_dir = Path(str(log_path)[:-5])  # strip .json
-        conflicted_dir.mkdir(parents=True, exist_ok=True)
-        for rel, data in marker_files.items():
-            (conflicted_dir / rel.replace('/', '__')).write_bytes(data)
-    quarantined_files = []
-    if quarantined:
-        quarantine_dir = Path(str(log_path)[:-5]) / 'quarantined'
-        quarantine_dir.mkdir(parents=True, exist_ok=True)
-        for rel, data in sorted(quarantined.items()):
-            name = rel.replace('/', '__')
-            (quarantine_dir / name).write_bytes(data)
-            quarantined_files.append(name)
-    shutil.rmtree(shadow, ignore_errors=True)
+    backup_dir = store_dir / relay.ROLLBACK_TRASH_PREFIX / ('land-' + uuid.uuid4().hex)
+    backup = None
+    success = False
+    log_path = None
+    # Derived state files written after the payload lands: remember their
+    # prior bytes so a later failure can restore them together with the
+    # payload instead of leaving a half-applied import behind.
+    flag_paths = [store_dir / 'state' / 'goal-imported.json',
+                  store_dir / 'state' / 'goal-conflict.json']
+    flag_before = {p: (p.read_bytes() if p.exists() else None) for p in flag_paths}
+    try:
+        backup = _land_files(store_dir, merge_result['merged_files'],
+                             backup_dir=backup_dir)
+        # A merge may have added a new agent dir: re-render the index from
+        # the directories actually present, then refresh the integrity
+        # manifest so the next takeover checks post-merge bytes.
+        relay.write_index(store_dir)
+        relay.update_checksum_manifest(store_dir)
+        if merge_result.get('pending_info') is not None:
+            save(store_dir / 'state' / 'goal-imported.json',
+                 merge_result['pending_info'])
+        if any(c.get('file') == 'goal.md' for c in merge_result['conflicts']):
+            save(store_dir / 'state' / 'goal-conflict.json',
+                 {'at': utc(), 'source_device': source_info.get('device'),
+                  'source_device_id': source_info.get('device_id'),
+                  'source_seq': source_info.get('seq')})
+        log = {'at': utc(), 'kind': 'merge',
+               'source_device': source_info.get('device'),
+               'source_device_id': source_info.get('device_id'),
+               'source_seq': source_info.get('seq'),
+               'goal_action': merge_result['goal_action'],
+               'counts': merge_result['counts'],
+               'conflicts': merge_result['conflicts'],
+               'discarded': merge_result['discarded'],
+               'quarantined': sorted(quarantined) if quarantined else [],
+               'notes': merge_result['notes'],
+               'changed_files': sorted(merge_result['merged_files'])}
+        log_path = _merge_log_path(store_dir)
+        save(log_path, log)
+        if marker_files:
+            conflicted_dir = Path(str(log_path)[:-5])  # strip .json
+            conflicted_dir.mkdir(parents=True, exist_ok=True)
+            for rel, data in marker_files.items():
+                (conflicted_dir / rel.replace('/', '__')).write_bytes(data)
+        quarantined_files = []
+        if quarantined:
+            quarantine_dir = Path(str(log_path)[:-5]) / 'quarantined'
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            for rel, data in sorted(quarantined.items()):
+                name = rel.replace('/', '__')
+                (quarantine_dir / name).write_bytes(data)
+                quarantined_files.append(name)
+        success = True
+    except Exception:
+        # Post-land failure: put every replaced/added file back, restore
+        # derived state files, drop a partial merge log, and refresh the
+        # index/manifest. Keep the backup on disk for inspection, then
+        # re-raise the original error.
+        if backup is not None:
+            try:
+                _restore_land_backup(store_dir, merge_result['merged_files'],
+                                     backup)
+            except Exception:
+                pass
+            for path, prior in flag_before.items():
+                try:
+                    if prior is None:
+                        if path.exists():
+                            path.unlink()
+                    else:
+                        atomic(path, prior)
+                except OSError:
+                    pass
+            if log_path is not None:
+                try:
+                    if log_path.exists():
+                        log_path.unlink()
+                    shutil.rmtree(Path(str(log_path)[:-5]),
+                                  ignore_errors=True)
+                except OSError:
+                    pass
+            try:
+                relay.write_index(store_dir)
+                relay.update_checksum_manifest(store_dir)
+            except Exception:
+                pass
+        raise
+    finally:
+        if success:
+            shutil.rmtree(Path(backup), ignore_errors=True)
+        shutil.rmtree(shadow, ignore_errors=True)
     return {'changed_files': sorted(merge_result['merged_files']),
             'conflicts': merge_result['conflicts'],
             'counts': merge_result['counts'],
@@ -2115,39 +2337,47 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             '包内项目名非法：%r' % (slug,))
     toplevel = Path(toplevel)
     store_dir = relay.store_dir_for(toplevel)
-    if not store_dir.is_dir():
+    if store_dir.is_dir():
+        store_dir = relay.resolve_store_dir(toplevel)
+    elif confirm:
         relay.init(toplevel)
         store_dir = relay.resolve_store_dir(toplevel)
-    else:
-        store_dir = relay.resolve_store_dir(toplevel)
-    prefix = 'projects/%s/' % slug
-    payload = {rel[len(prefix):]: data for rel, data in files.items()
-               if rel.startswith(prefix)}
-    files_in, hits, marker_files, redacted_discarded, redacted_quarantined = \
-        _redact_incoming(payload)
-    source_info = {'device': manifest['source_device'],
-                   'device_id': manifest['source_device_id'], 'seq': None}
-    merge_result = merge_project(store_dir, files_in, source_info)
-    merge_result['discarded'].extend(redacted_discarded)
-    merge_result['quarantined'].update(redacted_quarantined)
-    entry = {'slug': slug, 'display_name': proj.get('display_name'),
-             'status': 'matched', 'redacted_count': hits,
-             'marker_files': sorted(marker_files),
-             'discarded': list(merge_result['discarded']),
-             'quarantined': sorted(merge_result['quarantined']),
-             'counts': merge_result['counts'],
-             'conflicts': merge_result['conflicts'],
-             'goal_action': merge_result['goal_action'],
-             'notes': merge_result['notes'],
-             'changed_files': sorted(merge_result['merged_files'])}
-    merge_logs = []
-    if confirm:
-        landed = _land_project(store_dir, merge_result, source_info,
-                               marker_files=marker_files,
-                               quarantined=merge_result['quarantined'])
-        entry['merge_log'] = landed['merge_log']
-        entry['quarantined_files'] = landed['quarantined_files']
-        merge_logs.append(landed['merge_log'])
+    # else: keep the (nonexistent) store path; merge_project is pure and
+    # previews against an empty archive without writing anything.
+    # The preview is pure, but landing must be serialized with every other
+    # archive writer (capture/summarize/export). Take the archive-wide lock
+    # for the whole merge+land transaction on confirm; a dry-run takes no
+    # lock and creates no lock file, preserving its zero-write promise.
+    lock = relay.outer_lock(store_dir) if confirm else nullcontext()
+    with lock:
+        prefix = 'projects/%s/' % slug
+        payload = {rel[len(prefix):]: data for rel, data in files.items()
+                   if rel.startswith(prefix)}
+        files_in, hits, marker_files, redacted_discarded, redacted_quarantined = \
+            _redact_incoming(payload)
+        source_info = {'device': manifest['source_device'],
+                       'device_id': manifest['source_device_id'], 'seq': None}
+        merge_result = merge_project(store_dir, files_in, source_info)
+        merge_result['discarded'].extend(redacted_discarded)
+        merge_result['quarantined'].update(redacted_quarantined)
+        entry = {'slug': slug, 'display_name': proj.get('display_name'),
+                 'status': 'matched', 'redacted_count': hits,
+                 'marker_files': sorted(marker_files),
+                 'discarded': list(merge_result['discarded']),
+                 'quarantined': sorted(merge_result['quarantined']),
+                 'counts': merge_result['counts'],
+                 'conflicts': merge_result['conflicts'],
+                 'goal_action': merge_result['goal_action'],
+                 'notes': merge_result['notes'],
+                 'changed_files': sorted(merge_result['merged_files'])}
+        merge_logs = []
+        if confirm:
+            landed = _land_project(store_dir, merge_result, source_info,
+                                   marker_files=marker_files,
+                                   quarantined=merge_result['quarantined'])
+            entry['merge_log'] = landed['merge_log']
+            entry['quarantined_files'] = landed['quarantined_files']
+            merge_logs.append(landed['merge_log'])
     return {'landed': confirm, 'exported_at': manifest['exported_at'],
             'source_device': manifest['source_device'],
             'source_device_id': manifest['source_device_id'],

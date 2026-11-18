@@ -78,6 +78,13 @@ class TestZipHandoff(V3Base):
             encoding='utf-8')
         return dest
 
+    def _mutate_manifest(self, bundle, **changes):
+        path = bundle / 'manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        manifest.update(changes)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                        encoding='utf-8')
+
     def _build_zip(self, zip_name='handoff.zip', **kw):
         bundle = self._bundle_dir(**kw)
         zip_path = Path(self.temp.name) / zip_name
@@ -133,6 +140,43 @@ class TestZipHandoff(V3Base):
                        if p.is_file())
         self.assertEqual(before, after)
 
+    def test_import_zip_dry_run_does_not_init_missing_store(self):
+        root = self.make_repo('bare')
+        zip_path = self._build_zip(files={'goal.md': b'# goal\n'})
+        self.assertFalse((root / '.project-relay').exists())
+        result = sync.import_zip(root, zip_path, confirm=False)
+        self.assertFalse(result['landed'])
+        self.assertFalse((root / '.project-relay').exists(),
+                         'dry-run must not create .project-relay')
+        self.assertFalse((root / '.gitignore').exists(),
+                         'dry-run must not write .gitignore')
+
+    def test_land_project_rolls_back_payload_and_flags_on_failure(self):
+        root = self.init()
+        store = self.store_dir(root)
+        target = store / 'state' / 'land-test.txt'
+        target.write_bytes(b'old')
+        relay.update_checksum_manifest(store)
+        result = {
+            'merged_files': {'state/land-test.txt': b'new'},
+            'conflicts': [], 'counts': {}, 'goal_action': 'none',
+            'discarded': [], 'notes': [], 'pending_info': None,
+        }
+        original = sync._merge_log_path
+        sync._merge_log_path = lambda _store: (_ for _ in ()).throw(
+            RuntimeError('boom after landing'))
+        try:
+            with self.assertRaises(RuntimeError):
+                sync._land_project(store, result,
+                                   {'device': 'peer', 'device_id': 'x',
+                                    'seq': None})
+        finally:
+            sync._merge_log_path = original
+        self.assertEqual(b'old', target.read_bytes())
+        backups = list((store / 'archive' / 'rollback-trash').glob('land-*'))
+        self.assertTrue(backups, 'failed landing must keep its rollback backup')
+        self.assertEqual([], relay.verify_checksum_manifest(store)[1])
+
     def test_export_clone_import_resume_round_trip(self):
         # The full handoff: export from A, clone A (no .project-relay/ --
         # it is gitignored), import the zip, resume reads the real brief.
@@ -162,6 +206,27 @@ class TestZipHandoff(V3Base):
         with self.assertRaises(SyncError):
             sync.export_zip(root, zip_path)
         self.assertEqual(b'old bundle\n', zip_path.read_bytes())
+
+    def test_export_zip_rechecks_target_under_lock(self):
+        root = self._setup_a()
+        zip_path = Path(self.temp.name) / 'raced.zip'
+        real_outer = sync.relay.outer_lock
+
+        class RacingLock:
+            def __enter__(self):
+                zip_path.write_bytes(b'race winner')
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        sync.relay.outer_lock = lambda _store: RacingLock()
+        try:
+            with self.assertRaises(SyncError):
+                sync.export_zip(root, zip_path)
+        finally:
+            sync.relay.outer_lock = real_outer
+        self.assertEqual(b'race winner', zip_path.read_bytes())
 
     def test_export_zip_requires_an_archive(self):
         root = self.make_repo('proj')  # never relay.init'd
@@ -197,12 +262,134 @@ class TestZipHandoff(V3Base):
         self.assertEqual(2, manifest['format_major'])
         self.assertEqual('project-relay-export', manifest['format'])
 
+    def test_write_bundle_zip_failure_leaves_target_absent(self):
+        bundle = self._bundle_dir(files={'goal.md': b'# goal\n'})
+        zip_path = Path(self.temp.name) / 'candidate.zip'
+        real = sync.zipfile.ZipFile
+
+        class BoomZip:
+            def __init__(self, file, mode='r', *args, **kwargs):
+                self._z = real(file, mode, *args, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._z.close()
+                return False
+
+            def write(self, *args, **kwargs):
+                self._z.write(*args, **kwargs)
+                raise OSError('simulated pack failure')
+
+        sync.zipfile.ZipFile = BoomZip
+        try:
+            with self.assertRaises(OSError):
+                sync.write_bundle_zip(bundle, zip_path)
+        finally:
+            sync.zipfile.ZipFile = real
+        self.assertFalse(zip_path.exists(),
+                         'a failed pack must not publish a partial target')
+        self.assertEqual([], list(zip_path.parent.glob(zip_path.name + '.*')),
+                         'a failed pack must clean its sibling temp file')
+
+    def test_read_bundle_zip_corrupt_entry_leaves_no_partial_destination(self):
+        zip_path = Path(self.temp.name) / 'corrupt.zip'
+        real = sync.zipfile.ZipFile
+        with real(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'a')
+            zf.writestr('b.txt', b'b')
+
+        class BoomZip:
+            def __init__(self, file, *args, **kwargs):
+                self._z = real(file, *args, **kwargs)
+                self._opened = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._z.close()
+                return False
+
+            def infolist(self):
+                return self._z.infolist()
+
+            def open(self, info):
+                self._opened += 1
+                if self._opened == 2:
+                    raise OSError('simulated corrupt entry')
+                return self._z.open(info)
+
+        dest = Path(self.temp.name) / 'corrupt-out'
+        sync.zipfile.ZipFile = BoomZip
+        try:
+            with self.assertRaises(OSError):
+                sync.read_bundle_zip(zip_path, dest)
+        finally:
+            sync.zipfile.ZipFile = real
+        self.assertFalse(dest.exists(),
+                         'a late corrupt entry must not leave a partial destination')
+        self.assertEqual([], list(dest.parent.glob('.relay-unzip-*')),
+                         'a failed unpack must remove its staging directory')
+
+    def test_export_bundle_strict_failure_leaves_no_payload(self):
+        root = self.init()
+        self.confirm_goal(root)
+        self.capture(root, 'codex')
+        dest = Path(self.temp.name) / 'strict-bundle'
+        with self.assertRaises(SyncError):
+            sync.export_bundle(self.store_dir(root), dest, 'dev', 'dev-1', strict=True)
+        self.assertFalse(dest.exists(),
+                         'strict rejection must not create the destination directory')
+
     def test_read_bundle_zip_rejects_escaping_entry(self):
         zip_path = Path(self.temp.name) / 'evil.zip'
         with zipfile.ZipFile(zip_path, 'w') as zf:
             zf.writestr('../escape.txt', b'x')
         with self.assertRaises(SyncError):
             sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'evil-out')
+
+    def test_read_bundle_zip_rejects_entry_count_limit(self):
+        zip_path = Path(self.temp.name) / 'many.zip'
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'a')
+            zf.writestr('b.txt', b'b')
+        old = sync.MAX_BUNDLE_ENTRIES
+        sync.MAX_BUNDLE_ENTRIES = 1
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'many-out')
+        finally:
+            sync.MAX_BUNDLE_ENTRIES = old
+        self.assertIn('条目过多', str(ctx.exception))
+
+    def test_read_bundle_zip_rejects_declared_total_limit(self):
+        zip_path = Path(self.temp.name) / 'total.zip'
+        with zipfile.ZipFile(zip_path, 'w') as zf:
+            zf.writestr('a.txt', b'aaaa')
+            zf.writestr('b.txt', b'bbbb')
+        old = sync.MAX_BUNDLE_TOTAL_BYTES
+        sync.MAX_BUNDLE_TOTAL_BYTES = 7
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'total-out')
+        finally:
+            sync.MAX_BUNDLE_TOTAL_BYTES = old
+        self.assertIn('解压总量', str(ctx.exception))
+
+    def test_read_bundle_zip_rejects_suspicious_compression_ratio(self):
+        zip_path = Path(self.temp.name) / 'ratio.zip'
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('zeros.bin', b'\x00' * 65536)
+        old = sync.MAX_BUNDLE_COMPRESSION_RATIO
+        sync.MAX_BUNDLE_COMPRESSION_RATIO = 2
+        try:
+            with self.assertRaises(SyncError) as ctx:
+                sync.read_bundle_zip(zip_path, Path(self.temp.name) / 'ratio-out')
+        finally:
+            sync.MAX_BUNDLE_COMPRESSION_RATIO = old
+        self.assertIn('压缩比', str(ctx.exception))
 
     # ---- verify_bundle: the import gate (pure, works today) ----
 
@@ -243,6 +430,61 @@ class TestZipHandoff(V3Base):
         (bundle / 'projects' / 'proj' / 'extra.md').write_bytes(b'x')
         with self.assertRaises(SyncError):
             sync.verify_bundle(bundle)
+
+    def test_verify_bundle_rejects_missing_source_device(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, source_device='')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('source_device', str(ctx.exception))
+
+    def test_verify_bundle_rejects_missing_exported_at(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, exported_at=None)
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('exported_at', str(ctx.exception))
+
+    def test_verify_bundle_rejects_bad_projects_shape(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, projects=[])
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('projects', str(ctx.exception))
+
+    def test_verify_bundle_rejects_foreign_project_entry(self):
+        bundle = self._bundle_dir()
+        other = bundle / 'projects' / 'other'
+        other.mkdir(parents=True)
+        data = b'# other\n'
+        (other / 'goal.md').write_bytes(data)
+        path = bundle / 'manifest.json'
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        rel = 'projects/other/goal.md'
+        manifest['files'][rel] = _sha256(data)
+        manifest['projects'][0]['files'].append(rel)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('其它项目', str(ctx.exception))
+
+    def test_verify_bundle_rejects_absolute_project_slug(self):
+        bundle = self._bundle_dir()
+        self._mutate_manifest(bundle, projects=[{'slug': '../escape', 'files': []}])
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('项目名非法', str(ctx.exception))
+
+    def test_verify_bundle_rejects_bad_hash_format(self):
+        bundle = self._bundle_dir()
+        manifest = json.loads((bundle / 'manifest.json').read_text(encoding='utf-8'))
+        first = sorted(manifest['files'])[0]
+        manifest['files'][first] = 'not-a-sha256'
+        (bundle / 'manifest.json').write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+        with self.assertRaises(SyncError) as ctx:
+            sync.verify_bundle(bundle)
+        self.assertIn('哈希格式', str(ctx.exception))
 
     # ---- export quality gate (pure: runs without _flow) ----
 

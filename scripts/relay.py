@@ -35,6 +35,7 @@ import re
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -155,6 +156,7 @@ def anchor(root):
 
 
 # ---------------------------------------------------------------- store
+VERSION = '0.2.0'
 STORE_DIRNAME = '.project-relay'
 # 现役 Agent：DeepSeek Harness（DSH，目录名 deepseek-harness）。
 # AGENTS 保留历史名字用于读取旧档案；ACTIVE_AGENTS 决定 init 建哪些目录。
@@ -175,7 +177,72 @@ CHECKSUM_MANIFEST = 'checksum-manifest.json'
 # (leftovers of the deleted sync-rollback trash; kept so old archives
 # still verify).
 ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'assets' / 'template-v2'
+
+# 本机状态文件：不进 ZIP 载荷，也不进完整性清单。清单若把它们算进去，
+# 正常的 capture/precompress/fingerprint 每次都会改这些文件，下一次
+# resume 就会误报“档案被损坏/截断”。relay_sync 复用同一组定义，避免
+# “打包排除”与“校验排除”两套标准漂移。
+LOCAL_ONLY_OUTER = frozenset({
+    'config.json',
+    'state/config.json',
+    'state/fingerprint-cache.json',
+    'state/device-notice.json',
+    'state/goal-conflict.json',
+    'state/goal-imported.json',
+    'state/rollback-note.json',
+})
+LOCAL_ONLY_AGENT_STATE = frozenset({
+    'cursor.json', 'baseline.json', 'numbers.json', 'digest.json',
+    'enforce.json', 'forks.json', 'backlog-notice.json',
+    'fingerprint-cache.json',
+})
+LOCAL_ONLY_AGENT_FILES = frozenset({'recipe.json'})
+LOCAL_ONLY_AGENT_DIRS = frozenset({'tx', 'backups', 'stats'})
+
+
+def is_local_only_path(rel):
+    """True for archive paths that are machine-local, not shared payload."""
+    if rel in LOCAL_ONLY_OUTER:
+        return True
+    if not rel.startswith('agents/'):
+        return False
+    parts = rel.split('/')
+    if len(parts) >= 3 and parts[2] in LOCAL_ONLY_AGENT_DIRS:
+        return True
+    if (len(parts) >= 4 and parts[2] == 'state'
+            and parts[3] in LOCAL_ONLY_AGENT_STATE):
+        return True
+    if len(parts) == 3 and parts[2] in LOCAL_ONLY_AGENT_FILES:
+        return True
+    return False
+
+
+def _resolve_templates_dir():
+    """Find template-v2 in a source checkout, a DSH skill, or a pip install.
+
+    pyproject data-files install the tree under
+    <prefix>/share/project-relay/template-v2; a source checkout and the
+    standalone skill keep it at <root>/assets/template-v2. The old
+    constant-only lookup silently produced empty skeleton files (and a
+    FileNotFoundError in _skeleton_bytes) after a pip install.
+    """
+    candidates = [
+        Path(__file__).resolve().parent.parent / 'assets' / 'template-v2',
+        Path(__file__).resolve().parent / 'assets' / 'template-v2',
+    ]
+    try:
+        data = sysconfig.get_path('data')
+        if data:
+            candidates.append(Path(data) / 'share' / 'project-relay' / 'template-v2')
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+TEMPLATES_DIR = _resolve_templates_dir()
 
 
 def main_worktree(path):
@@ -194,11 +261,39 @@ def store_dir_for(toplevel):
     return main_worktree(toplevel) / STORE_DIRNAME
 
 
+def _reject_store_symlinks(store_dir):
+    """Reject a .project-relay tree whose controlled directories are symlinks.
+
+    safe() already protects payload paths, but many writers address
+    store_dir/rel directly; a repo-committed .project-relay symlink could
+    redirect those writes outside the project. Check the store root and
+    every directory level we create/manage before returning it.
+    """
+    store_dir = Path(store_dir)
+    require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
+    for name in ('agents', 'receipts', 'state', 'archive'):
+        p = store_dir / name
+        if p.is_symlink() or p.exists():
+            require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
+    agents = store_dir / 'agents'
+    if agents.is_dir() and not agents.is_symlink():
+        for child in agents.iterdir():
+            if child.is_symlink():
+                require(False, '拒绝符号链接: ' + str(child))
+            if not child.is_dir():
+                continue
+            for name in ('raw', 'state', 'tx', 'backups'):
+                p = child / name
+                if p.is_symlink() or p.exists():
+                    require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
+
+
 def resolve_store_dir(toplevel):
     """Return the project store dir; fail closed when the project has no archive yet."""
     store_dir = store_dir_for(toplevel)
     require(store_dir.is_dir(),
             '项目尚未建仓，先运行 relay init（档案在 <项目根目录>/.project-relay/）')
+    _reject_store_symlinks(store_dir)
     return store_dir
 
 
@@ -223,29 +318,49 @@ class _StoreLock:
         self._fh = None
 
     def __enter__(self):
+        self._fh = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, 'a+')
-        if os.name == 'nt':
-            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            fcntl.flock(self._fh, fcntl.LOCK_EX)
+        fh = open(self.path, 'a+')
+        try:
+            if os.name == 'nt':
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+        except BaseException:
+            # 加锁失败不能让文件句柄悬空：否则 __exit__ 或下一次 __enter__
+            # 会拿到一个没锁住、也没关掉的句柄。
+            try:
+                fh.close()
+            finally:
+                self._fh = None
+            raise
+        self._fh = fh
         return self
 
     def __exit__(self, *exc):
+        fh = self._fh
+        if fh is None:
+            return False
+        self._fh = None
         try:
             if os.name == 'nt':
-                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                fcntl.flock(self._fh, fcntl.LOCK_UN)
-        except OSError:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        except (OSError, ValueError):
             pass
         finally:
-            self._fh.close()
+            fh.close()
         return False
 
 
 def outer_lock(store_dir):
-    """外层写锁：目标确认、新 Agent 加入、resume 写 state.md 时拿。"""
+    """档案级写锁：跨 Agent 的整档案事务都拿它。
+
+    目标确认、新 Agent 加入、resume 写 state.md 这类外层写入要拿；
+    capture/summarize 与 export-zip/import-zip 也整段持有，确保压缩包
+    落盘和任何档案写入不会交错。单 Agent 自己的目录锁仍在其内层。
+    """
     return _StoreLock(Path(store_dir) / '.write.lock')
 
 
@@ -380,6 +495,7 @@ def read_stack(store_dir):
 
 def write_stack(store_dir, text):
     atomic(_outer_doc(store_dir, 'stack.md'), text.encode('utf-8'))
+    update_checksum_manifest(store_dir)
     return _outer_doc(store_dir, 'stack.md')
 
 
@@ -390,6 +506,7 @@ def read_outlook(store_dir):
 
 def write_outlook(store_dir, text):
     atomic(_outer_doc(store_dir, 'outlook.md'), text.encode('utf-8'))
+    update_checksum_manifest(store_dir)
     return _outer_doc(store_dir, 'outlook.md')
 
 
@@ -439,6 +556,9 @@ def init(toplevel):
     兜底。项目根目录就是身份，没有项目键、没有注册表。"""
     root = Path(main_worktree(toplevel))
     store_dir = root / STORE_DIRNAME
+    require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
+    if store_dir.exists():
+        _reject_store_symlinks(store_dir)
     (store_dir / 'receipts').mkdir(parents=True, exist_ok=True)
     (store_dir / 'state').mkdir(parents=True, exist_ok=True)
     for agent in ACTIVE_AGENTS:
@@ -479,9 +599,10 @@ def _manifest_files(store_dir):
     """Every file under .project-relay/, as {relative path: bytes}.
 
     完整性清单覆盖整棵树（外层 + 各家目录）。清单本身、锁文件、
-    回滚残留（rollback-trash）、记账（stats/）不计入：锁文件是空的
-    排队标记，残留本来就不属于正式档案，记账是本机才有的行记录、
-    随写随增（capture/summarize 写行时不刷新清单）。"""
+    回滚残留（rollback-trash）、记账（stats/）与 is_local_only_path()
+    认定的本机状态不计入：锁文件是空的排队标记，残留本来就不属于
+    正式档案，本机状态随写随增（config、fingerprint-cache、cursor、
+    digest 等），若算进清单，正常采集后下一次 resume 就会误报。"""
     out = {}
     for p in sorted(Path(store_dir).rglob('*')):
         if not p.is_file() or p.is_symlink():
@@ -492,6 +613,8 @@ def _manifest_files(store_dir):
         if rel.startswith(ROLLBACK_TRASH_PREFIX):
             continue
         if rel.startswith('stats/'):
+            continue
+        if is_local_only_path(rel):
             continue
         out[rel] = p.read_bytes()
     return out
@@ -524,6 +647,10 @@ def verify_checksum_manifest(store_dir):
                        'actual': '损坏'}]
     mismatches = []
     for rel, expected in (manifest.get('files') or {}).items():
+        # Old manifests (pre-0.3) listed machine-local files; they must
+        # not turn normal config/cache churn into a corruption report.
+        if is_local_only_path(rel):
+            continue
         p = store_dir / rel
         if not p.exists():
             mismatches.append({'file': rel, 'expected': expected, 'actual': None})
@@ -921,7 +1048,7 @@ def _print_sync_project(entry):
 def _parser():
     p = argparse.ArgumentParser(prog='relay', description='项目根目录下的共享记忆，分 Agent 存放（v3）')
     p.add_argument('--root', default='.', help='项目根目录（默认当前目录）')
-    p.add_argument('--version', action='version', version='relay 3.1.0')
+    p.add_argument('--version', action='version', version='relay ' + VERSION)
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
     sub.add_parser('agents')
@@ -1103,8 +1230,9 @@ def main(argv=None):
                 current = read_agent_goal(store_dir, a.agent)
                 print(current if current else '（空）')
             else:
-                with agent_lock(store_dir, a.agent):
-                    write_agent_goal(store_dir, a.agent, text)
+                with outer_lock(store_dir):
+                    with agent_lock(store_dir, a.agent):
+                        write_agent_goal(store_dir, a.agent, text)
                 print('%s 的目标已写入（已记当前总目标哈希备查）' % a.agent)
         elif a.command in ('export-zip', 'import-zip', 'sync-resolve'):
             # The sync branch wraps its own errors (belt and braces):
@@ -1185,8 +1313,10 @@ def main(argv=None):
         elif a.command == 'log':
             store_dir = resolve_store_dir(a.root)
             if a.append is not None:
-                with agent_lock(store_dir, a.agent):
-                    append_agent_log(store_dir, a.agent, 'note', a.append)
+                with outer_lock(store_dir):
+                    with agent_lock(store_dir, a.agent):
+                        append_agent_log(store_dir, a.agent, 'note', a.append)
+                        update_checksum_manifest(store_dir)
                 print('日志已追加到 agents/%s/log.jsonl' % a.agent)
             else:
                 rows = read_agent_log(store_dir, a.agent, limit=a.limit)
@@ -1279,42 +1409,15 @@ def main(argv=None):
                         return 2
                     print(msg)
             elif a.command == 'recipe':
-                if a.recipe_command == 'package':
-                    info = flow.package_workbuddy(root, out=a.out)
-                    print('技能包：' + info['zip_path'])
-                    print('文件 %d 个' % len(info['files']))
+                home = Path(a.home).expanduser() if a.home else None
+                if a.recipe_command == 'install':
+                    info = flow.install_deepseek_harness(root,
+                        target_root=a.target_root, home_dir=home)
+                    print('skill 目录：' + info['skill_dir'])
+                    print(info['note'])
                 else:
-                    home = Path(a.home).expanduser() if a.home else None
-                    target = Path(a.target_root).expanduser() if a.target_root else Path.home()
-                    if a.recipe_command == 'install':
-                        if a.tool == 'claude-code':
-                            info = flow.install_claude(root, home_dir=home)
-                            print('\n'.join(info['notes']))
-                        elif a.tool == 'workbuddy':
-                            info = flow.install_workbuddy(root)
-                            print('skill 目录：' + info['skill_dir'])
-                            print(info['note'])
-                        elif a.tool == 'deepseek-harness':
-                            info = flow.install_deepseek_harness(root,
-                                target_root=a.target_root, home_dir=home)
-                            print('skill 目录：' + info['skill_dir'])
-                            print(info['note'])
-                        else:
-                            info = flow.install_codex(root)
-                            print(info['note'])
-                    else:
-                        if a.tool == 'claude-code':
-                            info = flow.uninstall_claude(root, home_dir=home)
-                            print('\n'.join(info['notes']))
-                        elif a.tool == 'workbuddy':
-                            info = flow.uninstall_workbuddy(root)
-                            print('已移除：' + info['removed'])
-                        elif a.tool == 'deepseek-harness':
-                            info = flow.uninstall_deepseek_harness(root)
-                            print('已移除：' + info['removed'])
-                        else:
-                            info = flow.uninstall_codex(root)
-                            print(info['note'])
+                    info = flow.uninstall_deepseek_harness(root)
+                    print('已移除：' + info['removed'])
             elif a.command == 'precompress':
                 doc = flow.precompress(root, agent=a.agent)
                 print('整理稿：条目区间 %s，改动文件 %d 个，失败样本 %d 个'

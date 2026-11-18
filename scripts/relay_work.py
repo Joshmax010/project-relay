@@ -61,6 +61,13 @@ def _branch_exists(root, branch):
     return _git_ok(root, 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch)
 
 
+def _branch_prefix_conflicts(root, branch):
+    """Branches under <branch>/ that would block creating <branch> as a ref."""
+    prefix = 'refs/heads/' + branch + '/'
+    out = _git_text(root, 'for-each-ref', '--format=%(refname:short)', prefix)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
 def _clean(root):
     # Compare with the user's own git autocrlf setting: commits made by the
     # user's git may store CRLF while relay's default wrapper pins LF.
@@ -77,6 +84,39 @@ def _default_base(project_root):
         if _branch_exists(project_root, name):
             return name
     return 'main'
+
+
+def _agent_branch_candidates(project_root, agent):
+    """Branches belonging to one agent: the flat agent/<name> plus children."""
+    base = BRANCH_PREFIX + agent
+    candidates = []
+    if _branch_exists(project_root, base):
+        candidates.append(base)
+    candidates.extend(_branch_prefix_conflicts(project_root, base))
+    return candidates
+
+
+def _resolve_agent_branch(project_root, agent, branch=None):
+    """Pick the branch for review/merge, tolerating the /work fallback."""
+    if branch:
+        return branch
+    base = BRANCH_PREFIX + agent
+    candidates = _agent_branch_candidates(project_root, agent)
+    if base in candidates:
+        return base
+    # Prefer a branch that is actually checked out in an agent worktree:
+    # old agent branches (for example agent/<name>/dsh-only) may exist
+    # without a worktree and should not make review/merge ambiguous.
+    registered = [record.get('branch') for record in _worktrees(project_root)
+                  if record.get('branch') in candidates]
+    if len(registered) == 1:
+        return registered[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        raise RelayError('多个 Agent 分支匹配 %s：%s；请用 --branch 指定'
+                         % (base, '、'.join(candidates)))
+    return base
 
 
 def _worktrees(project_root):
@@ -139,10 +179,38 @@ def enter(project_root, workspace=None, agent=DEFAULT_AGENT, branch=None,
     relay.resolve_store_dir(project_root)
     _validate_agent(agent)
     workspace = Path(workspace or os.getcwd()).expanduser().resolve()
+    explicit_branch = branch
     branch = branch or (BRANCH_PREFIX + agent)
     base = base or _default_base(project_root)
     require(_branch_exists(project_root, base),
             '基线分支不存在：%s（先创建或换 --base）' % base)
+    if not _branch_exists(project_root, branch):
+        conflicts = _branch_prefix_conflicts(project_root, branch)
+        if conflicts:
+            if explicit_branch:
+                raise RelayError(
+                    '分支名冲突：%s 已作为前缀被占用（如 %s），无法创建同名分支；'
+                    '请用 --branch %s/work 或其他名字'
+                    % (branch, conflicts[0], branch))
+            # Reuse an existing worktree for this agent before falling back:
+            # the flat default may be impossible only because a previous
+            # agent branch lives under agent/<name>/.
+            related = [record for record in _worktrees(project_root)
+                       if record.get('branch') in conflicts]
+            if len(related) == 1:
+                return {'mode': 'multi', 'project_root': str(project_root),
+                        'workspace': str(workspace), 'branch': related[0]['branch'],
+                        'base': base, 'worktree': str(related[0]['path']),
+                        'created': False}
+            if len(related) > 1:
+                raise RelayError(
+                    '多个 Agent 工作树匹配 %s：%s；请用 --branch 指定'
+                    % (BRANCH_PREFIX + agent,
+                       '、'.join(record.get('branch', '?') for record in related)))
+            # A previous agent branch may already live under agent/<name>/.
+            # Keep the documented flat default when possible, but fall back
+            # to a child branch instead of failing outright.
+            branch = branch + '/work'
     # Already inside the Agent's linked worktree: return it instead of
     # creating a nested one.
     if original_root != project_root and _current_branch(original_root) == branch:
@@ -181,7 +249,10 @@ def status(project_root, agent=None):
     relay.resolve_store_dir(project_root)
     rows = []
     for record in _worktrees(project_root):
-        if agent and not record['is_main'] and record.get('branch') != (BRANCH_PREFIX + agent):
+        prefix = BRANCH_PREFIX + agent
+        if agent and not record['is_main'] and not (
+                record.get('branch') == prefix
+                or (record.get('branch') or '').startswith(prefix + '/')):
             continue
         path = record['path']
         rows.append({'path': str(path), 'branch': record.get('branch'),
@@ -195,7 +266,7 @@ def review(project_root, agent=DEFAULT_AGENT, branch=None, base=None):
     project_root = Path(relay.main_worktree(project_root))
     relay.resolve_store_dir(project_root)
     _validate_agent(agent)
-    branch = branch or (BRANCH_PREFIX + agent)
+    branch = _resolve_agent_branch(project_root, agent, branch)
     base = base or _default_base(project_root)
     require(_branch_exists(project_root, branch), '分支不存在：%s' % branch)
     require(_branch_exists(project_root, base), '基线分支不存在：%s' % base)
@@ -217,7 +288,7 @@ def merge(project_root, agent=DEFAULT_AGENT, branch=None, base=None, confirm=Fal
     relay.resolve_store_dir(project_root)
     _validate_agent(agent)
     require(confirm, '合并需要显式 --confirm：先把 review 给用户看，批准后再合并')
-    branch = branch or (BRANCH_PREFIX + agent)
+    branch = _resolve_agent_branch(project_root, agent, branch)
     base = base or _default_base(project_root)
     require(_branch_exists(project_root, branch), '分支不存在：%s' % branch)
     require(_branch_exists(project_root, base), '基线分支不存在：%s' % base)

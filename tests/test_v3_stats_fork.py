@@ -91,6 +91,29 @@ class TestFuse(V3Base):
         self.assertFalse(result['cap_alert'])
         self.assertIsNone(result['monthly_cap'])
 
+    def test_compute_fuse_tolerates_legacy_row_without_total(self):
+        root = self.init()
+        store = self.store_dir(root)
+        now = time.time()
+        stats_path = store / 'stats' / 'summarize.jsonl'
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {'source': 'manual', 'trigger': 'manual',
+               'llm_in_tokens': 100, 'llm_out_tokens': 50,
+               'at_epoch': now - DAY}
+        stats_path.write_text(json.dumps(row) + '\n', encoding='utf-8')
+        result = stats.compute_fuse(store, now_epoch=now)
+        self.assertEqual(150, result['week_llm_tokens'])
+
+    def test_compute_fuse_ignores_non_dict_rows(self):
+        root = self.init()
+        store = self.store_dir(root)
+        now = time.time()
+        stats_path = store / 'stats' / 'summarize.jsonl'
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text('[]\n', encoding='utf-8')
+        result = stats.compute_fuse(store, now_epoch=now)
+        self.assertEqual(0, result['week_llm_tokens'])
+
     def test_spike_trips(self):
         root = self.init()
         store = self.store_dir(root)
@@ -327,6 +350,15 @@ class TestForkSummaries(V3Base):
             json.dumps({'seq': seq, 'source': 'manual'}, ensure_ascii=False),
             encoding='utf-8')
 
+    def test_malformed_chain_package_does_not_crash(self):
+        root = self.init()
+        adir = self.adir(root, 'codex')
+        chain_dir = adir / 'state' / 'chain-archives'
+        chain_dir.mkdir(parents=True)
+        (chain_dir / 'bad.json').write_text('[]', encoding='utf-8')
+        (chain_dir / 'bad2.json').write_text('{"records": {"a": 1}}', encoding='utf-8')
+        self.assertEqual([], fork.list_summaries(adir))
+
     def test_latest_summary_and_packaged_seqs(self):
         root = self.init()
         adir = self.adir(root, 'codex')
@@ -406,7 +438,8 @@ class TestFingerprintCache(V3Base):
 
     The cache file lives at <store>/state/fingerprint-cache.json and
     the excludes/threshold knobs come from <store>/state/config.json
-    (load_config), not the outer config.json the fuse reads.
+    (load_config). The fuse now reads the same state file first, falling
+    back to the legacy outer config.json.
     """
 
     def test_second_snapshot_hits_cache_and_matches_first(self):

@@ -59,6 +59,58 @@ class TestWorkModes(V3Base):
         self.assertFalse(again['created'])
         self.assertEqual(info['worktree'], again['worktree'])
 
+    def test_enter_falls_back_when_default_branch_is_prefix_reserved(self):
+        root = self.init()
+        # A previous agent branch may live under agent/<name>/, which makes
+        # the flat default ref impossible to create (Git ref prefix rule).
+        self.git(root, 'branch', 'agent/deepseek-harness/dsh-only')
+        workspace = Path(self.temp.name) / 'dsh-workspace'
+        workspace.mkdir()
+        info = work.enter(root, workspace=workspace, agent='deepseek-harness')
+        self.assertEqual('agent/deepseek-harness/work', info['branch'])
+        self.assertTrue(info['created'])
+        self.assertEqual('agent/deepseek-harness/work',
+                         self.git(info['worktree'], 'branch', '--show-current').stdout.decode().strip())
+
+    def test_enter_explicit_conflicting_branch_raises_clear_error(self):
+        root = self.init()
+        self.git(root, 'branch', 'agent/deepseek-harness/dsh-only')
+        workspace = Path(self.temp.name) / 'dsh-workspace'
+        workspace.mkdir()
+        with self.assertRaises(relay.RelayError) as ctx:
+            work.enter(root, workspace=workspace, agent='deepseek-harness',
+                       branch='agent/deepseek-harness')
+        self.assertIn('分支名冲突', str(ctx.exception))
+
+    def test_enter_reuses_existing_child_branch_worktree(self):
+        root = self.init()
+        self.git(root, 'branch', 'agent/deepseek-harness/dsh-only')
+        workspace = Path(self.temp.name) / 'dsh-workspace'
+        workspace.mkdir()
+        first = work.enter(root, workspace=workspace, agent='deepseek-harness',
+                           branch='agent/deepseek-harness/engineering-audit')
+        again = work.enter(root, workspace=workspace, agent='deepseek-harness')
+        self.assertFalse(again['created'])
+        self.assertEqual(first['worktree'], again['worktree'])
+        self.assertEqual('agent/deepseek-harness/engineering-audit', again['branch'])
+
+    def test_review_and_merge_resolve_fallback_branch(self):
+        root = self._init_clean()
+        self.git(root, 'branch', 'agent/deepseek-harness/dsh-only')
+        workspace = Path(self.temp.name) / 'dsh-workspace'
+        workspace.mkdir()
+        info = work.enter(root, workspace=workspace, agent='deepseek-harness')
+        tree = Path(info['worktree'])
+        (tree / 'app.py').write_text('value = 2\n', encoding='utf-8')
+        self.git(tree, 'add', '.')
+        self.git(tree, 'commit', '-m', 'agent change')
+        review = work.review(root, agent='deepseek-harness')
+        self.assertEqual('agent/deepseek-harness/work', review['branch'])
+        self.assertEqual(1, review['commit_count'])
+        merged = work.merge(root, agent='deepseek-harness', confirm=True)
+        self.assertTrue(merged['merged'])
+        self.assertEqual('value = 2\n', (root / 'app.py').read_text(encoding='utf-8'))
+
     def test_store_is_shared_across_worktree(self):
         root = self.init()
         workspace = Path(self.temp.name) / 'dsh-workspace'

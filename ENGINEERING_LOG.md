@@ -1,0 +1,230 @@
+# ENGINEERING_LOG
+
+项目：project-relay（D:\AAAAA\Josh Project\project-relay）
+维护方式：工程审计与低风险修复，每轮记录在案。
+
+## 2026-11-18 · 第 1 轮
+
+### 范围
+
+- 基线：主工作树 `main@3a68f89`，全量测试 203 tests OK（基线日志见 D:\AAAAA\dsh\engineering-baseline-tests.log）。
+- 审计范围：`scripts/relay.py`、`scripts/relay_flow.py`、`scripts/relay_sync.py`、`scripts/relay_work.py`、`pyproject.toml`、相关测试。
+- 本轮全部改动在 worktree `D:\AAAAA\dsh\worktrees\project-relay\deepseek-harness` 的分支 `agent/deepseek-harness/engineering-audit` 上；主工作树保持 `main` 干净。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 安全 | `uninstall_deepseek_harness` 直接信任 `recipe.json` 的 `skill_dir`，篡改后可删除任意目录 | 新增 `_skill_dir_for_uninstall`，只接受 `.../skills/project-relay` 且父目录为 `.dsh` 或 `.agents` 的安装路径；新增篡改记录拒绝测试 |
+| P2 打包 | `pyproject.toml` 只打包 6 个模板，实际 `assets/template-v2` 有 11 个；pip 安装后 `init` 写空模板，`_skeleton_bytes()` 可能 `FileNotFoundError` | 补齐 `agent-goal.md`、`changes.md`、`memory.md`、`outlook.md`、`stack.md` 等 11 个模板；新增 `_resolve_templates_dir()`，兼容源码、技能包与 pip 的 `share/project-relay/template-v2` |
+| P3 版本 | `relay --version` 输出 `3.1.0`，与 `pyproject.toml` 的 `0.2.0` 不一致 | 新增 `VERSION = '0.2.0'`，`--version` 与测试统一读取该常量 |
+| P3 死代码 | `recipe package` 分支不可达（parser 没有 `package` 子命令），且属于旧 WorkBuddy 产品面 | 删除不可达分支；`recipe` 安装/卸载只保留 DSH |
+| P2 数据安全 | `import_bundle` 在 `confirm=False` 的干跑也会调用 `relay.init`，违反“零写入” | 只有 `confirm=True` 且 store 不存在时才初始化；干跑保持纯预览 |
+| P3 可用性 | 默认分支 `agent/deepseek-harness` 已被已有子分支 `agent/deepseek-harness/dsh-only` 占用时，`relay work enter` 直接失败 | 新增 Git ref 前缀冲突检测；默认分支冲突时回退 `agent/deepseek-harness/work`，显式 `--branch` 冲突时给出清晰错误；review/merge 支持识别子分支并优先使用已登记 worktree |
+
+### 验证
+
+- `python -m unittest tests.test_relay_work -v`：11 tests OK
+- `python -m unittest tests.test_relay_batch16 -v`：9 tests OK
+- `python -m unittest tests.test_v3_zip -v`：18 tests OK
+- 全量回归：`python -m unittest discover -s tests -v` → 210 tests OK（304.399s，EXIT 0）。
+- `git diff --check`：通过，无空白错误。
+
+### 说明与后续
+
+- 旧 Claude Code / Codex / WorkBuddy 代码保留为读取旧档案的兼容层，不再进入新产品路径；本轮未删除历史函数，避免破坏旧档案读取与旧测试。
+- `recipe.json`、`state/config.json` 属本地文件，不随 zip 导入；本轮只做路径结构校验，未改变同步包格式。
+- 后续候选（尚未处理）：`read_bundle_zip` 尚无解压总大小/单文件大小上限；`smoke_command` 仅执行本地 config；这些属于 P3 健壮性，不影响本轮已修复问题。
+
+## 2026-11-18 · 第 2 轮
+
+### 范围
+
+- 基线：第 1 轮提交 `03c1e95`，全量 210 tests OK。
+- 本轮继续审计 `relay_sync.py` 的导入/导出事务、`relay_flow.py` 的 capture/summarize/resume 写路径、`relay.py` 的档案目录安全检查。
+- 所有改动仍在 worktree `D:\AAAAA\dsh\worktrees\project-relay\deepseek-harness` 的分支 `agent/deepseek-harness/engineering-audit` 上；主工作树保持 `main` 干净。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 并发 | capture/summarize 只拿 agent 锁，export/import 没有共同档案级锁；并发时可能在同一 seq 上互相覆盖 raw 条目或 memory/changes | capture/summarize 整段持有 `relay.outer_lock(store_dir)`，内层再拿 agent lock；export_zip 在 outer lock 内完成 export+pack；import confirm 用 outer lock 包住 merge/land，dry-run 保持零写入 |
+| P1 完整性 | resume 发现 checksum 不符后仍重算并写入 state.md、刷新清单，会把损坏“洗白”为新的基线 | checksum 不符时只读旧 state.md，设置 `cross_check={'error':'checksum-mismatch'}`，不写 state.md、不刷新清单，保留现场 |
+| P2 安全 | `.project-relay` 根或受控子目录是符号链接时，写路径可能被重定向到仓库外 | 新增 `_reject_store_symlinks`，在 `resolve_store_dir` 与 `init` 中拒绝 store 根、agents/receipts/state/archive 及各家 raw/state/tx/backups 的符号链接（包括断链） |
+| P2 数据安全 | `_land_project` 落盘后立即删除回滚备份，后续 index/manifest/goal 标记写入失败时无法恢复 | `_land_files` 支持持久 backup_dir；`_land_project` 把备份放在 `archive/rollback-trash/land-*`，失败时恢复 payload、goal-imported/goal-conflict、删除未完成 merge log 并重刷 index/manifest；成功才删除备份 |
+| P2 健壮性 | `read_bundle_zip` 无条目数/单文件/总大小/压缩比限制，恶意 zip 可耗尽内存或磁盘；manifest 关键字段缺失时可能半初始化 | 增加 20000 条目、128MB 单文件、512MB 总量、1000:1 压缩比上限，并按实际读取字节二次校验；`verify_bundle` 提前校验 source_device、source_device_id、exported_at、projects 形状与 64 位小写 hash |
+| P2 一致性 | export_bundle 在 strict 质量门前改写本地 redaction 且不刷新 checksum，strict 失败后本地已变、清单仍旧 | 只在全部质量门通过后调用 `_fix_local_redactions`，有修复则刷新 checksum；失败时本地保持原字节 |
+| P2 合并 | `_merge_state_md` 无差别删除未裁决的“分叉待裁”行，冲突在 list_pending_resolutions 中消失 | 解析已有 fork notes，只删除已裁决（merged==incoming）或过期（incoming 变化）的行，保留未裁决行并避免重复生成 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_capture_summarize -v`：20 tests OK（含 `test_resume_checksum_mismatch_keeps_archive_untouched`）
+- `python -m unittest tests.test_v3_merge -v`：28 tests OK（含 `TestStateForkNotes` 与 shadow-copy 测试）
+- `python -m unittest tests.test_v3_layout tests.test_v3_zip -v`：44 tests OK
+- `python -m unittest tests.test_v3_zip -v`：26 tests OK（含 8 条新增 zip 限制/manifest/回滚测试）
+- `python -m unittest tests.test_relay_work -v`：11 tests OK；`tests.test_relay_batch16`：9 tests OK
+- 全量回归：`python -m unittest discover -s tests -v` → **223 tests OK**（306.489s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round2-final-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 旧 Claude Code / Codex / WorkBuddy 代码仍保留为只读兼容层，不进入新产品路径。
+- 仍未处理的小项：`_StoreLock.__enter__` 在加锁失败时可能泄漏已打开的文件句柄；`smoke_command` 仅执行本地 config；zip 解包失败时可能保留部分临时目录。均为 P3，留待下一轮评估。
+
+## 2026-11-18 · 第 3 轮
+
+### 范围
+
+- 基线：第 2 轮提交 `067fe84`，全量 223 tests OK。
+- 本轮审计完整性清单边界、配置读取健壮性、锁句柄生命周期、ZIP manifest 形状与统计配置来源。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 完整性 | 正常 capture→summarize→capture 后 checksum 清单报 `agents/deepseek-harness/log.jsonl` 与 `state/fingerprint-cache.json` 不符：本机状态文件被纳入 manifest | 在 `relay.py` 增加 `LOCAL_ONLY_OUTER`、`LOCAL_ONLY_AGENT_STATE`、`LOCAL_ONLY_AGENT_FILES`、`LOCAL_ONLY_AGENT_DIRS` 与 `is_local_only_path`；清单与 `relay_sync` 共用同一组“本机文件”定义；capture/summarize/log/agent-goal/stack/outlook 写后刷新清单 |
+| P2 可维护性 | `relay_sync` 自己维护 `_LOCAL_ONLY_*` 集合，容易与 manifest 规则漂移 | 改为 `relay.LOCAL_ONLY_*` 别名，`_is_payload_file` 统一调用 `relay.is_local_only_path` |
+| P2 健壮性 | `load_config` 只校验 dict，`pending_cap` 等字段为字符串/列表时后续比较或除法抛 TypeError | 新增 `_is_int` / `_validate_config`，校验所有数值、列表、可空字符串配置项；非法 JSON 转 `RelayError` |
+| P2 配置 | `relay_stats._read_config` 只读外层 `config.json`，文档与 `relay_flow` 的 knob 在 `state/config.json`，月度 token 上限不生效 | 先读外层再叠加 `state/config.json`（state 优先），非法 cap 置 None |
+| P3 锁 | `_StoreLock.__enter__` 在 open/加锁失败时可能泄漏句柄，`__exit__` 对未初始化句柄不安全 | 局部 `fh` 成功后才赋 `self._fh`，异常时关闭并置 None；`__exit__` 先判空，解锁异常收窄为 `OSError/ValueError` |
+| P3 完整性 | `stack --set` / `outlook --set` 写外层正式文件后不刷新 checksum，下一次 resume 会误报 | `write_stack` / `write_outlook` 写后调用 `update_checksum_manifest` |
+| P3 ZIP | `verify_bundle` 只要求清单路径以 `projects/` 开头，`projects/other/` 文件会被静默丢弃；项目 slug 未在验证阶段约束 | 校验 slug 匹配 `_PROJECT_SLUG_RE` 且非 `.`/`..`，所有清单文件必须在 `projects/<slug>/` 前缀下 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_manifest_config -v`：13 tests OK（manifest 本机状态、旧清单兼容、capture-after-summarize、log/stack/outlook 刷新、锁句柄、配置校验、stats 月度 cap）
+- `python -m unittest tests.test_v3_zip -v`：28 tests OK（含新增 2 条其它项目/非法 slug 校验）
+- `python -m unittest tests.test_v3_layout -v`：18 tests OK
+- 定向回归（zip/merge/capture_summarize/stats_fork/redact）：124 tests OK（218.348s）
+- 全量回归：`python -m unittest discover -s tests -v` → **238 tests OK**（323.600s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round3-final2-tests.log`）
+- `git diff --check`：通过
+
+### 说明与后续
+
+- 本轮不改变 ZIP 包格式；只加严 manifest 校验与本机文件边界。
+- 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；zip 解包失败时可能保留部分临时目录；均属 P3，下一轮评估。
+
+## 2026-11-18 · 第 4 轮
+
+### 范围
+
+- 基线：第 3 轮提交 `8a4365c`，全量 238 tests OK。
+- 本轮审计 ZIP 导出/导入辅助函数的失败原子性，以及 `export_bundle` 的 strict 质量门执行顺序。
+- 所有改动仍在 worktree `D:\AAAAA\dsh\worktrees\project-relay\deepseek-harness` 的分支 `agent/deepseek-harness/engineering-audit` 上；主工作树保持 `main` 干净。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P1 数据完整性 | `write_bundle_zip` 直接写目标 zip，打包中途失败会留下半成品；`export_zip` 又拒绝覆盖已存在目标，半成品会成为永久障碍 | 改为先写同目录 `tempfile.mkstemp` 临时文件，全部条目写完后 `os.replace` 原子发布；异常时删除临时文件并重新抛出 |
+| P1 数据安全 | `read_bundle_zip` 直接向目标目录逐条解压，校验通过但后面某条解压损坏时会留下前面的文件 | 改为在同级 `.relay-unzip-*` 临时目录解压，全部成功后再替换目标目录；任何异常清理临时目录并重新抛出，保留原有条目数/大小/压缩比限制 |
+| P2 质量门 | `export_bundle` 先创建目标目录并写入 payload，最后才检查 strict 阻断项；直接调用时 strict 拒绝会留下部分导出文件 | 把 strict 阻断检查提前到 payload 写入之前，阻断时只可能留下空目标目录，不写任何文件 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip -v`：31 tests OK（新增 3 条失败原子性/空目标回归）。
+- 全量回归：`python -m unittest discover -s tests -v` → **241 tests OK**（325.913s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round4-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮不改变 ZIP 包格式，也不改变 manifest 结构；只修失败路径上的临时文件/半成品清理。
+- `export_bundle` strict 拒绝时目标目录可能为空目录（`export_zip` 使用临时目录，不受影响）；后续可考虑连空目录也不创建。
+- 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；`relay_work.merge` 在无 Git 身份的宿主机上会因 `Author identity unknown` 失败；均属环境/低风险项，下一轮评估。
+
+## 2026-11-18 · 第 5 轮
+
+### 范围
+
+- 基线：第 4 轮提交 `4acbf88`，全量 241 tests OK。
+- 本轮审计 `relay_sync.py` 导出失败清理与 `relay_stats.py` 统计行容错，补对应回归。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 可靠性 | `export_bundle` 在 strict 质量门前创建目标目录，strict 拒绝会留下空目录 | 把 `dest.mkdir` 后移到 strict 检查通过后、payload 写入前；测试改为断言目标目录不存在 |
+| P2 稳定性 | `relay_stats.compute_fuse` 直接读取 `r['llm_tokens']`，旧版/手工 stats 行缺失字段会 KeyError，resume/保险丝崩溃 | 新增 `_token_int`、`_row_llm_tokens`、`_row_epoch`；过滤非 dict 行；缺失 total 回退 `llm_in_tokens + llm_out_tokens`；异常 epoch 归零 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip tests.test_v3_stats_fork -v`：61 tests OK（45.867s）。
+- 全量回归：**243 tests OK**（329.321s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round5-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮不改变导出包格式或 manifest 结构。
+- 仍未处理的小项：`relay_work.merge` 在无 Git 身份宿主机上会因 `Author identity unknown` 失败；`smoke_command` 仅执行本地 config（本地配置，不是远程输入）；下一轮评估。
+
+## 2026-11-18 · 第 6 轮
+
+### 范围
+
+- 基线：第 5 轮提交 `9193092`，全量 243 tests OK。
+- 本轮审计 `relay.py` 的 `init` 档案目录边界，并复核 `relay_work.py` 的 enter/status/review/merge 分支逻辑。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 安全 | `relay.init` 只拒绝 `.project-relay` 根 symlink，未拒绝已存在的 `agents`/`receipts`/`state`/`archive` 子目录 symlink；仓库预置 `.project-relay/agents` 指向外部时，init 会写入仓库外 | 在 init 写骨架前，若 store 已存在则调用 `_reject_store_symlinks(store_dir)`；补 `test_init_rejects_symlinked_agent_dir`（宿主不支持 symlink 时 skip） |
+
+### 验证
+
+- `python -m unittest tests.test_v3_layout -v`：19 tests OK（1 skipped：宿主不支持创建 symlink）。
+- 全量回归：**244 tests OK**（332.140s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round6-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- `relay_work.py` 的 enter/status/review/merge 本轮未发现高严重度问题；`relay_work.merge` 仍依赖宿主机 Git identity（本地已配置 `DSH Agent <dsh@local.invalid>`）。
+- 下一轮继续审计统计/分叉模块和 CLI 错误路径；发现低风险问题直接修复并补回归。
+
+## 2026-11-18 · 第 7 轮
+
+### 范围
+
+- 基线：第 6 轮提交 `7430eaa`，全量 244 tests OK（skipped=1）。
+- 本轮继续审计 `relay_sync.py` 的并发导出路径与目标文件保护。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 并发 | `export_zip` 的目标 zip 已存在检查在获取 `relay.outer_lock` 之前；另一个导出进程可在检查与真正写入之间创建目标，随后 `write_bundle_zip` 的 `os.replace` 会静默覆盖已有 zip | 在 `with relay.outer_lock(store_dir):` 内再次检查 `zip_path.exists()`，不存在才继续写；新增 `test_export_zip_rechecks_target_under_lock` 覆盖竞争窗口 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip -v`：32 tests OK（28.365s）。
+- 全量回归：**245 tests OK**（346.266s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round7-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮仅收紧导出目标文件保护，不改变 ZIP 包格式。
+- 下一轮继续审计分叉/统计/CLI 错误路径。
+
+## 2026-11-18 · 第 8 轮
+
+### 范围
+
+- 基线：第 7 轮提交 `5bc4c47`，全量 245 tests OK（skipped=1）。
+- 本轮继续审计 `relay_fork.py` 的分叉链读取容错。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 稳定性 | `_package_records` 对 `state/chain-archives/*.json` 只捕获 JSON 解析错误；合法 JSON 但顶层为列表或 `records` 非列表时会在 `pkg.get(...)` / 迭代时崩溃，导致 `resume` / `detect_forks` / `list_summaries` 失败 | 读取后校验顶层为 dict、`records` 为 list；不合法包安全跳过。新增 `test_malformed_chain_package_does_not_crash` |
+
+### 验证
+
+- `python -m unittest tests.test_v3_stats_fork -v`：31 tests OK（23.289s）。
+- 全量回归：**246 tests OK**（353.152s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\engineering-round8-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 分叉链包格式不变；只是损坏数据不再阻断 resume。
+- 下一轮继续审计 CLI 错误路径与统计/分叉的剩余边界。

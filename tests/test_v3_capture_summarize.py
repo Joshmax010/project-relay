@@ -220,6 +220,10 @@ class TestResume(V3Base):
         idx = lines.index('## 事实')
         lines[idx + 1:idx + 1] = ['- %s：%s' % (key, value)]
         path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        # This is a test-only direct write; a real memory writer refreshes
+        # the integrity manifest. Without this, resume correctly treats the
+        # archive as damaged and skips the cross-agent check.
+        relay.update_checksum_manifest(store)
 
     def test_resume_renders_five_sections(self):
         root = self.init()
@@ -283,6 +287,26 @@ class TestResume(V3Base):
         self.assertIn('由 resume 从各家记忆现算', after)
         self.assertIn(flow.STATE_BEGIN, after)
         self.assertIn('codex', after)
+
+    def test_resume_checksum_mismatch_keeps_archive_untouched(self):
+        root = self.init()
+        self.confirm_goal(root)
+        self.capture(root, 'codex')
+        self.summarize(root, 'codex', semantic_text=SEMANTIC)
+        store = self.store_dir(root)
+        victim = self.adir(root, 'codex') / 'memory.md'
+        victim.write_text(victim.read_text(encoding='utf-8') + '\n被篡改的行\n',
+                          encoding='utf-8')
+        state_before = (store / 'state.md').read_bytes()
+        manifest_before = (store / relay.CHECKSUM_MANIFEST).read_bytes()
+        result = self.resume(root)
+        self.assertTrue(result['sick'])
+        self.assertIn('校验清单不符', result['sections'][1])
+        self.assertEqual(state_before, (store / 'state.md').read_bytes(),
+                         'resume must not rewrite state.md on checksum mismatch')
+        self.assertEqual(manifest_before,
+                         (store / relay.CHECKSUM_MANIFEST).read_bytes(),
+                         'resume must not refresh the manifest on checksum mismatch')
 
 
 class TestFactsEndToEnd(V3Base):

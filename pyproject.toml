@@ -37,10 +37,15 @@ py-modules = [
 # that path when the repo checkout is not around the installed module.
 [tool.setuptools.data-files]
 "share/project-relay/template-v2" = [
+    "assets/template-v2/agent-goal.md",
     "assets/template-v2/backlog.md",
+    "assets/template-v2/changes.md",
     "assets/template-v2/decisions.md",
     "assets/template-v2/goal.md",
     "assets/template-v2/handoff.md",
     "assets/template-v2/lessons.md",
+    "assets/template-v2/memory.md",
+    "assets/template-v2/outlook.md",
+    "assets/template-v2/stack.md",
     "assets/template-v2/state.md",
 ]

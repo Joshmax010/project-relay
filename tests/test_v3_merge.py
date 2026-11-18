@@ -16,6 +16,7 @@ last-summary/summaries unions, discards + quarantine, health_check,
 and the payload filter.
 """
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -302,6 +303,41 @@ class TestGoalStackState(MergeBase):
         self.assertTrue(any('stack.md 两边不同' in n for n in result['notes']))
 
 
+class TestStateForkNotes(V3Base):
+    def _state(self, value, fork=None):
+        body = '%s\n- 语言：%s\n%s\n' % (sync.STATE_BEGIN, value, sync.STATE_END)
+        if fork is not None:
+            body += '- 分叉待裁：语言（对方）：%s\n' % fork
+        return '前言\n' + body + '尾部\n'
+
+    def test_unresolved_fork_note_survives_remerge(self):
+        local = self._state('Python', 'Go')
+        incoming = self._state('Go')
+        merged, conflicts, _notes = sync._merge_state_md(
+            local, incoming, 'state.md')
+        self.assertEqual(1, merged.count('- 分叉待裁：语言'))
+        self.assertIn('- 分叉待裁：语言（对方）：Go', merged)
+        self.assertTrue(any(c.get('key') == '语言' for c in conflicts))
+
+    def test_resolved_fork_note_is_cleaned(self):
+        local = self._state('未知', 'Go')
+        incoming = self._state('Go')
+        merged, _conflicts, notes = sync._merge_state_md(
+            local, incoming, 'state.md')
+        self.assertNotIn('分叉待裁', merged)
+        self.assertIn('- 语言：Go', merged)
+        self.assertTrue(any('清理了' in n for n in notes))
+
+    def test_stale_fork_note_is_replaced_with_current_values(self):
+        local = self._state('Python', 'Go')
+        incoming = self._state('Rust')
+        merged, _conflicts, _notes = sync._merge_state_md(
+            local, incoming, 'state.md')
+        self.assertEqual(1, merged.count('- 分叉待裁：语言'))
+        self.assertIn('（对方）：Rust', merged)
+        self.assertNotIn('（对方）：Go', merged)
+
+
 class TestFilesAndSummaries(MergeBase):
     def test_receipts_union_renames_on_collision(self):
         a, _b = self.pair()
@@ -432,6 +468,22 @@ class TestHealthAndPayloadFilter(MergeBase):
         }
         for rel, expected in cases.items():
             self.assertEqual(expected, sync._is_payload_file(rel), rel)
+
+    def test_shadow_copy_skips_locks_and_rollback_trash(self):
+        a, _b = self.pair()
+        store = self.store_dir(a)
+        trash = store / 'archive' / 'rollback-trash' / 'land-x'
+        trash.mkdir(parents=True)
+        (trash / 'payload.md').write_bytes(b'payload')
+        (store / 'agents' / 'codex' / 'raw' / 'cap-0001.md.lock').write_bytes(b'x')
+        shadow = sync._shadow_copy(store)
+        try:
+            self.assertFalse((shadow / 'archive' / 'rollback-trash').exists())
+            self.assertFalse((shadow / 'agents' / 'codex' / 'raw' / 'cap-0001.md.lock').exists())
+            self.assertTrue((shadow / 'goal.md').exists())
+            self.assertTrue((shadow / 'agents' / 'codex' / 'raw' / 'cap-0001.md').exists())
+        finally:
+            shutil.rmtree(shadow, ignore_errors=True)
 
     def test_collect_payload_excludes_local_only_files(self):
         a, _b = self.pair()

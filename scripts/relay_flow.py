@@ -384,14 +384,54 @@ ARCHIVE_BUDGETS = {
 }
 
 # ---------------------------------------------------------------- config
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_config(cfg, path):
+    """Reject wrong types early; a string where a number belongs used to
+    fail much later inside a comparison/division with a bare TypeError."""
+    def bad(key, expected):
+        raise relay.RelayError('项目配置项 %s 应为%s（%s）' % (key, expected, path))
+
+    for key in ('pending_cap', 'raw_cap_mb', 'queue_timeout_seconds',
+                'threshold_files', 'threshold_lines', 'time_days',
+                'inject_budget_tokens', 'chain_compress_threshold',
+                'chain_compress_keep'):
+        if not _is_int(cfg.get(key)) or cfg[key] < 0:
+            bad(key, '非负整数')
+    for key in ('precompress_sample_cap', 'monthly_llm_token_cap'):
+        value = cfg.get(key)
+        if value is not None and (not _is_int(value) or value < 0):
+            bad(key, 'null 或非负整数')
+    if not isinstance(cfg.get('fingerprint_threshold_s'), (int, float)) \
+            or isinstance(cfg.get('fingerprint_threshold_s'), bool) \
+            or cfg['fingerprint_threshold_s'] < 0:
+        bad('fingerprint_threshold_s', '非负数字')
+    for key in ('exclude_globs', 'fingerprint_excludes'):
+        value = cfg.get(key)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            bad(key, '字符串列表')
+    smoke = cfg.get('smoke_command')
+    if smoke is not None and not isinstance(smoke, str):
+        bad('smoke_command', 'null 或字符串')
+    scope = cfg.get('scope')
+    if scope is not None and not isinstance(scope, str):
+        bad('scope', 'null 或字符串')
+
+
 def load_config(store_dir):
     """Project config: defaults merged over state/config.json (plan 1.7/1.11)."""
     cfg = dict(DEFAULT_CONFIG)
     path = store_dir / 'state' / 'config.json'
     if path.exists():
-        value = read_json(path)
+        try:
+            value = read_json(path)
+        except ValueError as exc:
+            raise relay.RelayError('项目配置不是有效 JSON：%s（%s）' % (path, exc))
         require(isinstance(value, dict), '项目配置格式错误：' + str(path))
         cfg.update(value)
+    _validate_config(cfg, path)
     return cfg
 
 
@@ -670,26 +710,29 @@ def _capture_inner(toplevel, agent, store_dir, adir, session=None,
 
 
 def capture(toplevel, agent, session=None, message=None, filename_tag=None):
-    """Public capture: new-agent join + agent-dir lock + agent log.
+    """Public capture: new-agent join + archive lock + agent lock + log.
 
     A first capture for an unknown agent IS the join event: the agent
-    dir is created and the routing table updated (outer lock, once).
-    The capture itself runs under that agent's own directory lock, so
-    two agents never block each other; two sessions of the same agent
-    queue on the small lock.
+    dir is created and the routing table updated. The archive-wide lock
+    is taken for the whole capture so a concurrent import/export cannot
+    interleave with the raw entry and its later manifest refresh. The
+    per-agent lock still serializes two sessions of the same agent.
     """
     store_dir = relay.resolve_store_dir(toplevel)
     toplevel = relay.git_toplevel(toplevel)
     adir = relay.agent_dir(store_dir, agent)
-    if not adir.is_dir():
-        with relay.outer_lock(store_dir):
+    with relay.outer_lock(store_dir):
+        if not adir.is_dir():
             relay.ensure_agent_dir(store_dir, agent)
-    with relay.agent_lock(store_dir, agent):
-        info = _capture_inner(toplevel, agent, store_dir, adir, session,
-                              message, filename_tag)
-        if not info.get('deduped'):
-            relay.append_agent_log(store_dir, agent, 'capture',
-                                   'cap-%04d' % info['seq'])
+        with relay.agent_lock(store_dir, agent):
+            info = _capture_inner(toplevel, agent, store_dir, adir, session,
+                                  message, filename_tag)
+            if not info.get('deduped'):
+                relay.append_agent_log(store_dir, agent, 'capture',
+                                       'cap-%04d' % info['seq'])
+                # 采集新条目后必须刷新完整性清单：raw 条目与 log 都是
+                # 正式档案，否则下一次 resume 会把它们报成缺失/篡改。
+                relay.update_checksum_manifest(store_dir)
     return info
 
 
@@ -1622,6 +1665,25 @@ def install_deepseek_harness(toplevel, target_root=None, home_dir=None):
             'message': '已装到 DeepSeek Harness（%s）' % location}
 
 
+def _skill_dir_for_uninstall(raw, toplevel):
+    """Validate an install record before deleting anything.
+
+    recipe.json is device-local and never imported, but a corrupted record
+    must not turn uninstall into an arbitrary-directory delete. Only the
+    DSH skill layout (root/.dsh/skills/project-relay or
+    home/.agents/skills/project-relay) is accepted.
+    """
+    skill_dir = Path(raw).expanduser()
+    if not skill_dir.is_absolute():
+        skill_dir = Path(toplevel) / skill_dir
+    skill_dir = skill_dir.resolve()
+    require(skill_dir.name == 'project-relay'
+            and skill_dir.parent.name == 'skills'
+            and skill_dir.parent.parent.name in ('.dsh', '.agents'),
+            '拒绝卸载：安装记录中的 skill_dir 不是合法的 DSH 技能目录：%s' % raw)
+    return skill_dir
+
+
 def uninstall_deepseek_harness(toplevel):
     """Remove the DeepSeek Harness skill directory and its install record."""
     toplevel = relay.main_worktree(toplevel)
@@ -1630,9 +1692,7 @@ def uninstall_deepseek_harness(toplevel):
     require(state is not None, '未找到 DeepSeek Harness 配方安装记录')
     raw = (state or {}).get('skill_dir')
     if raw:
-        skill_dir = Path(raw).expanduser()
-        if not skill_dir.is_absolute():
-            skill_dir = toplevel / skill_dir
+        skill_dir = _skill_dir_for_uninstall(raw, toplevel)
     else:
         skill_dir = toplevel / '.dsh' / 'skills' / 'project-relay'
     if skill_dir.is_dir():
@@ -2004,50 +2064,53 @@ def summarize(toplevel, agent, source='manual', semantic_text=None, session=None
               semantic_auto=False, trigger=None, llm_usage=None):
     """Public summarize: one agent's queue into that agent's own memory.
 
-    New-agent join + that agent's directory lock + changes.md section +
-    agent log (both inside the same lock). The checksum manifest refresh
-    and any stale device notice clear are outer-layer work and happen in
-    _summarize_locked. Batch 3.4: trigger names the scale class for the
-    stats row (None derives it from source); llm_usage is an optional
-    caller-reported {calls, input_tokens, output_tokens} object that turns
-    the LLM figures from estimates into measured values. When the cost
-    fuse is tripped, caller-supplied (non-auto) semantic text is dropped
-    and the run degrades to assembled-only; tool-generated auto text
-    (zero model calls by construction) passes through.
+    Archive lock + that agent's directory lock + changes.md section +
+    agent log (both inside the same lock). The archive-wide lock matches
+    import/export so a zip landing cannot interleave with a summarize's
+    memory/changes writes and manifest refresh. Batch 3.4: trigger names
+    the scale class for the stats row (None derives it from source);
+    llm_usage is an optional caller-reported {calls, input_tokens,
+    output_tokens} object that turns the LLM figures from estimates into
+    measured values. When the cost fuse is tripped, caller-supplied
+    (non-auto) semantic text is dropped and the run degrades to
+    assembled-only; tool-generated auto text (zero model calls by
+    construction) passes through.
     """
     store_dir = relay.resolve_store_dir(toplevel)
     toplevel = relay.git_toplevel(toplevel)
     adir = relay.agent_dir(store_dir, agent)
-    if not adir.is_dir():
-        with relay.outer_lock(store_dir):
+    with relay.outer_lock(store_dir):
+        if not adir.is_dir():
             relay.ensure_agent_dir(store_dir, agent)
-    with relay.agent_lock(store_dir, agent):
-        record = _summarize_locked(toplevel, agent, store_dir, adir, source,
-                                   semantic_text, session, semantic_auto,
-                                   trigger, llm_usage)
-        if record.get('noop'):
+        with relay.agent_lock(store_dir, agent):
+            record = _summarize_locked(toplevel, agent, store_dir, adir, source,
+                                       semantic_text, session, semantic_auto,
+                                       trigger, llm_usage)
+            if record.get('noop'):
+                return record
+            if record.get('degraded'):
+                relay.append_agent_log(store_dir, agent, 'summarize-degraded',
+                                       's%04d' % record.get('seq', 0))
+                relay.update_checksum_manifest(store_dir)
+                return record
+            if record.get('branched'):
+                # A branched product wrote no archive file (its seq is not a
+                # summary seq), but the branch log line is still a formal
+                # file; refresh so resume doesn't flag the log as tampered.
+                relay.append_agent_log(store_dir, agent, 'summarize-branched',
+                                       record['branch'])
+                relay.update_checksum_manifest(store_dir)
+                return record
+            _append_changes_record(store_dir, agent, record)
+            relay.append_agent_log(store_dir, agent, 'summarize',
+                                   's%04d' % record['seq'])
+            # The manifest invariant: once a manifest exists, EVERY archive
+            # writer must refresh it, or the next resume correctly reports a
+            # stale manifest as corruption. This runs last, after the
+            # changes.md section and the log line above.
+            relay.update_checksum_manifest(store_dir)
+            (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
             return record
-        if record.get('degraded'):
-            relay.append_agent_log(store_dir, agent, 'summarize-degraded',
-                                   's%04d' % record.get('seq', 0))
-            return record
-        if record.get('branched'):
-            # A branched product wrote no archive file (its seq is not a
-            # summary seq), so there is no changes.md section and nothing
-            # to refresh -- just log the branch.
-            relay.append_agent_log(store_dir, agent, 'summarize-branched',
-                                   record['branch'])
-            return record
-        _append_changes_record(store_dir, agent, record)
-        relay.append_agent_log(store_dir, agent, 'summarize',
-                               's%04d' % record['seq'])
-        # The manifest invariant: once a manifest exists, EVERY archive
-        # writer must refresh it, or the next resume correctly reports a
-        # stale manifest as corruption. This runs last, after the
-        # changes.md section and the log line above.
-        relay.update_checksum_manifest(store_dir)
-        (store_dir / DEVICE_NOTICE_FILE).unlink(missing_ok=True)
-        return record
 
 
 def _summarize_locked(toplevel, agent, store_dir, adir, source='manual',
@@ -3192,19 +3255,30 @@ def resume(toplevel):
         if corrections:
             sec4 += '\n对账纠正 %d 条已记入总记忆（见一段现算结果）' % len(corrections)
     # Overall memory: computed from the agents' files, then persisted to
-    # outer state.md (the one bounded write outside section 4).
-    try:
-        state_text, cross_check = _compute_overall_memory(
-            store_dir, toplevel, agents, corrections)
-        with relay.outer_lock(store_dir):
-            atomic(store_dir / 'state.md', state_text.encode('utf-8'))
-        relay.update_checksum_manifest(store_dir)
-    except Exception as exc:
-        state_text = (store_dir / 'state.md').read_text(encoding='utf-8') \
-            if (store_dir / 'state.md').exists() else ''
-        cross_check = {'conflicts': [], 'facts': {}, 'error': repr(exc)}
-        banner = ('【带病接手】总记忆现算失败：%r，已用上次落盘的 state.md 继续。' % exc) \
-            + ('\n' + banner if banner else '')
+    # outer state.md (the one bounded write outside section 4). When the
+    # checksum manifest is already mismatched, do NOT persist a recomputed
+    # state.md or refresh the manifest: that would launder a corrupted
+    # archive into a fresh baseline and hide the damage from the next
+    # resume. Keep the last good state for the report and leave the
+    # archive byte-for-byte as found.
+    if manifest_mismatches:
+        state_path = store_dir / 'state.md'
+        state_text = state_path.read_text(encoding='utf-8') \
+            if state_path.exists() else ''
+        cross_check = {'conflicts': [], 'facts': {}, 'error': 'checksum-mismatch'}
+    else:
+        try:
+            state_text, cross_check = _compute_overall_memory(
+                store_dir, toplevel, agents, corrections)
+            with relay.outer_lock(store_dir):
+                atomic(store_dir / 'state.md', state_text.encode('utf-8'))
+            relay.update_checksum_manifest(store_dir)
+        except Exception as exc:
+            state_text = (store_dir / 'state.md').read_text(encoding='utf-8') \
+                if (store_dir / 'state.md').exists() else ''
+            cross_check = {'conflicts': [], 'facts': {}, 'error': repr(exc)}
+            banner = ('【带病接手】总记忆现算失败：%r，已用上次落盘的 state.md 继续。' % exc) \
+                + ('\n' + banner if banner else '')
     # Section 1: archive summary, from the computed state.
     gstate, ginfo = relay.goal_status(toplevel)
     gstate_display = '待本机确认' if gstate == 'imported' else gstate
