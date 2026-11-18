@@ -110,6 +110,43 @@ def estimate_tokens(text):
     return tokens_for_chars(len(text))
 
 
+def _token_int(value):
+    """Best-effort non-negative integer for a stats field."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _row_llm_tokens(row):
+    """LLM tokens for one stats row, tolerating old or malformed rows.
+
+    record_summarize writes the derived total llm_tokens; rows from older
+    builds may only carry llm_in_tokens/llm_out_tokens. Resume must not
+    crash because the stats history predates the derived field.
+    """
+    if not isinstance(row, dict):
+        return 0
+    if row.get('llm_tokens') is not None:
+        return _token_int(row.get('llm_tokens'))
+    return _token_int(row.get('llm_in_tokens', 0)) + _token_int(row.get('llm_out_tokens', 0))
+
+
+def _row_epoch(row):
+    """Best-effort numeric epoch for a stats row; 0 when unavailable."""
+    if not isinstance(row, dict):
+        return 0.0
+    value = row.get('at_epoch', 0)
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _append(store_dir, filename, row, now_epoch=None):
     now_epoch = time.time() if now_epoch is None else now_epoch
     row = dict(row)
@@ -247,13 +284,14 @@ def compute_fuse(store_dir, now_epoch=None):
     takeover read path stays write-free; summarize uses evaluate_fuse,
     which persists transitions."""
     now_epoch = time.time() if now_epoch is None else now_epoch
-    rows = [r for r in summarize_rows(store_dir) if not r.get('noop')]
-    week = sum(r['llm_tokens'] for r in rows
-               if r.get('at_epoch', 0) >= now_epoch - 7 * 86400)
-    prev = sum(r['llm_tokens'] for r in rows
-               if now_epoch - 14 * 86400 <= r.get('at_epoch', 0) < now_epoch - 7 * 86400)
-    month = sum(r['llm_tokens'] for r in rows
-                if _month_key(r.get('at_epoch', 0)) == _month_key(now_epoch))
+    rows = [r for r in summarize_rows(store_dir)
+            if isinstance(r, dict) and not r.get('noop')]
+    week = sum(_row_llm_tokens(r) for r in rows
+               if _row_epoch(r) >= now_epoch - 7 * 86400)
+    prev = sum(_row_llm_tokens(r) for r in rows
+               if now_epoch - 14 * 86400 <= _row_epoch(r) < now_epoch - 7 * 86400)
+    month = sum(_row_llm_tokens(r) for r in rows
+                if _month_key(_row_epoch(r)) == _month_key(now_epoch))
     cfg, _ = _read_config(store_dir)
     cap = cfg.get('monthly_llm_token_cap', None)
     tripped = prev > 0 and week >= FUSE_SPIKE_FLOOR_TOKENS \

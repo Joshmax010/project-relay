@@ -131,3 +131,28 @@
 - 本轮不改变 ZIP 包格式，也不改变 manifest 结构；只修失败路径上的临时文件/半成品清理。
 - `export_bundle` strict 拒绝时目标目录可能为空目录（`export_zip` 使用临时目录，不受影响）；后续可考虑连空目录也不创建。
 - 仍未处理的小项：`smoke_command` 仅执行本地 config（本地配置，不是远程 RCE）；`relay_work.merge` 在无 Git 身份的宿主机上会因 `Author identity unknown` 失败；均属环境/低风险项，下一轮评估。
+
+## 2026-11-18 · 第 5 轮
+
+### 范围
+
+- 基线：第 4 轮提交 `4acbf88`，全量 241 tests OK。
+- 本轮审计 `relay_sync.py` 导出失败清理与 `relay_stats.py` 统计行容错，补对应回归。
+
+### 已修复问题
+
+| 优先级 | 问题 | 修复 |
+|---|---|---|
+| P2 可靠性 | `export_bundle` 在 strict 质量门前创建目标目录，strict 拒绝会留下空目录 | 把 `dest.mkdir` 后移到 strict 检查通过后、payload 写入前；测试改为断言目标目录不存在 |
+| P2 稳定性 | `relay_stats.compute_fuse` 直接读取 `r['llm_tokens']`，旧版/手工 stats 行缺失字段会 KeyError，resume/保险丝崩溃 | 新增 `_token_int`、`_row_llm_tokens`、`_row_epoch`；过滤非 dict 行；缺失 total 回退 `llm_in_tokens + llm_out_tokens`；异常 epoch 归零 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_zip tests.test_v3_stats_fork -v`：61 tests OK（45.867s）。
+- 全量回归：**243 tests OK**（329.321s，EXIT 0，日志 `D:\AAAAA\dsh\engineering-round5-tests.log`）
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本轮不改变导出包格式或 manifest 结构。
+- 仍未处理的小项：`relay_work.merge` 在无 Git 身份宿主机上会因 `Author identity unknown` 失败；`smoke_command` 仅执行本地 config（本地配置，不是远程输入）；下一轮评估。

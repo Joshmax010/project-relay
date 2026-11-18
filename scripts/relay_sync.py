@@ -1283,7 +1283,6 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
     """
     dest = Path(dest_dir)
     require(not dest.exists() or not any(dest.iterdir()), '导出目标目录非空：' + str(dest))
-    dest.mkdir(parents=True, exist_ok=True)
     store_dir = Path(store_dir)
     slug = relay.slug_for(store_dir.parent.name)
     payload = _collect_payload(store_dir)
@@ -1296,6 +1295,9 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
             raise RelayError(
                 '导出前置检查未通过（%d 项阻断）：%s'
                 % (len(blocked), '；'.join(g['message'] for g in blocked)))
+    # Create the destination only after every preflight gate has passed:
+    # a strict refusal must not leave an empty directory behind.
+    dest.mkdir(parents=True, exist_ok=True)
     manifest_files = {}
     entry_count = 0
     proj_dir = dest / 'projects' / slug

@@ -91,6 +91,29 @@ class TestFuse(V3Base):
         self.assertFalse(result['cap_alert'])
         self.assertIsNone(result['monthly_cap'])
 
+    def test_compute_fuse_tolerates_legacy_row_without_total(self):
+        root = self.init()
+        store = self.store_dir(root)
+        now = time.time()
+        stats_path = store / 'stats' / 'summarize.jsonl'
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        row = {'source': 'manual', 'trigger': 'manual',
+               'llm_in_tokens': 100, 'llm_out_tokens': 50,
+               'at_epoch': now - DAY}
+        stats_path.write_text(json.dumps(row) + '\n', encoding='utf-8')
+        result = stats.compute_fuse(store, now_epoch=now)
+        self.assertEqual(150, result['week_llm_tokens'])
+
+    def test_compute_fuse_ignores_non_dict_rows(self):
+        root = self.init()
+        store = self.store_dir(root)
+        now = time.time()
+        stats_path = store / 'stats' / 'summarize.jsonl'
+        stats_path.parent.mkdir(parents=True, exist_ok=True)
+        stats_path.write_text('[]\n', encoding='utf-8')
+        result = stats.compute_fuse(store, now_epoch=now)
+        self.assertEqual(0, result['week_llm_tokens'])
+
     def test_spike_trips(self):
         root = self.init()
         store = self.store_dir(root)

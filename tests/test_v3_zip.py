@@ -319,8 +319,8 @@ class TestZipHandoff(V3Base):
         dest = Path(self.temp.name) / 'strict-bundle'
         with self.assertRaises(SyncError):
             sync.export_bundle(self.store_dir(root), dest, 'dev', 'dev-1', strict=True)
-        self.assertFalse(dest.exists() and any(dest.iterdir()),
-                         'strict rejection must happen before payload writes')
+        self.assertFalse(dest.exists(),
+                         'strict rejection must not create the destination directory')
 
     def test_read_bundle_zip_rejects_escaping_entry(self):
         zip_path = Path(self.temp.name) / 'evil.zip'
