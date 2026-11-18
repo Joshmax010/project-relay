@@ -35,6 +35,7 @@ import re
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path, PurePosixPath
 
@@ -155,6 +156,7 @@ def anchor(root):
 
 
 # ---------------------------------------------------------------- store
+VERSION = '0.2.0'
 STORE_DIRNAME = '.project-relay'
 # 现役 Agent：DeepSeek Harness（DSH，目录名 deepseek-harness）。
 # AGENTS 保留历史名字用于读取旧档案；ACTIVE_AGENTS 决定 init 建哪些目录。
@@ -175,7 +177,34 @@ CHECKSUM_MANIFEST = 'checksum-manifest.json'
 # (leftovers of the deleted sync-rollback trash; kept so old archives
 # still verify).
 ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
-TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'assets' / 'template-v2'
+
+
+def _resolve_templates_dir():
+    """Find template-v2 in a source checkout, a DSH skill, or a pip install.
+
+    pyproject data-files install the tree under
+    <prefix>/share/project-relay/template-v2; a source checkout and the
+    standalone skill keep it at <root>/assets/template-v2. The old
+    constant-only lookup silently produced empty skeleton files (and a
+    FileNotFoundError in _skeleton_bytes) after a pip install.
+    """
+    candidates = [
+        Path(__file__).resolve().parent.parent / 'assets' / 'template-v2',
+        Path(__file__).resolve().parent / 'assets' / 'template-v2',
+    ]
+    try:
+        data = sysconfig.get_path('data')
+        if data:
+            candidates.append(Path(data) / 'share' / 'project-relay' / 'template-v2')
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+TEMPLATES_DIR = _resolve_templates_dir()
 
 
 def main_worktree(path):
@@ -921,7 +950,7 @@ def _print_sync_project(entry):
 def _parser():
     p = argparse.ArgumentParser(prog='relay', description='项目根目录下的共享记忆，分 Agent 存放（v3）')
     p.add_argument('--root', default='.', help='项目根目录（默认当前目录）')
-    p.add_argument('--version', action='version', version='relay 3.1.0')
+    p.add_argument('--version', action='version', version='relay ' + VERSION)
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
     sub.add_parser('agents')
@@ -1279,42 +1308,15 @@ def main(argv=None):
                         return 2
                     print(msg)
             elif a.command == 'recipe':
-                if a.recipe_command == 'package':
-                    info = flow.package_workbuddy(root, out=a.out)
-                    print('技能包：' + info['zip_path'])
-                    print('文件 %d 个' % len(info['files']))
+                home = Path(a.home).expanduser() if a.home else None
+                if a.recipe_command == 'install':
+                    info = flow.install_deepseek_harness(root,
+                        target_root=a.target_root, home_dir=home)
+                    print('skill 目录：' + info['skill_dir'])
+                    print(info['note'])
                 else:
-                    home = Path(a.home).expanduser() if a.home else None
-                    target = Path(a.target_root).expanduser() if a.target_root else Path.home()
-                    if a.recipe_command == 'install':
-                        if a.tool == 'claude-code':
-                            info = flow.install_claude(root, home_dir=home)
-                            print('\n'.join(info['notes']))
-                        elif a.tool == 'workbuddy':
-                            info = flow.install_workbuddy(root)
-                            print('skill 目录：' + info['skill_dir'])
-                            print(info['note'])
-                        elif a.tool == 'deepseek-harness':
-                            info = flow.install_deepseek_harness(root,
-                                target_root=a.target_root, home_dir=home)
-                            print('skill 目录：' + info['skill_dir'])
-                            print(info['note'])
-                        else:
-                            info = flow.install_codex(root)
-                            print(info['note'])
-                    else:
-                        if a.tool == 'claude-code':
-                            info = flow.uninstall_claude(root, home_dir=home)
-                            print('\n'.join(info['notes']))
-                        elif a.tool == 'workbuddy':
-                            info = flow.uninstall_workbuddy(root)
-                            print('已移除：' + info['removed'])
-                        elif a.tool == 'deepseek-harness':
-                            info = flow.uninstall_deepseek_harness(root)
-                            print('已移除：' + info['removed'])
-                        else:
-                            info = flow.uninstall_codex(root)
-                            print(info['note'])
+                    info = flow.uninstall_deepseek_harness(root)
+                    print('已移除：' + info['removed'])
             elif a.command == 'precompress':
                 doc = flow.precompress(root, agent=a.agent)
                 print('整理稿：条目区间 %s，改动文件 %d 个，失败样本 %d 个'

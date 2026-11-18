@@ -2115,11 +2115,13 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             '包内项目名非法：%r' % (slug,))
     toplevel = Path(toplevel)
     store_dir = relay.store_dir_for(toplevel)
-    if not store_dir.is_dir():
+    if store_dir.is_dir():
+        store_dir = relay.resolve_store_dir(toplevel)
+    elif confirm:
         relay.init(toplevel)
         store_dir = relay.resolve_store_dir(toplevel)
-    else:
-        store_dir = relay.resolve_store_dir(toplevel)
+    # else: keep the (nonexistent) store path; merge_project is pure and
+    # previews against an empty archive without writing anything.
     prefix = 'projects/%s/' % slug
     payload = {rel[len(prefix):]: data for rel, data in files.items()
                if rel.startswith(prefix)}

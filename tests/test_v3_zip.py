@@ -133,6 +133,17 @@ class TestZipHandoff(V3Base):
                        if p.is_file())
         self.assertEqual(before, after)
 
+    def test_import_zip_dry_run_does_not_init_missing_store(self):
+        root = self.make_repo('bare')
+        zip_path = self._build_zip(files={'goal.md': b'# goal\n'})
+        self.assertFalse((root / '.project-relay').exists())
+        result = sync.import_zip(root, zip_path, confirm=False)
+        self.assertFalse(result['landed'])
+        self.assertFalse((root / '.project-relay').exists(),
+                         'dry-run must not create .project-relay')
+        self.assertFalse((root / '.gitignore').exists(),
+                         'dry-run must not write .gitignore')
+
     def test_export_clone_import_resume_round_trip(self):
         # The full handoff: export from A, clone A (no .project-relay/ --
         # it is gitignored), import the zip, resume reads the real brief.

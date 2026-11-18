@@ -1622,6 +1622,25 @@ def install_deepseek_harness(toplevel, target_root=None, home_dir=None):
             'message': '已装到 DeepSeek Harness（%s）' % location}
 
 
+def _skill_dir_for_uninstall(raw, toplevel):
+    """Validate an install record before deleting anything.
+
+    recipe.json is device-local and never imported, but a corrupted record
+    must not turn uninstall into an arbitrary-directory delete. Only the
+    DSH skill layout (root/.dsh/skills/project-relay or
+    home/.agents/skills/project-relay) is accepted.
+    """
+    skill_dir = Path(raw).expanduser()
+    if not skill_dir.is_absolute():
+        skill_dir = Path(toplevel) / skill_dir
+    skill_dir = skill_dir.resolve()
+    require(skill_dir.name == 'project-relay'
+            and skill_dir.parent.name == 'skills'
+            and skill_dir.parent.parent.name in ('.dsh', '.agents'),
+            '拒绝卸载：安装记录中的 skill_dir 不是合法的 DSH 技能目录：%s' % raw)
+    return skill_dir
+
+
 def uninstall_deepseek_harness(toplevel):
     """Remove the DeepSeek Harness skill directory and its install record."""
     toplevel = relay.main_worktree(toplevel)
@@ -1630,9 +1649,7 @@ def uninstall_deepseek_harness(toplevel):
     require(state is not None, '未找到 DeepSeek Harness 配方安装记录')
     raw = (state or {}).get('skill_dir')
     if raw:
-        skill_dir = Path(raw).expanduser()
-        if not skill_dir.is_absolute():
-            skill_dir = toplevel / skill_dir
+        skill_dir = _skill_dir_for_uninstall(raw, toplevel)
     else:
         skill_dir = toplevel / '.dsh' / 'skills' / 'project-relay'
     if skill_dir.is_dir():
