@@ -228,3 +228,31 @@
 
 - 分叉链包格式不变；只是损坏数据不再阻断 resume。
 - 下一轮继续审计 CLI 错误路径与统计/分叉的剩余边界。
+
+## 2026-11-20 · 第 9 轮（会话卡）
+
+### 范围
+
+- 基线：`main@7be4240`（目标落档与定位文档已提交）。
+- 实现「项目是宿主、Agent 是住户」的会话卡：会话结束和阶段节点写短卡，默认 resume 只读卡，冲突只标 `[待用户确认]`。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| 会话卡写入 | `relay card --agent ... --session ... --stage session-end|milestone --file ...`；默认 3000 字符上限，超长拒写，脱敏后校验；不读 raw 条目、不做后台监听 |
+| 默认接手 | `relay resume` 只读每家最新短卡并显示成本；旧五段对账保留为 `relay resume --full`（会补汇总、写 state.md） |
+| 冲突处理 | 同一事实跨卡/记忆不一致时并列显示并标 `[待用户确认]`，不自动选边；同会话同阶段的分叉卡双方保留 |
+| 成本 | 会话卡 LLM 成本进入同一周熔断与月度软上限；resume 显示本月用量/上限；周熔断时停写卡，月度上限只告警 |
+| ZIP | 会话卡作为 payload 进入导出；导入按内容并集，同事件不同内容保留双方，不覆盖 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_session_cards -v`：14 tests OK。
+- `python -m unittest discover -s tests -v`：260 tests OK（382.242s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-full-tests-final.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本项目 `.project-relay/state/config.json` 已设 `monthly_llm_token_cap = 200000`，resume 成本段会显示；默认未配置项目仍为 None（只统计不告警）。
+- 下一步：接入 DSH 的 Stop/阶段钩子自动写卡；再统一 README/SKILL 与 references 的旧五段说明。

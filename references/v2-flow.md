@@ -12,8 +12,9 @@
 `relay recipe install|uninstall --tool deepseek-harness [--target-root] [--home]`、
 `relay work enter|status|review|merge`、`relay precompress`、`relay fingerprint`、
 `relay scales [--agent]`、`relay summarize --agent <家> [--source] [--semantic-file] [--session]`、
-`relay recover --agent <家>`、`relay inject [--budget] [--agent]`、
-`relay resume`、`relay hook resume|stop`、`relay stack/outlook [--set]`、
+`relay recover --agent <家>`、`relay inject [--budget] [--agent] [--full]`、
+`relay card --agent <家> --session <会话> --stage session-end|milestone --file <短卡>`、
+`relay resume [--full]`、`relay hook resume|stop`、`relay stack/outlook [--set]`、
 `relay agent-goal --agent <家> [--set/--file]`、`relay log --agent <家>`。
 
 已删的命令：`pack`、`unpack`、`sync-setup`、`sync-claim`、`sync-rollback`、
@@ -24,20 +25,22 @@
 ## 数据流
 
 ```
-会话收尾：capture（确定性快照 + 语义占位） -> agents/<家>/raw/cap-NNNN.md（queue=pending）
+会话收尾：relay card（会话结束/阶段节点短卡） -> agents/<家>/sessions/card-NNNN.md
+   -> capture（确定性快照 + 语义占位） -> agents/<家>/raw/cap-NNNN.md（queue=pending）
    -> precompress（规则整理稿 state/digest.json + 数字白名单 state/numbers.json）
    -> scales（三刻度判定，任一到线触发）
    -> summarize（确定性拼装 + 语义增量 -> 事务日志 tx/ -> 原子落盘 agents/<家>/
       memory.md、decisions.md、lessons.md、backlog.md、changes.md
       -> 备份 backups/ -> 游标 state/cursor.json + 基线 state/baseline.json
       -> 条目 pending -> summarized，上一批 summarized -> raw/archived/）
-会话开始：resume（五段：摘要 -> 对账 -> 积压 -> 兜底汇总 -> 冒烟）
+会话开始：resume（默认只读最新会话卡 + 成本段 + 跨卡冲突，不读 raw/聊天、不写档案）
+   `resume --full` 保留五段：摘要 -> 对账 -> 积压 -> 兜底汇总 -> 冒烟
    + 现算总记忆写外层 state.md + 跨 Agent 核对 + 目标对齐
 ```
 
 ## 接手质量补充（batch 10，v3 按家走）
 
-`relay resume` 的五段契约不变，另加两块**只读**补充段（不写档案，
+`relay resume --full` 保留五段契约，另加两块**只读**补充段（不写档案，
 失败只降级为缺失，不影响接手）：
 
 1. **接手对账·交接包指纹**（`_package_drift_section`）：取全家最新一条

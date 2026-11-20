@@ -53,6 +53,7 @@ read_json = relay.read_json
 STATS_DIRNAME = 'stats'
 CAPTURE_ROWS = 'capture.jsonl'
 SUMMARIZE_ROWS = 'summarize.jsonl'
+SESSION_CARD_ROWS = 'session-card.jsonl'
 HANDOFF_ROWS = 'handoff.jsonl'
 FUSE_STATE = 'fuse.json'
 
@@ -184,6 +185,10 @@ def summarize_rows(store_dir):
     return _rows(store_dir, SUMMARIZE_ROWS)
 
 
+def session_card_rows(store_dir):
+    return _rows(store_dir, SESSION_CARD_ROWS)
+
+
 def handoff_rows(store_dir):
     return _rows(store_dir, HANDOFF_ROWS)
 
@@ -227,6 +232,32 @@ def record_summarize(store_dir, source, trigger, entry_count=0,
         'archive_delta_tokens': int(archive_delta_tokens),
         'noop': bool(noop), 'degraded': bool(degraded),
         'branched': bool(branched), 'fused': bool(fused),
+    }, now_epoch=now_epoch)
+
+
+def record_session_card(store_dir, agent, session, stage, semantic_chars,
+                        llm_usage=None, now_epoch=None):
+    """One session-card LLM cost row. The card text is supplied by the
+    host agent; without measured usage, count one estimated call and only
+    the visible card text as output tokens (the prompt is unknowable here).
+    """
+    if llm_usage:
+        calls = _token_int(llm_usage.get('calls', 0))
+        in_tokens = _token_int(llm_usage.get('input_tokens', 0))
+        out_tokens = _token_int(llm_usage.get('output_tokens', 0))
+        measured = True
+    else:
+        calls = 1
+        in_tokens = 0
+        out_tokens = tokens_for_chars(semantic_chars)
+        measured = False
+    return _append(store_dir, SESSION_CARD_ROWS, {
+        'agent': agent, 'session': session, 'stage': stage,
+        'semantic_chars': int(semantic_chars),
+        'llm_calls': calls, 'llm_in_tokens': in_tokens,
+        'llm_out_tokens': out_tokens,
+        'llm_tokens': in_tokens + out_tokens,
+        'llm_measured': measured,
     }, now_epoch=now_epoch)
 
 
@@ -286,6 +317,9 @@ def compute_fuse(store_dir, now_epoch=None):
     now_epoch = time.time() if now_epoch is None else now_epoch
     rows = [r for r in summarize_rows(store_dir)
             if isinstance(r, dict) and not r.get('noop')]
+    # Session cards are LLM-written too: their costs share the same weekly
+    # fuse and monthly soft cap instead of becoming an unmetered side door.
+    rows += [r for r in session_card_rows(store_dir) if isinstance(r, dict)]
     week = sum(_row_llm_tokens(r) for r in rows
                if _row_epoch(r) >= now_epoch - 7 * 86400)
     prev = sum(_row_llm_tokens(r) for r in rows
@@ -296,7 +330,7 @@ def compute_fuse(store_dir, now_epoch=None):
     cap = cfg.get('monthly_llm_token_cap', None)
     tripped = prev > 0 and week >= FUSE_SPIKE_FLOOR_TOKENS \
         and week > FUSE_SPIKE_RATIO * prev
-    reason = ('周内汇总 LLM 成本 %d tokens，超上周 %d tokens 的 3 倍'
+    reason = ('周内 LLM 成本 %d tokens，超上周 %d tokens 的 3 倍'
               % (week, prev)) if tripped else ''
     return {'tripped': tripped, 'reason': reason,
             'week_llm_tokens': week, 'prev_week_llm_tokens': prev,
