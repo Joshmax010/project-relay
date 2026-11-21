@@ -32,6 +32,8 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 会话结束和阶段节点各留一张短卡：只写结论、决定、待办和事实，不读原始聊天，也不做后台监听。默认每张最多 3000 字符；超长直接拒写，周成本保险丝触发时停写。`relay resume` 默认只读每家最新短卡，跨卡冲突标 `[待用户确认]`，不自动选边。
 
+DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <会话> --card-file <短卡>`；阶段节点调用 `relay hook stage --agent deepseek-harness --session <会话> --file <短卡>`。卡片写入失败只报错，不阻断采集和执法。
+
 ## 工作区、分支与工作树
 
 先分清两个东西：
@@ -123,6 +125,8 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 - `relay init`：建 `.project-relay/`
 - `relay resume`（默认只读会话卡）/ `relay resume --full`（旧五段）
 - `relay card --agent <名> --session <会话> --stage session-end|milestone --file <短卡>`
+- `relay hook stop --agent <名> --session <会话> --card-file <短卡>`（Stop 钩子）
+- `relay hook stage --agent <名> --session <会话> --file <短卡>`（阶段钩子）
 - `relay capture` / `relay summarize` / `relay scales`
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`

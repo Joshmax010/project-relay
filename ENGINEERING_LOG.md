@@ -256,3 +256,31 @@
 
 - 本项目 `.project-relay/state/config.json` 已设 `monthly_llm_token_cap = 200000`，resume 成本段会显示；默认未配置项目仍为 None（只统计不告警）。
 - 下一步：接入 DSH 的 Stop/阶段钩子自动写卡；再统一 README/SKILL 与 references 的旧五段说明。
+
+## 2026-11-21 · 第 10 轮（DSH Stop / 阶段钩子）
+
+### 范围
+
+- 基线：`session-cards@1e35dc7`（会话卡 PR #11 未合并，本轮以栈式分支开发）。
+- 给 DSH 的 Stop / 阶段钩子提供写卡入口，不改变 capture/enforce 既有行为。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| Stop 钩子 | `relay hook stop --agent deepseek-harness --session <会话> --card-file <短卡>`：先采集、再执法，最后写 `session-end` 卡；卡片失败只返回可见错误，不阻断采集/执法 |
+| 阶段钩子 | `relay hook stage --agent deepseek-harness --session <会话> --file <短卡>`：写 `milestone` 卡，不重复 capture |
+| 兼容 | 原 `hook stop` 仍默认 `claude-code`、不传卡片时行为不变；Claude 现有 hook recipe 不受影响 |
+| 文档 | README / SKILL / references 补 Stop/阶段钩子命令与失败语义 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_dsh_hooks -v`：6 tests OK。
+- `python -m unittest tests.test_v3_dsh_hooks tests.test_v3_hooks_recipe tests.test_v3_session_cards -v`：52 tests OK。
+- 全量回归：**266 tests OK**（345.896s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-full-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本 PR 交付 DSH 可调用的 hook 命令入口和测试；DSH 侧的具体插件/事件调度接线仍在下一小步。
+- 卡片正文由调用方（DSH Stop/阶段事件）提供，不在 hook 内读取原始聊天。
