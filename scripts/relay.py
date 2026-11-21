@@ -37,6 +37,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import uuid
 from pathlib import Path, PurePosixPath
 
 if os.name == 'nt':
@@ -158,6 +159,9 @@ def anchor(root):
 # ---------------------------------------------------------------- store
 VERSION = '0.2.0'
 STORE_DIRNAME = '.project-relay'
+PROJECT_FILE = 'project.json'
+REGISTRY_DIRNAME = '.project-relay'
+REGISTRY_FILE = 'registry.json'
 # 现役 Agent：DeepSeek Harness（DSH，目录名 deepseek-harness）。
 # AGENTS 保留历史名字用于读取旧档案；ACTIVE_AGENTS 决定 init 建哪些目录。
 AGENTS = ('codex', 'claude-code', 'workbuddy', 'deepseek-harness')
@@ -259,6 +263,134 @@ def main_worktree(path):
 def store_dir_for(toplevel):
     """<项目根目录>/.project-relay —— v3 的唯一档案位置（从工作树也解析到主工作树）。"""
     return main_worktree(toplevel) / STORE_DIRNAME
+
+
+def project_file_path(store_dir):
+    return Path(store_dir) / PROJECT_FILE
+
+
+def registry_path():
+    """Machine-local project locator cache (never inside the project)."""
+    override = os.environ.get('PROJECT_RELAY_HOME')
+    base = Path(override).expanduser() if override else (Path.home() / REGISTRY_DIRNAME)
+    return base / REGISTRY_FILE
+
+
+def read_registry():
+    path = registry_path()
+    if not path.exists():
+        return {'version': 1, 'projects': {}}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {'version': 1, 'projects': {}}
+    if not isinstance(data, dict):
+        return {'version': 1, 'projects': {}}
+    projects = data.get('projects')
+    if not isinstance(projects, dict):
+        projects = {}
+    return {'version': int(data.get('version') or 1), 'projects': projects}
+
+
+def save_registry(data):
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save(path, data)
+    return path
+
+
+def ensure_project_file(store_dir, root):
+    """Create/repair <store>/project.json; never stores an absolute root."""
+    path = project_file_path(store_dir)
+    current = {}
+    if path.exists():
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(value, dict):
+                current = value
+        except (OSError, ValueError):
+            current = {}
+    project = dict(current)
+    changed = not path.exists()
+    if not isinstance(project.get('project_id'), str) or \
+            not re.fullmatch(r'[0-9a-f]{32}', project['project_id']):
+        project['project_id'] = uuid.uuid4().hex
+        changed = True
+    if not isinstance(project.get('name'), str) or not project['name'].strip():
+        project['name'] = Path(root).name
+        changed = True
+    if not isinstance(project.get('created_at'), str) or not project['created_at'].strip():
+        project['created_at'] = utc()
+        changed = True
+    if changed:
+        save(path, project)
+    return project
+
+
+def register_project(root, store_dir, project=None):
+    """Upsert this project into the machine-local locator cache."""
+    project = dict(project or ensure_project_file(store_dir, root))
+    root = Path(root).resolve()
+    data = read_registry()
+    entry = {
+        'project_id': project['project_id'],
+        'name': project.get('name') or root.name,
+        'path': str(root),
+        'last_seen': utc(),
+    }
+    # The path is the canonical locator; drop stale rows for the same path.
+    for pid, old in list(data['projects'].items()):
+        if pid != project['project_id'] and isinstance(old, dict) \
+                and Path(str(old.get('path', ''))).expanduser().resolve() == root:
+            data['projects'].pop(pid, None)
+    data['projects'][project['project_id']] = entry
+    save_registry(data)
+    return entry
+
+
+def private_agent_root(root):
+    """Return the Agent-private home containing root, when applicable."""
+    root = Path(root).resolve()
+    candidates = [Path.home() / '.dsh', Path.home() / '.agents',
+                  Path.home() / '.claude', Path.home() / '.codex',
+                  Path.home() / '.workbuddy']
+    profile = os.environ.get('DSH_PROFILE_DIR')
+    if profile:
+        candidates.append(Path(profile))
+    for base in candidates:
+        try:
+            root.relative_to(base.expanduser().resolve())
+            return str(base)
+        except (ValueError, OSError):
+            continue
+    return None
+
+
+def project_root_warning(root):
+    private = private_agent_root(root)
+    if not private:
+        return None
+    suggested = Path.home() / 'Projects' / Path(root).name
+    return ('项目根位于 Agent 私有区 %s；建议迁移到用户项目区，例如 %s，'
+            '再重新运行 relay init/import-zip' % (private, suggested))
+
+
+def locate_projects(name=None):
+    data = read_registry()
+    query = (name or '').strip().lower()
+    rows = []
+    for pid, entry in data['projects'].items():
+        if not isinstance(entry, dict):
+            continue
+        path = Path(str(entry.get('path', ''))).expanduser()
+        values = [str(entry.get('name', '')), path.name, pid]
+        if query and query not in [v.lower() for v in values]:
+            continue
+        rows.append({'project_id': pid, 'name': entry.get('name') or path.name,
+                     'path': str(path), 'exists': path.is_dir(),
+                     'last_seen': entry.get('last_seen')})
+    rows.sort(key=lambda row: (row['name'].lower(), row['path'].lower()))
+    return rows
 
 
 def _reject_store_symlinks(store_dir):
@@ -553,7 +685,7 @@ def init(toplevel):
     外层：总目标/总记忆文件 + receipts/ + state/（目标机件暂存）。
     各家：agents/<agent>/，现役 DeepSeek Harness 给全套骨架。
     幂等：已建仓时只补缺失的骨架文件、不动已有内容，并确保 .gitignore
-    兜底。项目根目录就是身份，没有项目键、没有注册表。"""
+    兜底。项目身份写在 project.json（稳定 project_id），机器本地注册表只做定位缓存。"""
     root = Path(main_worktree(toplevel))
     store_dir = root / STORE_DIRNAME
     require(not store_dir.is_symlink(), '拒绝符号链接档案目录: ' + str(store_dir))
@@ -574,8 +706,11 @@ def init(toplevel):
             dest.write_text('', encoding='utf-8')
     write_index(store_dir)
     ignored = ensure_gitignore(root)
+    project = ensure_project_file(store_dir, root)
+    register_project(root, store_dir, project)
     return {'store_dir': str(store_dir), 'root': str(root),
-            'gitignored': ignored}
+            'gitignored': ignored, 'project': project,
+            'warning': project_root_warning(root)}
 
 def git_toplevel(path):
     """Resolve any path inside a repo to its top level (plan 1.4 preflight)."""
@@ -1051,6 +1186,11 @@ def _parser():
     p.add_argument('--version', action='version', version='relay ' + VERSION)
     sub = p.add_subparsers(dest='command', required=True)
     sub.add_parser('init')
+    loc = sub.add_parser('locate', help='按项目名/ID 查本机项目定位缓存')
+    loc.add_argument('--name')
+    loc.add_argument('--json', action='store_true')
+    op = sub.add_parser('open', help='打印项目的 cd 路径（供 shell 执行）')
+    op.add_argument('name')
     sub.add_parser('agents')
     g = sub.add_parser('goal')
     gsub = g.add_subparsers(dest='goal_command', required=True)
@@ -1177,7 +1317,28 @@ def main(argv=None):
             print('记忆仓：' + str(result['store_dir']))
             print('档案默认不进 git（已写 .gitignore 兜底）' if result['gitignored']
                   else '档案已在 .gitignore 里')
+            print('项目身份证：' + result['project']['project_id'])
+            if result.get('warning'):
+                print('提醒：' + result['warning'])
             print('下一步：用 goal draft 提交目标草案，再用 goal show 查看 diff、goal confirm 确认')
+        elif a.command == 'locate':
+            rows = locate_projects(a.name)
+            if a.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            elif not rows:
+                print('未找到项目；可先在本机对项目运行 relay init 注册')
+            else:
+                for row in rows:
+                    print('%s\t%s\t%s' % (row['name'], row['project_id'], row['path']))
+        elif a.command == 'open':
+            rows = locate_projects(a.name)
+            if not rows:
+                print('未找到项目：' + a.name, file=sys.stderr)
+                return 1
+            if len(rows) > 1:
+                print('匹配多个项目，请用 relay locate --name 查看：' + a.name, file=sys.stderr)
+                return 1
+            print('cd "%s"' % rows[0]['path'])
         elif a.command == 'agents':
             store_dir = resolve_store_dir(a.root)
             print((store_dir / 'index.md').read_text(encoding='utf-8')

@@ -115,7 +115,7 @@ def _is_payload_file(rel):
     if rel.startswith('receipts/'):
         return True
     if rel in ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
-               'stack.md', 'outlook.md', 'index.md'):
+               'stack.md', 'outlook.md', 'index.md', 'project.json'):
         return True
     if rel.startswith('state/goal-tentative.') \
             or rel.startswith('state/goal-draft.'):
@@ -1624,7 +1624,7 @@ def _is_handled(rel):
     if _is_raw_entry_rel(rel):
         return True
     if rel in ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
-               'stack.md', 'outlook.md', 'index.md'):
+               'stack.md', 'outlook.md', 'index.md', 'project.json'):
         return True
     if rel.startswith('receipts/'):
         return True
@@ -1768,6 +1768,23 @@ def merge_project(local_dir, incoming_files, source_info):
     def local_bytes(rel):
         p = local_dir / rel
         return p.read_bytes() if p.exists() else b''
+
+    # ---- project identity: keep the local ID; adopt only when absent
+    if 'project.json' in incoming_files:
+        local_project = local_bytes('project.json')
+        if not local_project:
+            merged['project.json'] = incoming_files['project.json']
+        else:
+            try:
+                local_id = json.loads(local_project.decode('utf-8')).get('project_id')
+                incoming_id = json.loads(
+                    incoming_files['project.json'].decode('utf-8')).get('project_id')
+            except (ValueError, UnicodeDecodeError):
+                local_id = incoming_id = None
+            if local_id and incoming_id and local_id != incoming_id:
+                notes.append('项目身份证 ID 与本地不同，保留本地 project.json')
+            elif incoming_files['project.json'] != local_project:
+                notes.append('项目身份证内容不同，保留本地 project.json')
 
     # ---- outer goal first (per-agent goal alignment needs its hash)
     incoming_receipts = {}

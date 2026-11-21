@@ -21,6 +21,7 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 
 ```
 <项目根目录>/.project-relay/
+  project.json                                 # 项目身份证：project_id、名称、创建时间
   goal.md、state.md、backlog.md、decisions.md   # 外层：总目标、总记忆、共用待办与决定
   stack.md、outlook.md、index.md               # 外层：技术栈、未来预期、指路表
   receipts/                                     # 目标确认收据
@@ -28,6 +29,10 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 ```
 
 外层是总目标与总记忆，要精简：Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。DSH 只写 `agents/deepseek-harness/`，同一家开两个会话同时写时用小文件锁排队。
+
+## 项目身份证与定位
+
+每个项目在 `.project-relay/project.json` 里有自己的 `project_id`、名称和创建时间。机器本地的 `~/.project-relay/registry.json` 只做定位缓存，可重建、不算项目身份、不进入 ZIP。`relay locate [--name]` 查本机项目，`relay open <name>` 打印项目的 `cd` 路径。`relay init` 遇到 Agent 私有区（如 `~/.dsh`、`~/.agents`、Agent 默认会话目录）会提醒并给出迁移建议。
 
 ## 工作区、分支与工作树
 
@@ -112,7 +117,9 @@ python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ## 常用命令
 
 ```bash
-python3 scripts/relay.py init            # 给项目建档
+python3 scripts/relay.py init            # 给项目建档（写 project.json + 本机定位缓存）
+python3 scripts/relay.py locate [--name] # 查本机项目定位
+python3 scripts/relay.py open <name>     # 打印项目的 cd 路径
 python3 scripts/relay.py agents          # 看指路表
 python3 scripts/relay.py resume          # 接手对账（五段简报 + 跨 Agent 核对）
 python3 scripts/relay.py capture         # 会话结束采集

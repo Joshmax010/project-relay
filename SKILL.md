@@ -21,12 +21,16 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 ## 档案长什么样
 
-项目记忆在**项目根目录**下的 `.project-relay/`，跟代码住在一起、跟项目走，不属于某个 Agent；默认不进 git，换设备只走 zip。外一层是总的：总目标、技术栈、未来预期、共用待办与决定、一张指路表。这层你每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。
+项目记忆在**项目根目录**下的 `.project-relay/`，跟代码住在一起、跟项目走，不属于某个 Agent；默认不进 git，换设备只走 zip。`.project-relay/project.json` 保存项目身份证；本机 `~/.project-relay/registry.json` 只做定位缓存。外一层是总的：总目标、技术栈、未来预期、共用待办与决定、一张指路表。这层你每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。
 
 本版只装配 DeepSeek Harness：
 
 - `agents/deepseek-harness/`：你自己的记忆、改动记录、日志、待办、目标。
 - 旧版其他 Agent 的目录如果旧档案里已经有，只读兼容，不再新建、不再写入。
+
+## 项目身份证与定位
+
+每个项目在 `.project-relay/project.json` 里有自己的 `project_id`、名称和创建时间。机器本地的 `~/.project-relay/registry.json` 只做定位缓存，可重建、不算项目身份、不进入 ZIP。`relay locate [--name]` 查本机项目，`relay open <name>` 打印项目的 `cd` 路径。`relay init` 遇到 Agent 私有区（如 `~/.dsh`、`~/.agents`、Agent 默认会话目录）会提醒并给出迁移建议。
 
 ## 工作区、分支与工作树
 
@@ -116,7 +120,8 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 命令都在**本 SKILL.md 所在目录**（技能目录）下跑 `python scripts/relay.py ...`（Windows 用 `python`）。项目级安装的技能目录通常是 `<项目根>/.dsh/skills/project-relay`；用户级通常是 `<用户目录>/.agents/skills/project-relay`。如果当前会话在项目根，也可以直接用 `.dsh/skills/project-relay/scripts/relay.py`。
 
-- `relay init`：建 `.project-relay/`
+- `relay init`：建 `.project-relay/`，写 `project.json` 和本机定位缓存
+- `relay locate [--name]` / `relay open <name>`：查/打开本机项目
 - `relay resume` / `relay capture` / `relay summarize` / `relay scales`
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`
