@@ -69,6 +69,8 @@ goal/log/raw/state（last-summary + summaries）、receipts、目标机件暂存
 
 - 原料条目：按 key 并集；对方条目落入自家 `raw/`，用自家下一 seq
   （cap-0002 起，不进另一家）。同 key 不同 body：双方保留并记 conflict。
+- 会话卡：按内容哈希并集；同 `session + stage` 不同正文保留双方记
+  conflict，不按 memory 的 incoming-wins 覆盖。
 - decisions/lessons/backlog：按 `## ID` 块合（外层 + 各家）；待办同事项
   不同正文记 conflict。
 - memory.md：受管块经 `_merge_state_md`（模板值不赢、空白采纳对方、
@@ -113,8 +115,8 @@ memory.md 写冲突标记后报问题。
 
 ## 10. 与 resume 的接线
 
-- resume 的五段之外另有两块只读补充（batch 10）：交接包指纹漂移
-  （包导出后代码漂移了哪些文件）与目标对齐（各家目标哈希 vs 总目标哈希）。
+- `resume` 默认只读会话卡（不读 raw/聊天、不写档案）；`resume --full` 保留五段，
+  另有两块只读补充（batch 10）：交接包指纹漂移与目标对齐。
 - 导入后第一次 resume 跑四段兜底汇总（各家有 pending 的逐家汇总），
   简报里能看到对方的记录才算接上；接完给评级（顺畅 / 有缺口 / 失败）
   并写明缺口。

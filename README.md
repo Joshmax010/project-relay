@@ -10,7 +10,8 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 
 ## 一句话：它怎么工作
 
-- **会话开始**：先跑 `relay resume` 对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟），对账完成前不许动代码。
+- **会话开始**：先跑 `relay resume` 读最新会话卡（默认只读，不写档案）；需要旧的五段对账时用 `relay resume --full`。
+- **会话结束**：先跑 `relay card` 留一张短卡（做了什么、为什么、新增事实、未决问题），再跑 `relay capture` 采集确定性快照。
 - **会话结束**：先跑 `relay capture` 采集确定性快照，顺手填上这一轮做了什么，为什么这么做，定了什么，还剩什么尾巴。
 - **汇总**：任一刻度到线就汇总。三个刻度是里程碑（目标档案已确认变更）、改动量（改动文件 ≥ 10 个或净改动 ≥ 800 行）和时间（距上次汇总 ≥ 7 天且有未汇总采集）。
 - **Git 工作区**：项目根的主工作树留在 main 给你验收；多 Agent 模式下每个 Agent 在自己的工作区里有一条 `agent/<名字>` 分支和独立 worktree，改完经你批准才合并。
@@ -28,6 +29,10 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 ```
 
 外层是总目标与总记忆，要精简：Agent 每轮不许直接写，只在目标确认或新 Agent 加入时才改。总记忆由 resume 从各家文件里现算出来。DSH 只写 `agents/deepseek-harness/`，同一家开两个会话同时写时用小文件锁排队。
+
+## 会话卡
+
+会话结束和阶段节点各留一张短卡：只写结论、决定、待办和事实，不读原始聊天，也不做后台监听。默认每张最多 3000 字符；超长直接拒写，周成本保险丝触发时停写。`relay resume` 默认只读每家最新短卡，跨卡冲突标 `[待用户确认]`，不自动选边。
 
 ## 工作区、分支与工作树
 
@@ -107,14 +112,16 @@ python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 
 导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行；要硬门槛就加 `--strict`。
 
-接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做。接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
+接手方验：`relay resume` 默认只读会话卡；需要看旧五段交接简报时用 `relay resume --full`。确认能看到对方的记录再接着做，接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。
 
 ## 常用命令
 
 ```bash
 python3 scripts/relay.py init            # 给项目建档
 python3 scripts/relay.py agents          # 看指路表
-python3 scripts/relay.py resume          # 接手对账（五段简报 + 跨 Agent 核对）
+python3 scripts/relay.py resume          # 接手（默认只读会话卡）
+python3 scripts/relay.py resume --full   # 旧五段对账（会补汇总、写 state.md）
+python3 scripts/relay.py card --agent deepseek-harness --session <会话> --stage session-end --file <短卡>
 python3 scripts/relay.py capture         # 会话结束采集
 python3 scripts/relay.py summarize       # 汇总（--trigger manual 手动触发）
 python3 scripts/relay.py scales          # 三刻度现状

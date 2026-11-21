@@ -1615,6 +1615,35 @@ def _is_template_outer(rel, local_bytes):
     return False
 
 
+def _is_session_card_rel(rel):
+    parts = rel.split('/')
+    return (len(parts) == 4 and parts[0] == 'agents'
+            and parts[2] == 'sessions' and parts[3].startswith('card-')
+            and parts[3].endswith('.md'))
+
+
+def _parse_session_card_bytes(data):
+    text = data.decode('utf-8')
+    require(BODY_DELIM in text, '会话卡格式损坏')
+    head, body = text.split(BODY_DELIM, 1)
+    header = json.loads(head)
+    require(isinstance(header, dict) and header.get('version') == 1,
+            '会话卡版本不受支持')
+    require(isinstance(header.get('seq'), int) and header['seq'] > 0,
+            '会话卡序号无效')
+    require(isinstance(header.get('agent'), str) and header['agent'],
+            '会话卡 Agent 缺失')
+    require(isinstance(header.get('session'), str) and header['session'].strip(),
+            '会话卡 session 缺失')
+    require(header.get('stage') in ('session-end', 'milestone'),
+            '会话卡阶段无效')
+    require(body.strip(), '会话卡正文为空')
+    cap = header.get('char_cap', 3000)
+    require(isinstance(cap, int) and cap > 0 and len(body) <= cap + 40,
+            '会话卡超过声明长度上限')
+    return header, body
+
+
 def _is_handled(rel):
     """True when merge_project has a rule for this incoming path.
 
@@ -1641,6 +1670,8 @@ def _is_handled(rel):
             return True
         if sub == 'state/last-summary.json' \
                 or sub.startswith('state/summaries/'):
+            return True
+        if _is_session_card_rel(rel):
             return True
         return False
     return False
@@ -1885,6 +1916,69 @@ def merge_project(local_dir, incoming_files, source_info):
                 else:
                     notes.append('%s 的目标未对齐当前总目标，保留本地版本'
                                  % agent)
+        # Session cards: content-hash union. Never apply memory's
+        # incoming-wins rule; same-event different bodies remain visible.
+        card_prefix = adir + '/sessions/'
+        local_card_hashes = set()
+        local_card_events = {}
+        used_card_nums = set()
+        card_dir = local_dir / card_prefix
+        if card_dir.is_dir():
+            for path in card_dir.glob('card-*.md'):
+                data = path.read_bytes()
+                local_card_hashes.add(_sha256(data))
+                try:
+                    used_card_nums.add(int(path.stem.split('-')[-1]))
+                    header, body = _parse_session_card_bytes(data)
+                    event = header.get('event_id') or (
+                        'legacy', header.get('session'), header.get('stage'))
+                    local_card_events.setdefault(event, []).append(path)
+                except (ValueError, UnicodeDecodeError, RelayError):
+                    pass
+        next_card_num = (max(used_card_nums) + 1) if used_card_nums else 1
+        for rel in sorted(incoming_files):
+            if not _is_session_card_rel(rel) or not rel.startswith(card_prefix):
+                continue
+            data = incoming_files[rel]
+            if _sha256(data) in local_card_hashes:
+                continue
+            try:
+                header, body = _parse_session_card_bytes(data)
+                require(header['agent'] == agent, '会话卡 Agent 与目录不符')
+            except (ValueError, UnicodeDecodeError, RelayError) as exc:
+                discarded.append({'file': rel, 'reason': 'malformed-session-card',
+                                  'detail': str(exc)})
+                quarantined[rel] = data
+                continue
+            seq = header['seq']
+            if seq in used_card_nums:
+                while next_card_num in used_card_nums:
+                    next_card_num += 1
+                seq = next_card_num
+            used_card_nums.add(seq)
+            next_card_num = max(next_card_num, seq + 1)
+            new_rel = '%scard-%04d.md' % (card_prefix, seq)
+            event = header.get('event_id') or (
+                'legacy', header.get('session'), header.get('stage'))
+            if event in local_card_events:
+                conflicts.append({'file': new_rel,
+                                  'rule': 'session-card-same-event-different-body',
+                                  'event_id': header.get('event_id'),
+                                  'local': [str(p.relative_to(local_dir)).replace('\\', '/')
+                                            for p in local_card_events[event]],
+                                  'incoming': rel})
+            if seq != header['seq']:
+                header = dict(header, seq=seq)
+                lines = body.splitlines(True)
+                if lines and lines[0].startswith('# 会话卡 card-'):
+                    lines[0] = '# 会话卡 card-%04d\n' % seq
+                    body = ''.join(lines)
+                data = (json.dumps(header, ensure_ascii=False, sort_keys=True,
+                                   indent=2) + BODY_DELIM + body).encode('utf-8')
+            merged[new_rel] = data
+            local_card_hashes.add(_sha256(data))
+            counts['files_added'] += 1
+
         # per-agent state: last-summary (higher seq wins) + summaries
         # (content-hash union, renumber on collision).
         sum_prefix = adir + '/state/summaries/'

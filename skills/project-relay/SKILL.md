@@ -17,7 +17,7 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 | 装上接力 | 跑 recipe install --tool deepseek-harness，装到 DSH |
 | 目标是……、这个项目要做…… | 走目标流程（见下），在聊天里问 |
 
-会话开始和结束不用用户开口：开头自己跑 resume 对账，对完再动代码；结尾自己跑 capture 采集，语义占位段填好再收尾。
+会话开始和结束不用用户开口：开头自己跑 resume 读最新会话卡（默认只读，不写档案）；结尾先跑 `relay card` 留一张短卡，再跑 capture 采集，语义占位段填好再收尾。
 
 ## 档案长什么样
 
@@ -27,6 +27,10 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 - `agents/deepseek-harness/`：你自己的记忆、改动记录、日志、待办、目标。
 - 旧版其他 Agent 的目录如果旧档案里已经有，只读兼容，不再新建、不再写入。
+
+## 会话卡
+
+会话结束和阶段节点各留一张短卡：只写结论、决定、待办和事实，不读原始聊天，也不做后台监听。默认每张最多 3000 字符；超长直接拒写，周成本保险丝触发时停写。`relay resume` 默认只读每家最新短卡，跨卡冲突标 `[待用户确认]`，不自动选边。
 
 ## 工作区、分支与工作树
 
@@ -60,9 +64,9 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 ## 会话开始：先对账
 
-跑 `relay resume`：读档 → 现状对账 → 积压 → 补汇总 → 冒烟。对账完成前不许动代码。resume 除了重算总记忆、补汇总这两处有界写入外不改档案。档案不存在时：有包就先 import-zip，没有就 `relay init` 从零建档，不猜不编。
+跑 `relay resume`：默认只读最新会话卡，不读原始聊天、不写档案、不补汇总。要看旧的五段对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟）时用 `relay resume --full`。档案不存在时：有包就先 import-zip，没有就 `relay init` 从零建档，不猜不编。
 
-简报里有一段跨 Agent 核对：各家记忆里互相矛盾的地方直接列出来，比如后端说接口升到 v2、前端说还在等 v1。看到矛盾先摆出来，别自己悄悄选一边。
+简报里有一段跨 Agent 核对：各家最新会话卡或记忆里互相矛盾的地方直接列出来，并标 `[待用户确认]`。看到矛盾先摆出来，别自己悄悄选一边。
 
 ## 会话结束：先采集
 
@@ -91,7 +95,7 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 - `relay export-zip --zip <文件.zip>` 导出一个 zip，拷到另一台电脑，`relay import-zip --zip <文件.zip> --confirm` 导入（不带 `--confirm` 只干跑预览、零写入）。zip 里是整个 `.project-relay/` 树，另一台设备上任何 Agent 既能读别人的记忆，也能读自己的。
 - 导入先校验、再脱敏复扫、后落盘，任何一步失败整体拒绝且零写入。已有档案就按合并规则合，缺口记进合并日志。
 - 导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行。要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
-- 接手方验：`relay resume` 看交接简报，确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。简报除五段之外还会有两块只读补充：**接手对账·交接包指纹**（交接包导出后代码漂移了哪些文件，直接列出来）和**目标对齐·承诺与档案**（目标里提到、但待办/状态没有对应条目或进度记录的承诺）。
+- 接手方验：`relay resume` 默认只读最新会话卡；要看旧五段交接简报时用 `relay resume --full`。确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。`--full` 简报除五段之外还会有两块只读补充：**接手对账·交接包指纹**（交接包导出后代码漂移了哪些文件，直接列出来）和**目标对齐·承诺与档案**（目标里提到、但待办/状态没有对应条目或进度记录的承诺）。
 
 `.project-relay/` 默认不进 git，init 时写 `.gitignore` 兜底。换设备前在旧设备上 export-zip，和拔 U 盘前点弹出一样，是个日常动作。
 
@@ -117,7 +121,9 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 命令都在**本 SKILL.md 所在目录**（技能目录）下跑 `python scripts/relay.py ...`（Windows 用 `python`）。项目级安装的技能目录通常是 `<项目根>/.dsh/skills/project-relay`；用户级通常是 `<用户目录>/.agents/skills/project-relay`。如果当前会话在项目根，也可以直接用 `.dsh/skills/project-relay/scripts/relay.py`。
 
 - `relay init`：建 `.project-relay/`
-- `relay resume` / `relay capture` / `relay summarize` / `relay scales`
+- `relay resume`（默认只读会话卡）/ `relay resume --full`（旧五段）
+- `relay card --agent <名> --session <会话> --stage session-end|milestone --file <短卡>`
+- `relay capture` / `relay summarize` / `relay scales`
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`
 - `relay work enter|status|review|merge`：分支与工作树
