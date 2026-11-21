@@ -228,3 +228,31 @@
 
 - 分叉链包格式不变；只是损坏数据不再阻断 resume。
 - 下一轮继续审计 CLI 错误路径与统计/分叉的剩余边界。
+
+## 2026-11-21 · 项目身份证与定位
+
+### 范围
+
+- 基线：`main@7be4240`（目标落档与定位文档已提交）。
+- 实现项目身份证、机器本地定位缓存，以及 init 遇到 Agent 私有区的提醒。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| 项目身份证 | `relay init` 写 `.project-relay/project.json`：稳定 `project_id`、名称、创建时间；幂等，不改已有 ID |
+| 本机定位缓存 | `~/.project-relay/registry.json` 记录 project_id、名称、路径、last_seen；可重建、不进 ZIP、不算身份 |
+| 查找命令 | `relay locate [--name] [--json]` 查项目；`relay open <name>` 打印可执行的 `cd` 路径 |
+| 私有区提醒 | `relay init` 检测 `~/.dsh`、`~/.agents`、`~/.claude`、`~/.codex`、`~/.workbuddy`、`DSH_PROFILE_DIR`，提示迁移到用户项目区 |
+| ZIP | `project.json` 进入 payload；导入保留本地 project_id，ID 冲突只记 note，不覆盖本地身份 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_identity -v`：6 tests OK。
+- 全量回归：**252 tests OK**（333.387s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-full-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 私有区只提醒不阻止，迁移目前是建议路径；自动迁移命令留给下一轮。
+- 定位缓存只做机器本地索引；跨设备仍只走 zip。
