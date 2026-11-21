@@ -235,16 +235,28 @@ def record_summarize(store_dir, source, trigger, entry_count=0,
     }, now_epoch=now_epoch)
 
 
+def validate_llm_usage(llm_usage):
+    """Validate caller-reported usage; partial objects must not count as measured."""
+    if llm_usage is None:
+        return
+    require(isinstance(llm_usage, dict), 'llm_usage 必须是对象')
+    for key in ('calls', 'input_tokens', 'output_tokens'):
+        value = llm_usage.get(key)
+        require(isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+                'llm_usage.%s 必须是非负整数（三个字段缺一不可）' % key)
+
+
 def record_session_card(store_dir, agent, session, stage, semantic_chars,
                         llm_usage=None, now_epoch=None):
     """One session-card LLM cost row. The card text is supplied by the
     host agent; without measured usage, count one estimated call and only
     the visible card text as output tokens (the prompt is unknowable here).
     """
-    if llm_usage:
-        calls = _token_int(llm_usage.get('calls', 0))
-        in_tokens = _token_int(llm_usage.get('input_tokens', 0))
-        out_tokens = _token_int(llm_usage.get('output_tokens', 0))
+    validate_llm_usage(llm_usage)
+    if llm_usage is not None:
+        calls = llm_usage['calls']
+        in_tokens = llm_usage['input_tokens']
+        out_tokens = llm_usage['output_tokens']
         measured = True
     else:
         calls = 1

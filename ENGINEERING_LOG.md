@@ -256,3 +256,13 @@
 
 - 本项目 `.project-relay/state/config.json` 已设 `monthly_llm_token_cap = 200000`，resume 成本段会显示；默认未配置项目仍为 None（只统计不告警）。
 - 下一步：接入 DSH 的 Stop/阶段钩子自动写卡；再统一 README/SKILL 与 references 的旧五段说明。
+
+### 复审修复（2026-11-21）
+
+- 里程碑卡分组改按 `event_id`：同一会话的旧 milestone 不再进入 resume / 对账；只有同 event_id 的导入分叉副本双方保留。
+- `inject --budget N`：卡片与跨 Agent 核对合计后按总 token 预算截断，输出不超过 N。
+- `llm_usage`：calls / input_tokens / output_tokens 三字段缺一不可，缺失或非法直接拒写，不再标成「已实测」。
+- 卡头 `session` 也走脱敏；纯密钥形式的 session 脱敏为空时拒写。
+- Claude / Codex 安装说明补 `relay card` 步骤，和默认 resume 读卡对齐。
+- `RELAY_SKILL_TEXT` 读取根目录 SKILL.md 时增加缺失回退；新增 SKILL 两份逐字节一致测试。
+- 验证：`python -m unittest tests.test_v3_session_cards -v`：19 tests OK；全量 **265 tests OK**（344.462s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review-full-tests.log`）；`git diff --check` 通过。

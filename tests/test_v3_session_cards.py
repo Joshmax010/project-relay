@@ -81,9 +81,13 @@ class TestSessionCards(V3Base):
         self.assertFalse((self.adir(root, 'codex') / 'sessions').exists())
         self.assertEqual([], stats.session_card_rows(self.store_dir(root)))
 
-    def test_redaction_applies_to_card(self):
+    def test_redaction_applies_to_card_body_and_rejects_secret_session(self):
         root = self.init()
         token = 'ghp_' + ('A' * 24)
+        with self.assertRaisesRegex(RelayError, 'session'):
+            flow.write_session_card(
+                root, 'codex', token, 'session-end', '## 决定\n- token=' + token)
+        self.assertFalse((self.adir(root, 'codex') / 'sessions').exists())
         info = flow.write_session_card(
             root, 'codex', 's1', 'session-end', '## 决定\n- token=' + token)
         text = Path(info['path']).read_text(encoding='utf-8')
@@ -125,6 +129,57 @@ class TestSessionCards(V3Base):
         self.assertIn('v1', result['cross_section'])
         self.assertIn('v2', result['cross_section'])
 
+    def test_latest_milestone_only_ignores_older_milestones(self):
+        root = self.init()
+        flow.write_session_card(root, 'codex', 's1', 'milestone', '## 事实\n- 接口：v1')
+        flow.write_session_card(root, 'codex', 's1', 'milestone', '## 事实\n- 接口：v2')
+        cards = flow.latest_session_cards(self.store_dir(root), ['codex'])
+        self.assertEqual(1, len(cards))
+        self.assertIn('v2', cards[0]['body'])
+        result = flow.resume(root)
+        self.assertNotIn('v1', result['cards_section'])
+
+    def test_fork_copies_of_same_event_are_both_kept(self):
+        root = self.init()
+        flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        rel = 'agents/codex/sessions/card-0001.md'
+        payload = sync._collect_payload(self.store_dir(root))
+        incoming = payload[rel].replace(b'- \xe6\x8e\xa5\xe5\x8f\xa3\xef\xbc\x9av2',
+                                         b'- \xe6\x8e\xa5\xe5\x8f\xa3\xef\xbc\x9av3')
+        result = sync.merge_project(self.store_dir(root), {rel: incoming},
+                                    {'device': 'other'})
+        self.assertTrue(any(c.get('rule') == 'session-card-same-event-different-body'
+                            for c in result['conflicts']))
+        for merged_rel, data in result['merged_files'].items():
+            dest = self.store_dir(root) / merged_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        relay.update_checksum_manifest(self.store_dir(root))
+        cards = flow.latest_session_cards(self.store_dir(root), ['codex'])
+        self.assertEqual(2, len(cards))
+        self.assertEqual(1, len({c['header'].get('event_id') for c in cards}))
+
+    def test_inject_budget_includes_cross_section(self):
+        root = self.init()
+        relay.ensure_agent_dir(self.store_dir(root), 'claude-code')
+        flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        flow.write_session_card(root, 'claude-code', 's2', 'session-end',
+                                '## 事实\n- 接口：v1')
+        result = flow.inject(root, budget=80)
+        self.assertLessEqual(result['tokens_estimate'], 80)
+
+    def test_partial_llm_usage_is_rejected_not_measured(self):
+        root = self.init()
+        with self.assertRaisesRegex(RelayError, 'llm_usage'):
+            flow.write_session_card(root, 'codex', 's1', 'session-end', CARD,
+                                    llm_usage={'calls': 1})
+        self.assertFalse((self.adir(root, 'codex') / 'sessions').exists())
+
+    def test_skill_copies_are_byte_identical(self):
+        repo = Path(__file__).resolve().parents[1]
+        self.assertEqual((repo / 'SKILL.md').read_bytes(),
+                         (repo / 'skills' / 'project-relay' / 'SKILL.md').read_bytes())
+
     def test_cli_card_and_usage(self):
         root = self.init()
         semantic = Path(self.temp.name) / 'card.md'
@@ -159,7 +214,8 @@ class TestSessionCardStats(V3Base):
         stats.record_summarize(store, 'manual', 'manual', llm_in_tokens=2000,
                                now_epoch=now - 10 * 86400)
         stats.record_session_card(store, 'codex', 's1', 'session-end', 1,
-                                  llm_usage={'calls': 1, 'input_tokens': 7000},
+                                  llm_usage={'calls': 1, 'input_tokens': 7000,
+                                             'output_tokens': 0},
                                   now_epoch=now - 86400)
         self.assertTrue(stats.compute_fuse(store, now_epoch=now)['tripped'])
 

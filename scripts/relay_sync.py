@@ -1930,8 +1930,9 @@ def merge_project(local_dir, incoming_files, source_info):
                 try:
                     used_card_nums.add(int(path.stem.split('-')[-1]))
                     header, body = _parse_session_card_bytes(data)
-                    local_card_events.setdefault(
-                        (header.get('session'), header.get('stage')), []).append(path)
+                    event = header.get('event_id') or (
+                        'legacy', header.get('session'), header.get('stage'))
+                    local_card_events.setdefault(event, []).append(path)
                 except (ValueError, UnicodeDecodeError, RelayError):
                     pass
         next_card_num = (max(used_card_nums) + 1) if used_card_nums else 1
@@ -1957,10 +1958,12 @@ def merge_project(local_dir, incoming_files, source_info):
             used_card_nums.add(seq)
             next_card_num = max(next_card_num, seq + 1)
             new_rel = '%scard-%04d.md' % (card_prefix, seq)
-            event = (header.get('session'), header.get('stage'))
+            event = header.get('event_id') or (
+                'legacy', header.get('session'), header.get('stage'))
             if event in local_card_events:
                 conflicts.append({'file': new_rel,
                                   'rule': 'session-card-same-event-different-body',
+                                  'event_id': header.get('event_id'),
                                   'local': [str(p.relative_to(local_dir)).replace('\\', '/')
                                             for p in local_card_events[event]],
                                   'incoming': rel})

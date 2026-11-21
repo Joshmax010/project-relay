@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -199,18 +200,26 @@ def list_session_cards(adir):
 
 
 def latest_session_cards(store_dir, agents):
-    """The newest card per agent; never reads raw conversation material."""
+    """The newest event per agent, plus all fork copies of that event.
+
+    A legitimate later milestone in the same session is a different event
+    and must not drag older milestones into resume/conflict checking. Only
+    cards carrying the same event_id are treated as forked copies (import
+    divergence), where both sides stay visible until the user confirms.
+    """
     cards = []
     for agent in agents:
         owned = list_session_cards(relay.agent_dir(store_dir, agent))
-        if owned:
-            latest = owned[-1]
-            # Same session + stage with different bytes is a forked card,
-            # not permission to pick a winner by timestamp/import order.
-            event = (latest['header'].get('session'), latest['header'].get('stage'))
-            cards.extend(card for card in owned
-                         if (card['header'].get('session'),
-                             card['header'].get('stage')) == event)
+        if not owned:
+            continue
+        latest = owned[-1]
+        event_id = latest['header'].get('event_id')
+        if event_id:
+            selected = [card for card in owned
+                        if card['header'].get('event_id') == event_id]
+        else:
+            selected = [latest]
+        cards.extend(selected)
     cards.sort(key=lambda card: (card['header'].get('captured_at', ''),
                                  card['header'].get('seq', 0)), reverse=True)
     return cards
@@ -241,23 +250,29 @@ def write_session_card(toplevel, agent, session, stage, text, llm_usage=None):
     require(len(text) <= cap,
             '会话卡超长：%d 字符，上限 %d；请压缩到结论、决定、待办和事实'
             % (len(text), cap))
+    session = session.strip()
+    session, session_hits = redact(session)
     text, hits = redact(text)
+    hits += session_hits
+    require(session.strip(), '会话卡 session 脱敏后为空')
     require(len(text) <= cap, '会话卡脱敏后仍超过字符上限 %d' % cap)
     with relay.outer_lock(store_dir):
         if not adir.is_dir():
             relay.ensure_agent_dir(store_dir, agent)
         with relay.agent_lock(store_dir, agent):
             stats = _stats_module()
+            stats.validate_llm_usage(llm_usage)
             fuse = stats.compute_fuse(store_dir)
             require(not fuse.get('tripped'),
                     '成本保险丝已触发，会话卡暂停写入：' + fuse.get('reason', ''))
             owned = list_session_cards(adir)
             seq = (owned[-1]['header']['seq'] + 1) if owned else 1
             header = {
-                'version': 1, 'seq': seq, 'captured_at': utc(),
-                'agent': agent, 'session': session.strip(), 'stage': stage,
-                'anchor': relay.anchor(toplevel), 'semantic_chars': len(text),
-                'char_cap': cap, 'redacted_count': hits,
+                'version': 1, 'seq': seq, 'event_id': uuid.uuid4().hex,
+                'captured_at': utc(), 'agent': agent, 'session': session,
+                'stage': stage, 'anchor': relay.anchor(toplevel),
+                'semantic_chars': len(text), 'char_cap': cap,
+                'redacted_count': hits,
             }
             body = '# 会话卡 card-%04d\n\n%s\n' % (seq, text.strip())
             path = _card_path(adir, seq)
@@ -268,11 +283,11 @@ def write_session_card(toplevel, agent, session, stage, text, llm_usage=None):
                                    'card-%04d' % seq)
             relay.update_checksum_manifest(store_dir)
             _record_stats_safe(stats.record_session_card, store_dir,
-                               agent, session.strip(), stage, len(text),
+                               agent, session, stage, len(text),
                                llm_usage=llm_usage)
             fuse = stats.compute_fuse(store_dir)
     return {'seq': seq, 'path': str(path), 'stage': stage,
-            'session': session.strip(), 'semantic_chars': len(text),
+            'session': session, 'semantic_chars': len(text),
             'char_cap': cap, 'redacted_count': hits,
             'monthly_cap': fuse.get('monthly_cap'),
             'month_llm_tokens': fuse.get('month_llm_tokens', 0)}
@@ -1490,7 +1505,7 @@ def install_claude(toplevel, home_dir=None):
         save(settings_path, settings)
     claude_md = home / '.claude' / 'CLAUDE.md'
     body = ('project-relay 接手规程（受管小节，勿手改）：\n'
-            '- 会话开始先跑 relay resume 对账；会话结束先跑 relay capture 采集。\n'
+            '- 会话开始先跑 relay resume 读会话卡；会话结束先跑 relay card 留短卡，再跑 relay capture 采集。\n'
             '- 语义占位段未填不得声称已收尾；Stop 钩子会拦截补填。')
     sec_changed, sec_note = managed_insert(claude_md, 'relay', '1', body)
     _save_recipe_state(store_dir, 'claude-code',
@@ -1649,7 +1664,17 @@ def hook_stop(cwd, agent='claude-code', session=None):
             'note': enf.get('note'), 'capture': cap, 'enforce': enf}
 
 
-RELAY_SKILL_TEXT = (Path(__file__).resolve().parent.parent / 'SKILL.md').read_text(encoding='utf-8')
+def _load_skill_text():
+    """Load the shipped SKILL.md; fall back to a checked error text if incomplete."""
+    skill_md = Path(__file__).resolve().parent.parent / 'SKILL.md'
+    try:
+        return skill_md.read_text(encoding='utf-8')
+    except OSError as exc:
+        return ('---\nname: project-relay\ndescription: 项目接力技能安装包不完整。\n---\n\n'
+                '# Relay\n\n安装包缺少 SKILL.md（%s）；请重新安装完整技能包。\n' % exc)
+
+
+RELAY_SKILL_TEXT = _load_skill_text()
 
 _SKILL_SCRIPT_FILES = ('relay.py', 'relay_flow.py', 'relay_fork.py',
                       'relay_stats.py', 'relay_sync.py', 'relay_work.py')
@@ -1861,7 +1886,7 @@ def install_codex(toplevel):
     store_dir = relay.resolve_store_dir(toplevel)
     toplevel = relay.git_toplevel(toplevel)
     body = ('project-relay 接手规程（受管小节，勿手改）：\n'
-            '- 会话开始先跑 relay resume 对账；会话结束先跑 relay capture 采集。\n'
+            '- 会话开始先跑 relay resume 读会话卡；会话结束先跑 relay card 留短卡，再跑 relay capture 采集。\n'
             '- 语义占位段未填不得声称已收尾。\n'
             '- 本路线无 hooks，采集可靠性为三家最低档；积压由接手兜底汇总补齐。')
     changed, note = managed_insert(toplevel / 'AGENTS.md', 'relay', '1', body)
@@ -3150,6 +3175,23 @@ def _injection_parts(toplevel, budget=None, agent=None):
     return text, layers
 
 
+def _trim_to_token_budget(text, budget):
+    """Trim text at a line boundary so the hard token budget still holds."""
+    if estimate_tokens(text) <= budget:
+        return text
+    marker = '\n\n[已按预算截断]\n'
+    marker_tokens = estimate_tokens(marker)
+    if marker_tokens > budget:
+        return ''
+    out = []
+    for line in text.splitlines(True):
+        candidate = ''.join(out) + line
+        if estimate_tokens(candidate) + marker_tokens > budget:
+            break
+        out.append(line)
+    return ''.join(out).rstrip() + marker
+
+
 def inject(toplevel, budget=None, agent=None, full=False):
     """Inject cards by default; full=True retains the legacy archive injection."""
     if not full:
@@ -3159,7 +3201,8 @@ def inject(toplevel, budget=None, agent=None, full=False):
         agents = [agent] if agent else list(relay.list_agents(store_dir))
         cards = render_session_cards_section(store_dir, agents, cfg, budget)
         cross = session_card_cross_check(store_dir, agents)
-        text = cards + '\n\n' + render_cross_section(cross)
+        text = _trim_to_token_budget(
+            cards + '\n\n' + render_cross_section(cross), budget)
         return {'text': text, 'tokens_estimate': estimate_tokens(text),
                 'budget': budget, 'mode': 'cards',
                 'layers': {'cards': estimate_tokens(text), 'total': estimate_tokens(text),
