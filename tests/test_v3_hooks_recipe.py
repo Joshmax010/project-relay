@@ -171,18 +171,19 @@ class TestHookStop(V3Base):
 
 
 class TestHookResume(V3Base):
-    def test_resume_in_project_returns_five_sections(self):
+    def test_resume_in_project_returns_cards(self):
         root = self.init()
         self.confirm_goal(root)
         result = flow.hook_resume(root)
         self.assertFalse(result.get('no_archive'))
-        self.assertEqual(5, len(result['sections']))
+        self.assertEqual('cards', result.get('mode'))
+        self.assertIn('cards_section', result)
 
     def test_direct_resume_still_works(self):
         # Resume itself is fine; only the hook gate is broken.
         root = self.init()
         self.confirm_goal(root)
-        result = flow.resume(root)
+        result = flow.resume(root, full=True)
         self.assertFalse(result.get('no_archive'))
         self.assertEqual(5, len(result['sections']))
 

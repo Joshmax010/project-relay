@@ -200,7 +200,7 @@ class TestEndToEnd(CLIBase):
                                       '--agent', 'deepseek-harness')
         self.assertEqual(0, code, err)
         self.assertIn('汇总序号：1', out)
-        code, out, err = self.cli_err('--root', root, 'resume')
+        code, out, err = self.cli_err('--root', root, 'resume', '--full')
         self.assertEqual(0, code, err)
         for section in ('一段', '二段', '三段', '四段', '五段'):
             self.assertIn(section, out, 'missing ' + section)
@@ -227,7 +227,7 @@ class TestEndToEnd(CLIBase):
         self.assertEqual(0, code, err)
         self.assertTrue((clone / '.project-relay' / 'agents' / 'deepseek-harness'
                          / 'raw' / 'cap-0001.md').is_file())
-        code, out, err = self.cli_err('--root', clone, 'resume')
+        code, out, err = self.cli_err('--root', clone, 'resume', '--full')
         self.assertEqual(0, code, err)
         for section in ('一段', '二段', '三段', '四段', '五段'):
             self.assertIn(section, out, 'missing ' + section)
