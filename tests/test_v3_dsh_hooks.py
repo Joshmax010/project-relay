@@ -63,6 +63,40 @@ class TestDshStopHook(V3Base):
         self.assertEqual(0, code, text)
         self.assertIn('阶段卡：card-0002', text)
 
+    def test_cli_hook_stop_bad_card_file_still_captures(self):
+        root = self.init()
+        missing = Path(self.temp.name) / 'missing-card.md'
+        code, text = self.cli('--root', root, 'hook', 'stop',
+                              '--agent', 'deepseek-harness',
+                              '--session', 'dsh-s1',
+                              '--card-file', missing)
+        self.assertEqual(2, code, text)  # enforce 仍按语义缺失拦截
+        self.assertEqual(1, len(self.entries(root, 'deepseek-harness')))
+        self.assertFalse((self.adir(root, 'deepseek-harness') / 'sessions').exists())
+
+    def test_cli_hook_stop_bad_llm_usage_still_captures(self):
+        root = self.init()
+        card_file = Path(self.temp.name) / 'card.md'
+        card_file.write_text(CARD, encoding='utf-8')
+        code, text = self.cli('--root', root, 'hook', 'stop',
+                              '--agent', 'deepseek-harness',
+                              '--session', 'dsh-s1',
+                              '--card-file', card_file,
+                              '--llm-usage', '{not json')
+        self.assertEqual(2, code, text)
+        self.assertEqual(1, len(self.entries(root, 'deepseek-harness')))
+        self.assertTrue((self.adir(root, 'deepseek-harness') / 'sessions' / 'card-0001.md').exists())
+
+    def test_cli_hook_stage_bad_file_does_not_crash(self):
+        root = self.init()
+        missing = Path(self.temp.name) / 'missing-stage.md'
+        code, text = self.cli('--root', root, 'hook', 'stage',
+                              '--agent', 'deepseek-harness',
+                              '--session', 'dsh-s1',
+                              '--file', missing)
+        self.assertEqual(0, code, text)
+        self.assertFalse((self.adir(root, 'deepseek-harness') / 'sessions').exists())
+
     def test_card_failure_is_visible_but_does_not_skip_capture(self):
         root = self.init()
         path = self.store_dir(root) / 'state' / 'config.json'

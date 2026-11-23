@@ -303,3 +303,11 @@
 
 - 本 PR 交付 DSH 可调用的 hook 命令入口和测试；DSH 侧的具体插件/事件调度接线仍在下一小步。
 - 卡片正文由调用方（DSH Stop/阶段事件）提供，不在 hook 内读取原始聊天。
+
+### PR12 复审修复（2026-11-23）
+
+- CLI `hook stop` 的 `--card-file` 读取失败或 `--llm-usage` 解析失败不再中断 capture/enforce；警告后继续。
+- CLI `hook stage` 同样兜底坏输入；失败只丢阶段卡。
+- SKILL 的 DSH 钩子说明补“接了 Stop 钩子就不用再手动 card/capture”。
+- 分支已 rebase 到 PR11 新 head `1f24906`。
+- 验证：`tests.test_v3_dsh_hooks`：9 tests OK；全量 **279 tests OK**（421.298s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-review-full-tests.log`）；`git diff --check` 通过。

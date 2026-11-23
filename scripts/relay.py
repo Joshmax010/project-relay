@@ -1428,8 +1428,20 @@ def main(argv=None):
                     print(r['note'] if r.get('skipped') else
                           (r['message'] if r.get('no_archive') else flow.render_resume(r)))
                 elif a.hook_command == 'stage':
-                    text = Path(a.file).read_text(encoding='utf-8')
-                    usage = json.loads(a.llm_usage) if a.llm_usage else None
+                    text = None
+                    if a.file:
+                        try:
+                            text = Path(a.file).read_text(encoding='utf-8')
+                        except (OSError, UnicodeDecodeError) as exc:
+                            print('阶段卡读取失败，跳过写卡：%r' % (exc,), file=sys.stderr)
+                            return 0
+                    usage = None
+                    if a.llm_usage:
+                        try:
+                            usage = json.loads(a.llm_usage)
+                        except ValueError as exc:
+                            print('阶段卡 llm_usage 解析失败，改按估算成本：%r' % (exc,),
+                                  file=sys.stderr)
                     r = flow.hook_stage(hook_root, a.agent, a.session, text, usage)
                     if r.get('skipped'):
                         print(r['note'])
@@ -1437,9 +1449,20 @@ def main(argv=None):
                         print('阶段卡：card-%04d（%s）' % (r['seq'], r['path']))
                 else:
                     session = a.session or _session_from_stdin()
-                    text = (Path(a.card_file).read_text(encoding='utf-8')
-                            if a.card_file else None)
-                    usage = json.loads(a.llm_usage) if a.llm_usage else None
+                    text = None
+                    if a.card_file:
+                        try:
+                            text = Path(a.card_file).read_text(encoding='utf-8')
+                        except (OSError, UnicodeDecodeError) as exc:
+                            # A bad card input must not take capture/enforce with it.
+                            print('会话卡读取失败，跳过写卡：%r' % (exc,), file=sys.stderr)
+                    usage = None
+                    if a.llm_usage:
+                        try:
+                            usage = json.loads(a.llm_usage)
+                        except ValueError as exc:
+                            print('llm_usage 解析失败，改按估算成本：%r' % (exc,),
+                                  file=sys.stderr)
                     r = flow.hook_stop(hook_root, agent=a.agent, session=session,
                                        card_text=text, card_usage=usage)
                     cap, enf = r['capture'], r['enforce']
