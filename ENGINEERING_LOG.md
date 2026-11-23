@@ -273,4 +273,4 @@
 - 新增 `relay project move --to <新目录>`：移动项目目录、保留 project_id，并更新本机 registry 路径。
 - 新增 `relay project adopt`：把已有 `.project-relay` 登记到本机定位缓存。
 - init 私有区提醒现在指向 `relay project move --to`。
-- 验证：`tests.test_v3_identity`：15 tests OK；全量 **261 tests OK**（442.583s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-move-full-tests.log`）；`git diff --check` 通过。
+- 验证：`tests.test_v3_identity`：16 tests OK；全量 **262 tests OK**（442.910s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-final-full-tests.log`）；`git diff --check` 通过。

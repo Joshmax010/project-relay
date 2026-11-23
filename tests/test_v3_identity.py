@@ -138,6 +138,11 @@ class TestProjectIdentity(V3Base):
         self.assertTrue(any(row['project_id'] == project_id and Path(row['path']).resolve() == dest.resolve()
                             for row in rows))
 
+    def test_move_project_refuses_target_inside_project(self):
+        root = self.init('move-inside-guard')
+        with self.assertRaises(relay.RelayError):
+            relay.move_project(root, root / 'inside')
+
     def test_move_project_refuses_existing_destination(self):
         root = self.init('move-guard')
         dest = Path(self.temp.name) / 'occupied'

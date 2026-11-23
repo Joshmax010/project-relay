@@ -407,12 +407,26 @@ def move_project(toplevel, destination):
     require(dest != root, '目标目录不能是项目根本身')
     require(not dest.exists(), '目标目录已存在：' + str(dest))
     try:
-        root.relative_to(dest)
+        dest.relative_to(root)
         require(False, '目标目录不能位于项目内部')
     except ValueError:
         pass
+    dest.parent.mkdir(parents=True, exist_ok=True)
     old_root = root
-    shutil.move(str(root), str(dest))
+    old_cwd = Path.cwd()
+    cwd_inside = old_cwd == root or root in old_cwd.parents
+    if cwd_inside:
+        os.chdir(str(root.parent))
+    try:
+        shutil.move(str(root), str(dest))
+    finally:
+        if cwd_inside:
+            # The old cwd may no longer exist after the move; never leave
+            # the process parked inside the moved tree or the temp parent.
+            try:
+                os.chdir(str(Path.home()))
+            except OSError:
+                pass
     store_dir = dest / STORE_DIRNAME
     project = ensure_project_file(store_dir, dest)
     unregister_project_path(old_root)
