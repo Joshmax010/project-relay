@@ -212,7 +212,12 @@ def latest_session_cards(store_dir, agents):
         owned = list_session_cards(relay.agent_dir(store_dir, agent))
         if not owned:
             continue
-        latest = owned[-1]
+        # Latest means captured last, not highest storage seq: an import
+        # renumbers cards into local seq order, which can make an older
+        # card sort after a newer one.
+        latest = max(owned, key=lambda card: (
+            card['header'].get('captured_at', ''),
+            card['header'].get('seq', 0)))
         event_id = latest['header'].get('event_id')
         if event_id:
             selected = [card for card in owned

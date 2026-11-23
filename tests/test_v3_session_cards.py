@@ -139,6 +139,27 @@ class TestSessionCards(V3Base):
         result = flow.resume(root)
         self.assertNotIn('v1', result['cards_section'])
 
+    def test_latest_card_uses_capture_time_not_storage_seq(self):
+        root = self.init()
+        first = flow.write_session_card(root, 'codex', 's1', 'session-end',
+                                        '## 决定\n- 时间较新的一张')
+        second = flow.write_session_card(root, 'codex', 's1', 'session-end',
+                                         '## 决定\n- 时间较旧的一张')
+        # An import renumbers cards into local seq order, so a card with
+        # the higher seq can be the older one. Fake that state: the
+        # seq-2 card carries an earlier captured_at.
+        path = Path(second['path'])
+        head, body = path.read_bytes().split(flow.BODY_DELIM.encode(), 1)
+        header = json.loads(head)
+        header['captured_at'] = '1999-01-01T00:00:00Z'
+        path.write_bytes((json.dumps(header, ensure_ascii=False,
+                                     sort_keys=True, indent=2)
+                          + flow.BODY_DELIM).encode('utf-8') + body)
+        relay.update_checksum_manifest(self.store_dir(root))
+        cards = flow.latest_session_cards(self.store_dir(root), ['codex'])
+        self.assertEqual(1, len(cards))
+        self.assertIn('时间较新的一张', cards[0]['body'])
+
     def test_fork_copies_of_same_event_are_both_kept(self):
         root = self.init()
         flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
@@ -292,6 +313,39 @@ class TestSessionCardSync(V3Base):
                             for c in result['conflicts']))
         self.assertTrue(any(k.endswith('sessions/card-0002.md')
                             for k in result['merged_files']))
+
+    def test_renumbered_roundtrip_card_is_not_conflict_or_duplicate(self):
+        root = self.init()
+        info = flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        raw = Path(info['path']).read_bytes()
+        head, body = raw.split(flow.BODY_DELIM.encode(), 1)
+        header = json.loads(head)
+        header['seq'] = 9
+        body = body.replace(b'card-0001', b'card-0009', 1)
+        data = (json.dumps(header, ensure_ascii=False, sort_keys=True,
+                           indent=2) + flow.BODY_DELIM).encode('utf-8') + body
+        result = sync.merge_project(
+            self.store_dir(root),
+            {'agents/codex/sessions/card-0009.md': data},
+            {'device': 'other'})
+        self.assertFalse(any(
+            c.get('rule') == 'session-card-same-event-different-body'
+            for c in result['conflicts']))
+        self.assertFalse(any('sessions/' in k for k in result['merged_files']))
+
+    def test_imported_card_length_ceiling_is_not_self_declared(self):
+        header = {'version': 1, 'seq': 1, 'agent': 'codex', 'session': 's1',
+                  'stage': 'session-end', 'char_cap': 999999}
+        body = '# 会话卡 card-0001\n' + 'x' * 4000
+        data = (json.dumps(header, ensure_ascii=False, sort_keys=True,
+                           indent=2) + sync.BODY_DELIM + body).encode('utf-8')
+        with self.assertRaises(RelayError):
+            sync._parse_session_card_bytes(data)
+        root = self.init()
+        info = flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        parsed_header, _ = sync._parse_session_card_bytes(
+            Path(info['path']).read_bytes())
+        self.assertEqual('codex', parsed_header['agent'])
 
     def test_resume_cards_is_read_only_and_ignores_memory_and_raw(self):
         root = self.init()

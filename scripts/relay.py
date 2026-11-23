@@ -516,7 +516,7 @@ def _reject_store_symlinks(store_dir):
                 require(False, '拒绝符号链接: ' + str(child))
             if not child.is_dir():
                 continue
-            for name in ('raw', 'state', 'tx', 'backups'):
+            for name in ('raw', 'state', 'tx', 'backups', 'sessions'):
                 p = child / name
                 if p.is_symlink() or p.exists():
                     require(not p.is_symlink(), '拒绝符号链接: ' + str(p))
