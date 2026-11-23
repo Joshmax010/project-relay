@@ -121,7 +121,7 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 命令都在**本 SKILL.md 所在目录**（技能目录）下跑 `python scripts/relay.py ...`（Windows 用 `python`）。项目级安装的技能目录通常是 `<项目根>/.dsh/skills/project-relay`；用户级通常是 `<用户目录>/.agents/skills/project-relay`。如果当前会话在项目根，也可以直接用 `.dsh/skills/project-relay/scripts/relay.py`。
 
 - `relay init`：建 `.project-relay/`，写 `project.json` 和本机定位缓存
-- `relay locate [--name]` / `relay open <name>`：查/打开本机项目
+- `relay locate [--name]` / `relay open <name> [--shell posix|powershell|cmd]`：查/打开本机项目
 - `relay resume` / `relay capture` / `relay summarize` / `relay scales`
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`

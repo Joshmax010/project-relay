@@ -32,6 +32,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -289,7 +290,11 @@ def read_registry():
     projects = data.get('projects')
     if not isinstance(projects, dict):
         projects = {}
-    return {'version': int(data.get('version') or 1), 'projects': projects}
+    try:
+        version = int(data.get('version') or 1)
+    except (TypeError, ValueError):
+        version = 1
+    return {'version': version, 'projects': projects}
 
 
 def save_registry(data):
@@ -328,24 +333,42 @@ def ensure_project_file(store_dir, root):
 
 
 def register_project(root, store_dir, project=None):
-    """Upsert this project into the machine-local locator cache."""
+    """Upsert this project into the machine-local locator cache.
+
+    The read-modify-write runs under a machine-local lock so concurrent
+    initializations cannot drop each other's registry row.
+    """
     project = dict(project or ensure_project_file(store_dir, root))
     root = Path(root).resolve()
-    data = read_registry()
-    entry = {
-        'project_id': project['project_id'],
-        'name': project.get('name') or root.name,
-        'path': str(root),
-        'last_seen': utc(),
-    }
-    # The path is the canonical locator; drop stale rows for the same path.
-    for pid, old in list(data['projects'].items()):
-        if pid != project['project_id'] and isinstance(old, dict) \
-                and Path(str(old.get('path', ''))).expanduser().resolve() == root:
-            data['projects'].pop(pid, None)
-    data['projects'][project['project_id']] = entry
-    save_registry(data)
+    with _StoreLock(registry_path().with_suffix('.lock')):
+        data = read_registry()
+        entry = {
+            'project_id': project['project_id'],
+            'name': project.get('name') or root.name,
+            'path': str(root),
+            'last_seen': utc(),
+        }
+        # The path is the canonical locator; drop stale rows for the same path.
+        for pid, old in list(data['projects'].items()):
+            if pid != project['project_id'] and isinstance(old, dict) \
+                    and Path(str(old.get('path', ''))).expanduser().resolve() == root:
+                data['projects'].pop(pid, None)
+        data['projects'][project['project_id']] = entry
+        save_registry(data)
     return entry
+
+
+def _open_command(path, shell='auto'):
+    """Quote a path for a user's shell; never print executable path text raw."""
+    text = str(path)
+    if shell == 'auto':
+        shell = 'powershell' if os.name == 'nt' else 'posix'
+    if shell == 'posix':
+        return 'cd ' + shlex.quote(text)
+    if shell == 'powershell':
+        return "cd '" + text.replace("'", "''") + "'"
+    # CMD: double-quoted path; percent expansion is the only extra escape.
+    return 'cd /d "%s"' % text.replace('%', '%%')
 
 
 def private_agent_root(root):
@@ -384,7 +407,7 @@ def locate_projects(name=None):
             continue
         path = Path(str(entry.get('path', ''))).expanduser()
         values = [str(entry.get('name', '')), path.name, pid]
-        if query and query not in [v.lower() for v in values]:
+        if query and not any(query in v.lower() for v in values):
             continue
         rows.append({'project_id': pid, 'name': entry.get('name') or path.name,
                      'path': str(path), 'exists': path.is_dir(),
@@ -1191,6 +1214,8 @@ def _parser():
     loc.add_argument('--json', action='store_true')
     op = sub.add_parser('open', help='打印项目的 cd 路径（供 shell 执行）')
     op.add_argument('name')
+    op.add_argument('--shell', choices=['auto', 'posix', 'powershell', 'cmd'],
+                    default='auto')
     sub.add_parser('agents')
     g = sub.add_parser('goal')
     gsub = g.add_subparsers(dest='goal_command', required=True)
@@ -1329,7 +1354,9 @@ def main(argv=None):
                 print('未找到项目；可先在本机对项目运行 relay init 注册')
             else:
                 for row in rows:
-                    print('%s\t%s\t%s' % (row['name'], row['project_id'], row['path']))
+                    suffix = '' if row['exists'] else '（不存在）'
+                    print('%s\t%s\t%s%s' % (row['name'], row['project_id'],
+                                               row['path'], suffix))
         elif a.command == 'open':
             rows = locate_projects(a.name)
             if not rows:
@@ -1338,7 +1365,10 @@ def main(argv=None):
             if len(rows) > 1:
                 print('匹配多个项目，请用 relay locate --name 查看：' + a.name, file=sys.stderr)
                 return 1
-            print('cd "%s"' % rows[0]['path'])
+            if not rows[0]['exists']:
+                print('项目路径不存在：' + rows[0]['path'] + '；请重新 init 或清理缓存', file=sys.stderr)
+                return 1
+            print(_open_command(rows[0]['path'], a.shell))
         elif a.command == 'agents':
             store_dir = resolve_store_dir(a.root)
             print((store_dir / 'index.md').read_text(encoding='utf-8')

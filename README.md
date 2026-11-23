@@ -119,7 +119,7 @@ python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```bash
 python3 scripts/relay.py init            # 给项目建档（写 project.json + 本机定位缓存）
 python3 scripts/relay.py locate [--name] # 查本机项目定位
-python3 scripts/relay.py open <name>     # 打印项目的 cd 路径
+python3 scripts/relay.py open <name>     # 打印项目的 cd 路径（--shell posix|powershell|cmd）
 python3 scripts/relay.py agents          # 看指路表
 python3 scripts/relay.py resume          # 接手对账（五段简报 + 跨 Agent 核对）
 python3 scripts/relay.py capture         # 会话结束采集
