@@ -1,5 +1,7 @@
 """DSH Stop / stage hook -> session card integration."""
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +21,19 @@ CARD = """## 已验证
 
 
 class TestDshStopHook(V3Base):
+    def test_dsh_plugin_bundle_is_present_and_valid(self):
+        repo = Path(__file__).resolve().parents[1]
+        base = repo / 'dsh-plugin' / 'project-relay-hooks'
+        self.assertTrue((base / 'package.json').is_file())
+        self.assertTrue((base / 'cordis.patch.yml').is_file())
+        self.assertTrue((base / 'index.js').is_file())
+        manifest = json.loads((base / 'package.json').read_text(encoding='utf-8'))
+        self.assertEqual('@local/project-relay-hooks', manifest['name'])
+        self.assertTrue(manifest['dsh']['bundle']['patch'])
+        if shutil.which('node'):
+            subprocess.run(['node', '--check', str(base / 'index.js')],
+                           check=True, capture_output=True)
+
     def test_hook_stop_writes_capture_and_card(self):
         root = self.init()
         result = flow.hook_stop(root, agent='deepseek-harness', session='dsh-s1',

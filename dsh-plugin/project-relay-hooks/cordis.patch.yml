@@ -1,0 +1,6 @@
+- insert:
+    - id: project-relay-hooks
+      name: '@local/project-relay-hooks'
+      config:
+        agent: deepseek-harness
+        stageEveryTurns: 10

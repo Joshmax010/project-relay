@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project Relay 钩子",
+    "description": "在 DSH Stop 和阶段边界写入 project-relay 会话卡。"
+  }
+}

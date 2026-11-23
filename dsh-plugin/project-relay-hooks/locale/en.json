@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Project Relay hooks",
+    "description": "Writes project-relay session cards on DSH stop and stage boundaries."
+  }
+}

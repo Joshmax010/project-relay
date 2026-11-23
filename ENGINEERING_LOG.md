@@ -291,17 +291,18 @@
 | 阶段钩子 | `relay hook stage --agent deepseek-harness --session <会话> --file <短卡>`：写 `milestone` 卡，不重复 capture |
 | 兼容 | 原 `hook stop` 仍默认 `claude-code`、不传卡片时行为不变；Claude 现有 hook recipe 不受影响 |
 | 文档 | README / SKILL / references 补 Stop/阶段钩子命令与失败语义 |
+| DSH 插件 | `dsh-plugin/project-relay-hooks`：监听 `workspace/session-stop` 和 `session/event`，自动调用 hook stop/stage；通过 Plugins > Add plugin 安装 |
 
 ### 验证
 
-- `python -m unittest tests.test_v3_dsh_hooks -v`：6 tests OK。
-- `python -m unittest tests.test_v3_dsh_hooks tests.test_v3_hooks_recipe tests.test_v3_session_cards -v`：52 tests OK。
-- 全量回归：**266 tests OK**（345.896s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-full-tests.log`）。
+- `python -m unittest tests.test_v3_dsh_hooks -v`：10 tests OK。
+- `python -m unittest tests.test_v3_dsh_hooks tests.test_v3_hooks_recipe tests.test_v3_session_cards -v`：56 tests OK。
+- 全量回归：**280 tests OK**（435.017s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-plugin-full-tests.log`）。
 - `git diff --check`：通过。
 
 ### 说明与后续
 
-- 本 PR 交付 DSH 可调用的 hook 命令入口和测试；DSH 侧的具体插件/事件调度接线仍在下一小步。
+- 本 PR 交付 DSH hook 命令入口、DSH 插件包和测试；插件通过 DSH Plugins > Add plugin 安装后监听 Stop/阶段事件。
 - 卡片正文由调用方（DSH Stop/阶段事件）提供，不在 hook 内读取原始聊天。
 
 ### PR12 复审修复（2026-11-23）
