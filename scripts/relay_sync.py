@@ -1622,6 +1622,19 @@ def _is_session_card_rel(rel):
             and parts[3].endswith('.md'))
 
 
+def _card_body_key(body):
+    """Card identity for dedupe: the body without its seq-bearing title.
+
+    Renumbering rewrites only the '# 会话卡 card-NNNN' title line (and
+    the header seq), so two stored copies of one card differ exactly
+    there.
+    """
+    lines = body.splitlines(True)
+    if lines and lines[0].startswith('# 会话卡 card-'):
+        lines = lines[1:]
+    return ''.join(lines).strip()
+
+
 def _parse_session_card_bytes(data):
     text = data.decode('utf-8')
     require(BODY_DELIM in text, '会话卡格式损坏')
@@ -1638,9 +1651,10 @@ def _parse_session_card_bytes(data):
     require(header.get('stage') in ('session-end', 'milestone'),
             '会话卡阶段无效')
     require(body.strip(), '会话卡正文为空')
-    cap = header.get('char_cap', 3000)
-    require(isinstance(cap, int) and cap > 0 and len(body) <= cap + 40,
-            '会话卡超过声明长度上限')
+    # The length ceiling is a local constant (writer default 3000 plus
+    # the stored-body slack for the title line). The card's own header
+    # must never raise the limit it is checked against.
+    require(len(body) <= 3000 + 40, '会话卡超过长度上限')
     return header, body
 
 
@@ -1951,6 +1965,7 @@ def merge_project(local_dir, incoming_files, source_info, fresh_store=False):
         card_prefix = adir + '/sessions/'
         local_card_hashes = set()
         local_card_events = {}
+        local_card_body_keys = {}
         used_card_nums = set()
         card_dir = local_dir / card_prefix
         if card_dir.is_dir():
@@ -1963,10 +1978,13 @@ def merge_project(local_dir, incoming_files, source_info, fresh_store=False):
                     event = header.get('event_id') or (
                         'legacy', header.get('session'), header.get('stage'))
                     local_card_events.setdefault(event, []).append(path)
+                    local_card_body_keys.setdefault(event, []).append(
+                        _card_body_key(body))
                 except (ValueError, UnicodeDecodeError, RelayError):
                     pass
         next_card_num = (max(used_card_nums) + 1) if used_card_nums else 1
         accepted_card_events = {}
+        accepted_card_body_keys = {}
         for rel in sorted(incoming_files):
             if not _is_session_card_rel(rel) or not rel.startswith(card_prefix):
                 continue
@@ -1980,6 +1998,15 @@ def merge_project(local_dir, incoming_files, source_info, fresh_store=False):
                 discarded.append({'file': rel, 'reason': 'malformed-session-card',
                                   'detail': str(exc)})
                 quarantined[rel] = data
+                continue
+            event = header.get('event_id') or (
+                'legacy', header.get('session'), header.get('stage'))
+            body_key = _card_body_key(body)
+            if body_key in local_card_body_keys.get(event, []) \
+                    or body_key in accepted_card_body_keys.get(event, []):
+                # The same card coming back under a different storage
+                # seq (an import elsewhere renumbered it): not a fork,
+                # not a duplicate to store.
                 continue
             seq = header['seq']
             if seq in used_card_nums:
@@ -2010,6 +2037,7 @@ def merge_project(local_dir, incoming_files, source_info, fresh_store=False):
                                    indent=2) + BODY_DELIM + body).encode('utf-8')
             merged[new_rel] = data
             accepted_card_events.setdefault(event, []).append(new_rel)
+            accepted_card_body_keys.setdefault(event, []).append(body_key)
             local_card_hashes.add(_sha256(data))
             counts['files_added'] += 1
 

@@ -51,6 +51,20 @@ class TestInitLayout(V3Base):
         with self.assertRaises(RelayError):
             relay.init(root)
 
+    def test_init_rejects_symlinked_sessions_dir(self):
+        root = self.init()
+        store = self.store_dir(root)
+        relay.ensure_agent_dir(store, 'codex')
+        outside = Path(self.temp.name) / 'outside-sessions'
+        outside.mkdir()
+        try:
+            (store / 'agents' / 'codex' / 'sessions').symlink_to(
+                outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('symlink not supported on this host')
+        with self.assertRaises(RelayError):
+            relay.init(root)
+
     def test_init_is_idempotent_and_keeps_content(self):
         root = self.init()
         store = self.store_dir(root)
