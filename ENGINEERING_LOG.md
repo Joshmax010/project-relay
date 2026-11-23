@@ -275,3 +275,49 @@
 - `resume_cards` / `inject` 只解析一次 `latest_session_cards`，cross check 与渲染共用。
 - `resume_cards` 增加 checksum-manifest 校验；卡被改过时挂【档案完整性】提示。
 - 验证：`tests.test_v3_session_cards`：24 tests OK；全量 **270 tests OK**（377.803s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review2-full-tests.log`）；`git diff --check` 通过。
+
+## 2026-11-21 · 项目身份证与定位
+
+### 范围
+
+- 基线：`main@7be4240`（目标落档与定位文档已提交）。
+- 实现项目身份证、机器本地定位缓存，以及 init 遇到 Agent 私有区的提醒。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| 项目身份证 | `relay init` 写 `.project-relay/project.json`：稳定 `project_id`、名称、创建时间；幂等，不改已有 ID |
+| 本机定位缓存 | `~/.project-relay/registry.json` 记录 project_id、名称、路径、last_seen；可重建、不进 ZIP、不算身份 |
+| 查找命令 | `relay locate [--name] [--json]` 查项目；`relay open <name>` 打印可执行的 `cd` 路径 |
+| 私有区提醒 | `relay init` 检测 `~/.dsh`、`~/.agents`、`~/.claude`、`~/.codex`、`~/.workbuddy`、`DSH_PROFILE_DIR`，提示迁移到用户项目区 |
+| ZIP | `project.json` 进入 payload；导入保留本地 project_id，ID 冲突只记 note，不覆盖本地身份 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_identity -v`：6 tests OK。
+- 全量回归：**252 tests OK**（333.387s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-full-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 私有区只提醒不阻止，迁移目前是建议路径；自动迁移命令留给下一轮。
+- 定位缓存只做机器本地索引；跨设备仍只走 zip。
+
+### PR13 复审修复（2026-11-23）
+
+- fresh import 采用包内 `project.json` 的 project_id，并刷新本机定位缓存，不再现造新 ID。
+- `relay open` 使用 shell 安全引用，新增 `--shell posix|powershell|cmd`；CMD 输出 `cd /d`。
+- 导入的 `project.json` 非对象时忽略并记 note，不再 AttributeError。
+- 注册表读改写加 `~/.project-relay/registry.lock` 排他锁。
+- `relay open` 对不存在路径报错退出；`locate` 默认标出不存在行。
+- 注册表 version 非数字时回退 1；`locate --name` 支持子串匹配。
+- 新增 fresh-import / existing-import 身份测试、shell 注入测试、坏版本/坏身份测试。
+- 验证：`tests.test_v3_identity`：12 tests OK；全量 **258 tests OK**（477.677s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-review-full-tests.log`）；`git diff --check` 通过。
+
+### 项目迁移命令（2026-11-23）
+
+- 新增 `relay project move --to <新目录>`：移动项目目录、保留 project_id，并更新本机 registry 路径。
+- 新增 `relay project adopt`：把已有 `.project-relay` 登记到本机定位缓存。
+- init 私有区提醒现在指向 `relay project move --to`。
+- 验证：`tests.test_v3_identity`：16 tests OK；全量 **262 tests OK**（442.910s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-final-full-tests.log`）；`git diff --check` 通过。

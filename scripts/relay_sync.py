@@ -115,7 +115,7 @@ def _is_payload_file(rel):
     if rel.startswith('receipts/'):
         return True
     if rel in ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
-               'stack.md', 'outlook.md', 'index.md'):
+               'stack.md', 'outlook.md', 'index.md', 'project.json'):
         return True
     if rel.startswith('state/goal-tentative.') \
             or rel.startswith('state/goal-draft.'):
@@ -1653,7 +1653,7 @@ def _is_handled(rel):
     if _is_raw_entry_rel(rel):
         return True
     if rel in ('goal.md', 'state.md', 'backlog.md', 'decisions.md',
-               'stack.md', 'outlook.md', 'index.md'):
+               'stack.md', 'outlook.md', 'index.md', 'project.json'):
         return True
     if rel.startswith('receipts/'):
         return True
@@ -1677,7 +1677,19 @@ def _is_handled(rel):
     return False
 
 
-def merge_project(local_dir, incoming_files, source_info):
+def _project_id_from_bytes(data):
+    """Return project_id only from a JSON object; damaged identity is ignored."""
+    try:
+        value = json.loads(data.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    project_id = value.get('project_id')
+    return project_id if isinstance(project_id, str) else None
+
+
+def merge_project(local_dir, incoming_files, source_info, fresh_store=False):
     """Pure merge preview AND apply input (no writes).
 
     local_dir is the live project store dir (read-only here).
@@ -1799,6 +1811,24 @@ def merge_project(local_dir, incoming_files, source_info):
     def local_bytes(rel):
         p = local_dir / rel
         return p.read_bytes() if p.exists() else b''
+
+    # ---- project identity: keep the local ID; adopt only when absent
+    if 'project.json' in incoming_files:
+        local_project = local_bytes('project.json')
+        local_id = _project_id_from_bytes(local_project) if local_project else None
+        incoming_id = _project_id_from_bytes(incoming_files['project.json'])
+        if not local_project:
+            merged['project.json'] = incoming_files['project.json']
+        elif incoming_id is None:
+            notes.append('包内 project.json 不是有效身份对象，忽略')
+        elif fresh_store:
+            # relay.init just made a placeholder identity for this import;
+            # adopt the archive's identity instead of minting a new one.
+            merged['project.json'] = incoming_files['project.json']
+        elif local_id and incoming_id and local_id != incoming_id:
+            notes.append('项目身份证 ID 与本地不同，保留本地 project.json')
+        elif incoming_files['project.json'] != local_project:
+            notes.append('项目身份证内容不同，保留本地 project.json')
 
     # ---- outer goal first (per-agent goal alignment needs its hash)
     incoming_receipts = {}
@@ -2435,6 +2465,7 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             '包内项目名非法：%r' % (slug,))
     toplevel = Path(toplevel)
     store_dir = relay.store_dir_for(toplevel)
+    fresh_store = not store_dir.is_dir()
     if store_dir.is_dir():
         store_dir = relay.resolve_store_dir(toplevel)
     elif confirm:
@@ -2455,7 +2486,8 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             _redact_incoming(payload)
         source_info = {'device': manifest['source_device'],
                        'device_id': manifest['source_device_id'], 'seq': None}
-        merge_result = merge_project(store_dir, files_in, source_info)
+        merge_result = merge_project(store_dir, files_in, source_info,
+                                     fresh_store=fresh_store)
         merge_result['discarded'].extend(redacted_discarded)
         merge_result['quarantined'].update(redacted_quarantined)
         entry = {'slug': slug, 'display_name': proj.get('display_name'),
@@ -2473,6 +2505,11 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             landed = _land_project(store_dir, merge_result, source_info,
                                    marker_files=marker_files,
                                    quarantined=merge_result['quarantined'])
+            if fresh_store:
+                # The import may have adopted an identity during merge;
+                # refresh the locator row so the old placeholder ID is gone.
+                project = relay.ensure_project_file(store_dir, toplevel)
+                relay.register_project(toplevel, store_dir, project)
             entry['merge_log'] = landed['merge_log']
             entry['quarantined_files'] = landed['quarantined_files']
             merge_logs.append(landed['merge_log'])

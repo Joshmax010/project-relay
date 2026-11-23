@@ -60,6 +60,15 @@ class V3Base(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name) / 'home'
         self.home.mkdir()
+        self._old_registry_home = os.environ.get('PROJECT_RELAY_HOME')
+        os.environ['PROJECT_RELAY_HOME'] = str(self.home / '.project-relay')
+
+        def restore_registry_home():
+            if self._old_registry_home is None:
+                os.environ.pop('PROJECT_RELAY_HOME', None)
+            else:
+                os.environ['PROJECT_RELAY_HOME'] = self._old_registry_home
+        self.addCleanup(restore_registry_home)
 
     def git(self, root, *args):
         return subprocess.run(['git', '-C', str(root), *args],
