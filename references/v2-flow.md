@@ -14,6 +14,7 @@
 `relay scales [--agent]`、`relay summarize --agent <家> [--source] [--semantic-file] [--session]`、
 `relay recover --agent <家>`、`relay inject [--budget] [--agent] [--full]`、
 `relay card --agent <家> --session <会话> --stage session-end|milestone --file <短卡>`、
+`relay hook stop --agent <家> --session <会话> --card-file <短卡>`、`relay hook stage --agent <家> --session <会话> --file <短卡>`、
 `relay resume [--full]`、`relay hook resume|stop`、`relay stack/outlook [--set]`、
 `relay agent-goal --agent <家> [--set/--file]`、`relay log --agent <家>`。
 

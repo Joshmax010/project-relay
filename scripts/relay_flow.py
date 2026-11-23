@@ -1675,11 +1675,14 @@ def hook_resume(cwd):
     return resume(toplevel)
 
 
-def hook_stop(cwd, agent='claude-code', session=None):
-    """Stop hook: the last capture of the session, then enforce, in one
-    process -- the same sequencing the recipe's installed Stop handler
-    guarantees, so enforce sees the entry the capture just wrote.
-    Returns the enforce verdict plus both halves for the caller to print.
+def hook_stop(cwd, agent='claude-code', session=None, card_text=None,
+              card_usage=None):
+    """Stop hook: capture, enforce, then optionally write one session card.
+
+    The hook runner may pass the agent-authored short card through card_text
+    (for DSH Stop); a missing card never blocks the capture/enforce safety
+    path. The card itself is still subject to the normal length cap and
+    cost fuse, and any card failure is returned as a visible warning.
     """
     toplevel = _hook_active_toplevel(cwd)
     if toplevel is None:
@@ -1687,12 +1690,31 @@ def hook_stop(cwd, agent='claude-code', session=None):
                    'note': '当前目录不在 relay 项目里（没有 .project-relay/）'}
         return {'action': 'pass', 'note': skipped['note'],
                 'instruction': skipped['note'],
-                'capture': skipped,
+                'capture': skipped, 'card': skipped,
                 'enforce': {'action': 'pass', 'note': skipped['note']}}
     cap = hook_capture(cwd, agent, session=session)
     enf = hook_enforce(cwd, agent, session=session)
+    card = None
+    if card_text is not None:
+        try:
+            require(session, '会话卡需要 session；DSH Stop 钩子必须传入 session')
+            card = write_session_card(cwd, agent, session, 'session-end',
+                                      card_text, llm_usage=card_usage)
+        except Exception as exc:
+            card = {'error': repr(exc), 'stage': 'session-end'}
     return {'action': enf.get('action'), 'instruction': enf.get('instruction'),
-            'note': enf.get('note'), 'capture': cap, 'enforce': enf}
+            'note': enf.get('note'), 'capture': cap, 'enforce': enf,
+            'card': card}
+
+
+def hook_stage(cwd, agent, session, text, llm_usage=None):
+    """DSH stage hook: write one short milestone card without capture."""
+    toplevel = _hook_active_toplevel(cwd)
+    if toplevel is None:
+        return {'skipped': True, 'stage': 'milestone',
+                'note': '当前目录不在 relay 项目里（没有 .project-relay/），不写卡'}
+    return write_session_card(toplevel, agent, session, 'milestone', text,
+                              llm_usage=llm_usage)
 
 
 def _load_skill_text():

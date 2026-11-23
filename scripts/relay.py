@@ -1340,7 +1340,17 @@ def _parser():
     hk = sub.add_parser('hook')
     hksub = hk.add_subparsers(dest='hook_command', required=True)
     hksub.add_parser('resume')
-    hksub.add_parser('stop')
+    hs = hksub.add_parser('stop')
+    hs.add_argument('--agent', default='claude-code')
+    hs.add_argument('--session')
+    hs.add_argument('--card-file', help='DSH Stop 传入的 UTF-8 短卡正文')
+    hs.add_argument('--llm-usage', help='JSON：{"calls":n,"input_tokens":n,"output_tokens":n}')
+    hg = hksub.add_parser('stage')
+    hg.add_argument('--agent', required=True)
+    hg.add_argument('--session', required=True)
+    hg.add_argument('--file', required=True, help='UTF-8 短卡正文')
+    hg.add_argument('--llm-usage')
+
     r = sub.add_parser('recipe')
     rsub = r.add_subparsers(dest='recipe_command', required=True)
     ri = rsub.add_parser('install')
@@ -1701,12 +1711,52 @@ def main(argv=None):
                     r = flow.hook_resume(hook_root)
                     print(r['note'] if r.get('skipped') else
                           (r['message'] if r.get('no_archive') else flow.render_resume(r)))
+                elif a.hook_command == 'stage':
+                    text = None
+                    if a.file:
+                        try:
+                            text = Path(a.file).read_text(encoding='utf-8')
+                        except (OSError, UnicodeDecodeError) as exc:
+                            print('阶段卡读取失败，跳过写卡：%r' % (exc,), file=sys.stderr)
+                            return 0
+                    usage = None
+                    if a.llm_usage:
+                        try:
+                            usage = json.loads(a.llm_usage)
+                        except ValueError as exc:
+                            print('阶段卡 llm_usage 解析失败，改按估算成本：%r' % (exc,),
+                                  file=sys.stderr)
+                    r = flow.hook_stage(hook_root, a.agent, a.session, text, usage)
+                    if r.get('skipped'):
+                        print(r['note'])
+                    else:
+                        print('阶段卡：card-%04d（%s）' % (r['seq'], r['path']))
                 else:
-                    session = _session_from_stdin()
-                    r = flow.hook_stop(hook_root, agent='claude-code', session=session)
+                    session = a.session or _session_from_stdin()
+                    text = None
+                    if a.card_file:
+                        try:
+                            text = Path(a.card_file).read_text(encoding='utf-8')
+                        except (OSError, UnicodeDecodeError) as exc:
+                            # A bad card input must not take capture/enforce with it.
+                            print('会话卡读取失败，跳过写卡：%r' % (exc,), file=sys.stderr)
+                    usage = None
+                    if a.llm_usage:
+                        try:
+                            usage = json.loads(a.llm_usage)
+                        except ValueError as exc:
+                            print('llm_usage 解析失败，改按估算成本：%r' % (exc,),
+                                  file=sys.stderr)
+                    r = flow.hook_stop(hook_root, agent=a.agent, session=session,
+                                       card_text=text, card_usage=usage)
                     cap, enf = r['capture'], r['enforce']
                     print(cap['note'] if cap.get('skipped') else
                           '采集条目：cap-%04d（%s）' % (cap['seq'], cap.get('path', '')))
+                    if r.get('card'):
+                        if r['card'].get('error'):
+                            print('会话卡未写入：' + r['card']['error'], file=sys.stderr)
+                        elif not r['card'].get('skipped'):
+                            print('会话卡：card-%04d（%s）' % (r['card']['seq'], r['card']['path']))
                     msg = enf.get('instruction') or ('PASS：' + enf.get('note', ''))
                     if enf.get('action') == 'block':
                         print(msg, file=sys.stderr)

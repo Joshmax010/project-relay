@@ -321,3 +321,40 @@
 - 新增 `relay project adopt`：把已有 `.project-relay` 登记到本机定位缓存。
 - init 私有区提醒现在指向 `relay project move --to`。
 - 验证：`tests.test_v3_identity`：16 tests OK；全量 **262 tests OK**（442.910s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\project-identity-final-full-tests.log`）；`git diff --check` 通过。
+
+## 2026-11-21 · 第 10 轮（DSH Stop / 阶段钩子）
+
+### 范围
+
+- 基线：`session-cards@1e35dc7`（会话卡 PR #11 未合并，本轮以栈式分支开发）。
+- 给 DSH 的 Stop / 阶段钩子提供写卡入口，不改变 capture/enforce 既有行为。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| Stop 钩子 | `relay hook stop --agent deepseek-harness --session <会话> --card-file <短卡>`：先采集、再执法，最后写 `session-end` 卡；卡片失败只返回可见错误，不阻断采集/执法 |
+| 阶段钩子 | `relay hook stage --agent deepseek-harness --session <会话> --file <短卡>`：写 `milestone` 卡，不重复 capture |
+| 兼容 | 原 `hook stop` 仍默认 `claude-code`、不传卡片时行为不变；Claude 现有 hook recipe 不受影响 |
+| 文档 | README / SKILL / references 补 Stop/阶段钩子命令与失败语义 |
+| DSH 插件 | `dsh-plugin/project-relay-hooks`：监听 `workspace/session-stop` 和 `session/event`，自动调用 hook stop/stage；通过 Plugins > Add plugin 安装 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_dsh_hooks -v`：10 tests OK。
+- `python -m unittest tests.test_v3_dsh_hooks tests.test_v3_hooks_recipe tests.test_v3_session_cards -v`：56 tests OK。
+- 全量回归：**280 tests OK**（435.017s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-plugin-full-tests.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本 PR 交付 DSH hook 命令入口、DSH 插件包和测试；插件通过 DSH Plugins > Add plugin 安装后监听 Stop/阶段事件。
+- 卡片正文由调用方（DSH Stop/阶段事件）提供，不在 hook 内读取原始聊天。
+
+### PR12 复审修复（2026-11-23）
+
+- CLI `hook stop` 的 `--card-file` 读取失败或 `--llm-usage` 解析失败不再中断 capture/enforce；警告后继续。
+- CLI `hook stage` 同样兜底坏输入；失败只丢阶段卡。
+- SKILL 的 DSH 钩子说明补“接了 Stop 钩子就不用再手动 card/capture”。
+- 分支已 rebase 到 PR11 新 head `1f24906`。
+- 验证：`tests.test_v3_dsh_hooks`：9 tests OK；全量 **279 tests OK**（421.298s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-review-full-tests.log`）；`git diff --check` 通过。
