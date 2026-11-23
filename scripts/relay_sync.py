@@ -1936,6 +1936,7 @@ def merge_project(local_dir, incoming_files, source_info):
                 except (ValueError, UnicodeDecodeError, RelayError):
                     pass
         next_card_num = (max(used_card_nums) + 1) if used_card_nums else 1
+        accepted_card_events = {}
         for rel in sorted(incoming_files):
             if not _is_session_card_rel(rel) or not rel.startswith(card_prefix):
                 continue
@@ -1960,12 +1961,14 @@ def merge_project(local_dir, incoming_files, source_info):
             new_rel = '%scard-%04d.md' % (card_prefix, seq)
             event = header.get('event_id') or (
                 'legacy', header.get('session'), header.get('stage'))
-            if event in local_card_events:
+            prior = [str(p.relative_to(local_dir)).replace('\\', '/')
+                     for p in local_card_events.get(event, [])]
+            prior += accepted_card_events.get(event, [])
+            if prior:
                 conflicts.append({'file': new_rel,
                                   'rule': 'session-card-same-event-different-body',
                                   'event_id': header.get('event_id'),
-                                  'local': [str(p.relative_to(local_dir)).replace('\\', '/')
-                                            for p in local_card_events[event]],
+                                  'local': prior,
                                   'incoming': rel})
             if seq != header['seq']:
                 header = dict(header, seq=seq)
@@ -1976,6 +1979,7 @@ def merge_project(local_dir, incoming_files, source_info):
                 data = (json.dumps(header, ensure_ascii=False, sort_keys=True,
                                    indent=2) + BODY_DELIM + body).encode('utf-8')
             merged[new_rel] = data
+            accepted_card_events.setdefault(event, []).append(new_rel)
             local_card_hashes.add(_sha256(data))
             counts['files_added'] += 1
 

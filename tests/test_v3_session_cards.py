@@ -180,6 +180,62 @@ class TestSessionCards(V3Base):
         self.assertEqual((repo / 'SKILL.md').read_bytes(),
                          (repo / 'skills' / 'project-relay' / 'SKILL.md').read_bytes())
 
+    def test_body_redacted_to_empty_is_rejected_and_keeps_previous_card(self):
+        root = self.init()
+        first = flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        token = 'ghp_' + ('A' * 24)
+        with self.assertRaisesRegex(RelayError, '正文脱敏后为空'):
+            flow.write_session_card(root, 'codex', 's2', 'session-end', token)
+        cards = flow.list_session_cards(self.adir(root, 'codex'))
+        self.assertEqual(1, len(cards))
+        self.assertEqual(first['seq'], cards[0]['header']['seq'])
+        self.assertIn('只保存短卡', cards[0]['body'])
+
+    def test_incoming_package_with_two_same_event_cards_reports_conflict(self):
+        source = self.init('source')
+        info = flow.write_session_card(source, 'deepseek-harness', 's1', 'session-end', CARD)
+        raw = Path(info['path']).read_bytes()
+        head, body = raw.split(flow.BODY_DELIM.encode(), 1)
+        header = json.loads(head)
+        header['seq'] = 1
+        body2 = body.replace(b'v2', b'v3')
+        data2 = (json.dumps(header, ensure_ascii=False, sort_keys=True, indent=2)
+                 + flow.BODY_DELIM).encode('utf-8') + body2
+        local = self.init('local')
+        result = sync.merge_project(
+            self.store_dir(local),
+            {'agents/deepseek-harness/sessions/card-0001.md': raw,
+             'agents/deepseek-harness/sessions/card-0002.md': data2},
+            {'device': 'other'})
+        self.assertTrue(any(c.get('rule') == 'session-card-same-event-different-body'
+                            for c in result['conflicts']))
+        self.assertEqual(2, len(result['merged_files']))
+
+    def test_resume_cards_records_handoff_stats(self):
+        root = self.init()
+        flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        before = len(stats.handoff_rows(self.store_dir(root)))
+        flow.resume(root)
+        after = len(stats.handoff_rows(self.store_dir(root)))
+        self.assertEqual(before + 1, after)
+
+    def test_resume_cards_reads_latest_cards_once(self):
+        root = self.init()
+        flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        with mock.patch.object(flow, 'latest_session_cards',
+                               wraps=flow.latest_session_cards) as latest:
+            flow.resume(root)
+        self.assertEqual(1, latest.call_count)
+
+    def test_resume_cards_checks_manifest_and_warns(self):
+        root = self.init()
+        info = flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        path = Path(info['path'])
+        path.write_text(path.read_text(encoding='utf-8') + '\n被改动\n', encoding='utf-8')
+        result = flow.resume(root)
+        self.assertIn('档案完整性', result['banner'])
+        self.assertIn('card-0001.md', result['banner'])
+
     def test_cli_card_and_usage(self):
         root = self.init()
         semantic = Path(self.temp.name) / 'card.md'

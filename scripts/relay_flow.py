@@ -255,6 +255,7 @@ def write_session_card(toplevel, agent, session, stage, text, llm_usage=None):
     text, hits = redact(text)
     hits += session_hits
     require(session.strip(), '会话卡 session 脱敏后为空')
+    require(text.strip(), '会话卡正文脱敏后为空')
     require(len(text) <= cap, '会话卡脱敏后仍超过字符上限 %d' % cap)
     with relay.outer_lock(store_dir):
         if not adir.is_dir():
@@ -293,13 +294,16 @@ def write_session_card(toplevel, agent, session, stage, text, llm_usage=None):
             'month_llm_tokens': fuse.get('month_llm_tokens', 0)}
 
 
-def render_session_cards_section(store_dir, agents, cfg, budget_tokens=None):
+def render_session_cards_section(store_dir, agents, cfg, budget_tokens=None,
+                                 cards=None):
     """Bounded resume section: latest card per agent, whole cards only.
 
     The caller's token budget is a hard cap for the rendered card text;
     cards that do not fit are counted, never truncated mid-sentence.
+    A caller that already loaded the latest cards passes them in.
     """
-    cards = latest_session_cards(store_dir, agents)
+    if cards is None:
+        cards = latest_session_cards(store_dir, agents)
     lines = ['会话卡', '只读每家最新短卡；不读取原始聊天，不用它自动裁决冲突。']
     if not cards:
         lines.append('暂无会话卡。')
@@ -345,10 +349,12 @@ def render_cost_section(fuse):
                '已触发' if fuse.get('tripped') else '未触发'))
 
 
-def session_card_cross_check(store_dir, agents):
+def session_card_cross_check(store_dir, agents, cards=None):
     """Compare only the latest cards; never read memory or raw entries."""
+    if cards is None:
+        cards = latest_session_cards(store_dir, agents)
     facts = {}
-    for card in latest_session_cards(store_dir, agents):
+    for card in cards:
         h = card['header']
         source = '%s（card-%04d）' % (h.get('agent'), h.get('seq', 0))
         facts[source] = _session_card_facts(card)
@@ -362,7 +368,12 @@ def session_card_cross_check(store_dir, agents):
 
 
 def resume_cards(toplevel):
-    """Strictly read-only takeover: latest cards, their conflicts, and cost."""
+    """Card takeover: latest cards, conflicts, cost, and one stats row.
+
+    The card body is read-only. Like _resume_full's bounded state.md
+    recompute, this path writes one handoff stats row; stats failures are
+    best-effort and never block the takeover itself.
+    """
     toplevel = relay.git_toplevel(toplevel)
     if not _store_exists(toplevel):
         return {'no_archive': True, 'mode': 'cards', 'sections': [],
@@ -371,19 +382,39 @@ def resume_cards(toplevel):
     store_dir = relay.resolve_store_dir(toplevel)
     cfg = load_config(store_dir)
     agents = list(relay.list_agents(store_dir))
-    cross = session_card_cross_check(store_dir, agents)
+    cards = latest_session_cards(store_dir, agents)
+    cross = session_card_cross_check(store_dir, agents, cards=cards)
     stats = _stats_module()
     fuse = _record_stats_safe(stats.compute_fuse, store_dir) or {}
+    _present, manifest_mismatches = relay.verify_checksum_manifest(store_dir)
     banner = None
+    if manifest_mismatches:
+        banner = ('【档案完整性】校验清单不符（可能被截断或冲突副本污染）：%s；'
+                  '先核对或从其他设备/最近导出包恢复，不要直接相信这份交接。'
+                  % '、'.join(m['file'] for m in manifest_mismatches))
     if fuse.get('cap_alert'):
-        banner = ('【月度软上限】本月 LLM 已记录 %d tokens，超过上限 %d；'
-                  '请检查成本，但不会仅因此熔断。'
-                  % (fuse.get('month_llm_tokens', 0), fuse.get('monthly_cap')))
+        cap_banner = ('【月度软上限】本月 LLM 已记录 %d tokens，超过上限 %d；'
+                      '请检查成本，但不会仅因此熔断。'
+                      % (fuse.get('month_llm_tokens', 0), fuse.get('monthly_cap')))
+        banner = cap_banner + ('\n' + banner if banner else '')
+    cards_section = render_session_cards_section(store_dir, agents, cfg, cards=cards)
+    cost_section = render_cost_section(fuse)
+    cross_section = render_cross_section(cross)
+    full_text = cards_section + '\n\n' + cost_section + '\n\n' + cross_section
+    layers = {'index': estimate_tokens(cards_section),
+              'timeline': estimate_tokens(cost_section),
+              'full': estimate_tokens(cross_section),
+              'total': estimate_tokens(full_text)}
+    _prev = _record_stats_safe(stats.latest_summarize_row, store_dir)
+    _record_stats_safe(stats.record_handoff, store_dir, layers,
+                       {'changed_files': 0, 'missing_files': 0,
+                        'branch_mismatch': 0, 'staged_mismatches': 0,
+                        'manifest_mismatches': len(manifest_mismatches)},
+                       prev_summarize_llm_tokens=(_prev or {}).get('llm_tokens', 0))
     return {'no_archive': False, 'mode': 'cards', 'sections': [],
-            'cards_section': render_session_cards_section(store_dir, agents, cfg),
-            'cross': cross, 'cross_section': render_cross_section(cross),
-            'cost_section': render_cost_section(fuse), 'fuse': fuse,
-            'banner': banner}
+            'cards_section': cards_section, 'cross': cross,
+            'cross_section': cross_section, 'cost_section': cost_section,
+            'fuse': fuse, 'banner': banner}
 
 
 def cross_agent_check(store_dir, agents=None):
@@ -3199,8 +3230,10 @@ def inject(toplevel, budget=None, agent=None, full=False):
         cfg = load_config(store_dir)
         budget = cfg['inject_budget_tokens'] if budget is None else budget
         agents = [agent] if agent else list(relay.list_agents(store_dir))
-        cards = render_session_cards_section(store_dir, agents, cfg, budget)
-        cross = session_card_cross_check(store_dir, agents)
+        latest = latest_session_cards(store_dir, agents)
+        cards = render_session_cards_section(store_dir, agents, cfg, budget,
+                                             cards=latest)
+        cross = session_card_cross_check(store_dir, agents, cards=latest)
         text = _trim_to_token_budget(
             cards + '\n\n' + render_cross_section(cross), budget)
         return {'text': text, 'tokens_estimate': estimate_tokens(text),

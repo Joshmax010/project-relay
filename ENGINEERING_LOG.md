@@ -266,3 +266,12 @@
 - Claude / Codex 安装说明补 `relay card` 步骤，和默认 resume 读卡对齐。
 - `RELAY_SKILL_TEXT` 读取根目录 SKILL.md 时增加缺失回退；新增 SKILL 两份逐字节一致测试。
 - 验证：`python -m unittest tests.test_v3_session_cards -v`：19 tests OK；全量 **265 tests OK**（344.462s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review-full-tests.log`）；`git diff --check` 通过。
+
+### 第二轮复审修复（2026-11-22）
+
+- 正文脱敏后为空也拒写：全密钥形状的卡正文不会生成新卡、不会顶掉上一张有效卡。
+- 导入包内部两张同 event_id、不同正文的卡也会记为 `session-card-same-event-different-body` 冲突，两张都保留。
+- 默认 `resume_cards` 也记一笔 handoff 统计；统计失败不阻断接手。
+- `resume_cards` / `inject` 只解析一次 `latest_session_cards`，cross check 与渲染共用。
+- `resume_cards` 增加 checksum-manifest 校验；卡被改过时挂【档案完整性】提示。
+- 验证：`tests.test_v3_session_cards`：24 tests OK；全量 **270 tests OK**（377.803s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review2-full-tests.log`）；`git diff --check` 通过。
