@@ -125,6 +125,36 @@ class TestProjectIdentity(V3Base):
         # locate must not crash on a non-numeric version and must substring-match.
         self.assertEqual('p1', relay.locate_projects('alp')[0]['project_id'])
 
+    def test_move_project_keeps_project_id_and_updates_registry(self):
+        root = self.init('move-src')
+        project_id = json.loads((self.store_dir(root) / 'project.json').read_text(encoding='utf-8'))['project_id']
+        dest = Path(self.temp.name) / 'moved-project'
+        info = relay.move_project(root, dest)
+        self.assertEqual(project_id, info['project']['project_id'])
+        self.assertFalse(root.exists())
+        self.assertTrue((dest / '.project-relay' / 'project.json').is_file())
+        self.assertEqual(project_id, json.loads((dest / '.project-relay' / 'project.json').read_text(encoding='utf-8'))['project_id'])
+        rows = relay.locate_projects('moved-project')
+        self.assertTrue(any(row['project_id'] == project_id and Path(row['path']).resolve() == dest.resolve()
+                            for row in rows))
+
+    def test_move_project_refuses_existing_destination(self):
+        root = self.init('move-guard')
+        dest = Path(self.temp.name) / 'occupied'
+        dest.mkdir()
+        with self.assertRaises(relay.RelayError):
+            relay.move_project(root, dest)
+
+    def test_adopt_project_registers_existing_identity(self):
+        root = self.init('adopt-me')
+        project_id = json.loads((self.store_dir(root) / 'project.json').read_text(encoding='utf-8'))['project_id']
+        relay.unregister_project_path(root)
+        self.assertEqual([], [row for row in relay.locate_projects('adopt-me')
+                             if row['project_id'] == project_id])
+        info = relay.adopt_project(root)
+        self.assertEqual(project_id, info['project']['project_id'])
+        self.assertTrue(any(row['project_id'] == project_id for row in relay.locate_projects('adopt-me')))
+
     def test_private_root_warning_has_migration_hint(self):
         base = Path(self.temp.name) / '.dsh' / 'proj'
         base.mkdir(parents=True)

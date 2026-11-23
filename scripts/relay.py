@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -371,6 +372,54 @@ def _open_command(path, shell='auto'):
     return 'cd /d "%s"' % text.replace('%', '%%')
 
 
+def unregister_project_path(root, project_id=None):
+    """Remove one project row from the machine-local locator cache."""
+    root = Path(root).resolve()
+    with _StoreLock(registry_path().with_suffix('.lock')):
+        data = read_registry()
+        for pid, old in list(data['projects'].items()):
+            if pid == project_id or (isinstance(old, dict) and
+                                     Path(str(old.get('path', ''))).expanduser().resolve() == root):
+                data['projects'].pop(pid, None)
+        save_registry(data)
+
+
+def adopt_project(toplevel):
+    """Register an existing .project-relay archive without changing its ID."""
+    root = Path(main_worktree(toplevel)).resolve()
+    store_dir = root / STORE_DIRNAME
+    require(store_dir.is_dir(), '项目尚未建仓：' + str(store_dir))
+    project = ensure_project_file(store_dir, root)
+    register_project(root, store_dir, project)
+    return {'root': str(root), 'project': project}
+
+
+def move_project(toplevel, destination):
+    """Move a project directory and keep its project_id stable.
+
+    destination is the exact new project directory. A move across devices
+    uses shutil.move; a normal rename is used within one device.
+    """
+    root = Path(main_worktree(toplevel)).resolve()
+    dest = Path(destination).expanduser()
+    if not dest.is_absolute():
+        dest = (Path.cwd() / dest).resolve()
+    require(dest != root, '目标目录不能是项目根本身')
+    require(not dest.exists(), '目标目录已存在：' + str(dest))
+    try:
+        root.relative_to(dest)
+        require(False, '目标目录不能位于项目内部')
+    except ValueError:
+        pass
+    old_root = root
+    shutil.move(str(root), str(dest))
+    store_dir = dest / STORE_DIRNAME
+    project = ensure_project_file(store_dir, dest)
+    unregister_project_path(old_root)
+    register_project(dest, store_dir, project)
+    return {'from': str(old_root), 'to': str(dest), 'project': project}
+
+
 def private_agent_root(root):
     """Return the Agent-private home containing root, when applicable."""
     root = Path(root).resolve()
@@ -394,8 +443,9 @@ def project_root_warning(root):
     if not private:
         return None
     suggested = Path.home() / 'Projects' / Path(root).name
-    return ('项目根位于 Agent 私有区 %s；建议迁移到用户项目区，例如 %s，'
-            '再重新运行 relay init/import-zip' % (private, suggested))
+    return ('项目根位于 Agent 私有区 %s；建议迁移到用户项目区，例如 %s；'
+            '可用 relay project move --to <目标目录> 迁移。'
+            % (private, suggested))
 
 
 def locate_projects(name=None):
@@ -1216,6 +1266,11 @@ def _parser():
     op.add_argument('name')
     op.add_argument('--shell', choices=['auto', 'posix', 'powershell', 'cmd'],
                     default='auto')
+    prj = sub.add_parser('project', help='项目归属与迁移')
+    prjsub = prj.add_subparsers(dest='project_command', required=True)
+    pm = prjsub.add_parser('move', help='移动项目目录并保留 project_id')
+    pm.add_argument('--to', required=True, help='新的项目目录（精确路径）')
+    prjsub.add_parser('adopt', help='把已有 .project-relay 登记到本机定位缓存')
     sub.add_parser('agents')
     g = sub.add_parser('goal')
     gsub = g.add_subparsers(dest='goal_command', required=True)
@@ -1346,6 +1401,15 @@ def main(argv=None):
             if result.get('warning'):
                 print('提醒：' + result['warning'])
             print('下一步：用 goal draft 提交目标草案，再用 goal show 查看 diff、goal confirm 确认')
+        elif a.command == 'project':
+            if a.project_command == 'move':
+                info = move_project(a.root, a.to)
+                print('项目已迁移：%s -> %s' % (info['from'], info['to']))
+                print('project_id：' + info['project']['project_id'])
+            else:
+                info = adopt_project(a.root)
+                print('项目已登记：' + info['root'])
+                print('project_id：' + info['project']['project_id'])
         elif a.command == 'locate':
             rows = locate_projects(a.name)
             if a.json:

@@ -122,6 +122,7 @@ description: 让 Agent 住进 Git 代码项目里：项目是宿主，Agent 是�
 
 - `relay init`：建 `.project-relay/`，写 `project.json` 和本机定位缓存
 - `relay locate [--name]` / `relay open <name> [--shell posix|powershell|cmd]`：查/打开本机项目
+- `relay project move --to <新目录>` / `relay project adopt`：迁移/登记已有项目
 - `relay resume` / `relay capture` / `relay summarize` / `relay scales`
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`
