@@ -106,8 +106,8 @@ class V3Base(unittest.TestCase):
     def summarize(self, root, agent='codex', **kw):
         return flow.summarize(root, agent, **kw)
 
-    def resume(self, root):
-        return flow.resume(root)
+    def resume(self, root, full=True):
+        return flow.resume(root, full=full)
 
     def resume_text(self, root):
         return flow.render_resume(self.resume(root))

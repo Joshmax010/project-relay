@@ -229,6 +229,53 @@
 - 分叉链包格式不变；只是损坏数据不再阻断 resume。
 - 下一轮继续审计 CLI 错误路径与统计/分叉的剩余边界。
 
+## 2026-11-20 · 第 9 轮（会话卡）
+
+### 范围
+
+- 基线：`main@7be4240`（目标落档与定位文档已提交）。
+- 实现「项目是宿主、Agent 是住户」的会话卡：会话结束和阶段节点写短卡，默认 resume 只读卡，冲突只标 `[待用户确认]`。
+
+### 已实现
+
+| 项 | 说明 |
+|---|---|
+| 会话卡写入 | `relay card --agent ... --session ... --stage session-end|milestone --file ...`；默认 3000 字符上限，超长拒写，脱敏后校验；不读 raw 条目、不做后台监听 |
+| 默认接手 | `relay resume` 只读每家最新短卡并显示成本；旧五段对账保留为 `relay resume --full`（会补汇总、写 state.md） |
+| 冲突处理 | 同一事实跨卡/记忆不一致时并列显示并标 `[待用户确认]`，不自动选边；同会话同阶段的分叉卡双方保留 |
+| 成本 | 会话卡 LLM 成本进入同一周熔断与月度软上限；resume 显示本月用量/上限；周熔断时停写卡，月度上限只告警 |
+| ZIP | 会话卡作为 payload 进入导出；导入按内容并集，同事件不同内容保留双方，不覆盖 |
+
+### 验证
+
+- `python -m unittest tests.test_v3_session_cards -v`：14 tests OK。
+- `python -m unittest discover -s tests -v`：260 tests OK（382.242s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-full-tests-final.log`）。
+- `git diff --check`：通过。
+
+### 说明与后续
+
+- 本项目 `.project-relay/state/config.json` 已设 `monthly_llm_token_cap = 200000`，resume 成本段会显示；默认未配置项目仍为 None（只统计不告警）。
+- 下一步：接入 DSH 的 Stop/阶段钩子自动写卡；再统一 README/SKILL 与 references 的旧五段说明。
+
+### 复审修复（2026-11-21）
+
+- 里程碑卡分组改按 `event_id`：同一会话的旧 milestone 不再进入 resume / 对账；只有同 event_id 的导入分叉副本双方保留。
+- `inject --budget N`：卡片与跨 Agent 核对合计后按总 token 预算截断，输出不超过 N。
+- `llm_usage`：calls / input_tokens / output_tokens 三字段缺一不可，缺失或非法直接拒写，不再标成「已实测」。
+- 卡头 `session` 也走脱敏；纯密钥形式的 session 脱敏为空时拒写。
+- Claude / Codex 安装说明补 `relay card` 步骤，和默认 resume 读卡对齐。
+- `RELAY_SKILL_TEXT` 读取根目录 SKILL.md 时增加缺失回退；新增 SKILL 两份逐字节一致测试。
+- 验证：`python -m unittest tests.test_v3_session_cards -v`：19 tests OK；全量 **265 tests OK**（344.462s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review-full-tests.log`）；`git diff --check` 通过。
+
+### 第二轮复审修复（2026-11-22）
+
+- 正文脱敏后为空也拒写：全密钥形状的卡正文不会生成新卡、不会顶掉上一张有效卡。
+- 导入包内部两张同 event_id、不同正文的卡也会记为 `session-card-same-event-different-body` 冲突，两张都保留。
+- 默认 `resume_cards` 也记一笔 handoff 统计；统计失败不阻断接手。
+- `resume_cards` / `inject` 只解析一次 `latest_session_cards`，cross check 与渲染共用。
+- `resume_cards` 增加 checksum-manifest 校验；卡被改过时挂【档案完整性】提示。
+- 验证：`tests.test_v3_session_cards`：24 tests OK；全量 **270 tests OK**（377.803s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\session-cards-review2-full-tests.log`）；`git diff --check` 通过。
+
 ## 2026-11-21 · 项目身份证与定位
 
 ### 范围

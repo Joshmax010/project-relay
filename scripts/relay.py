@@ -189,6 +189,7 @@ ROLLBACK_TRASH_PREFIX = 'archive/rollback-trash/'
 # resume 就会误报“档案被损坏/截断”。relay_sync 复用同一组定义，避免
 # “打包排除”与“校验排除”两套标准漂移。
 LOCAL_ONLY_OUTER = frozenset({
+    'registry.json',
     'config.json',
     'state/config.json',
     'state/fingerprint-cache.json',
@@ -306,6 +307,18 @@ def save_registry(data):
 
 
 def ensure_project_file(store_dir, root):
+    """Create/repair <store>/project.json under the registry lock.
+
+    Minting the ID and registering it must not interleave with another
+    init: the read-check-write here runs under the same machine-local
+    lock register_project uses, so two concurrent inits on one fresh
+    project converge on a single project_id.
+    """
+    with _StoreLock(registry_path().with_suffix('.lock')):
+        return _ensure_project_file_unlocked(store_dir, root)
+
+
+def _ensure_project_file_unlocked(store_dir, root):
     """Create/repair <store>/project.json; never stores an absolute root."""
     path = project_file_path(store_dir)
     current = {}
@@ -368,8 +381,10 @@ def _open_command(path, shell='auto'):
         return 'cd ' + shlex.quote(text)
     if shell == 'powershell':
         return "cd '" + text.replace("'", "''") + "'"
-    # CMD: double-quoted path; percent expansion is the only extra escape.
-    return 'cd /d "%s"' % text.replace('%', '%%')
+    # CMD: the printed line is pasted into an interactive prompt, so the
+    # path goes in double quotes as-is; %% is batch-file syntax and would
+    # point the command at a different (wrong) path here.
+    return 'cd /d "%s"' % text
 
 
 def unregister_project_path(root, project_id=None):
@@ -1311,6 +1326,12 @@ def _parser():
     cap.add_argument('--agent', required=True, help='采集进哪家目录，如 deepseek-harness')
     cap.add_argument('--session')
     cap.add_argument('--message')
+    card = sub.add_parser('card', help='在会话结束或阶段节点写一张短会话卡')
+    card.add_argument('--agent', required=True)
+    card.add_argument('--session', required=True)
+    card.add_argument('--stage', required=True, choices=['session-end', 'milestone'])
+    card.add_argument('--file', required=True, help='UTF-8 短卡正文，不读取原始聊天')
+    card.add_argument('--llm-usage', help='JSON：{"calls":n,"input_tokens":n,"output_tokens":n}')
     q = sub.add_parser('queue')
     q.add_argument('--agent', help='只看某家，不给则看全部')
     enf = sub.add_parser('enforce')
@@ -1352,8 +1373,11 @@ def _parser():
     rc.add_argument('--agent', required=True)
     inj = sub.add_parser('inject')
     inj.add_argument('--budget', type=int)
-    inj.add_argument('--agent', help='同时带上某家的待办与决定，不给则只用外层')
-    sub.add_parser('resume')
+    inj.add_argument('--agent', help='只看某家会话卡；--full 时同时带其待办与决定')
+    inj.add_argument('--full', action='store_true', help='旧全档案注入')
+    res = sub.add_parser('resume')
+    res.add_argument('--full', action='store_true',
+                     help='旧五段接手：读全档案、Git 对账并补汇总（会写入）')
     wk = sub.add_parser('work', help='多 Agent 的分支与工作树事务层')
     wksub = wk.add_subparsers(dest='work_command', required=True)
     for name in ('enter', 'status', 'review', 'merge'):
@@ -1614,7 +1638,7 @@ def main(argv=None):
                 print(work.render_merge(work.merge(a.root, agent=a.agent,
                                                    branch=a.branch, base=a.base,
                                                    confirm=a.confirm)))
-        elif a.command in ('capture', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
+        elif a.command in ('capture', 'card', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
                            'inject', 'resume'):
             _fspec = importlib.util.spec_from_file_location(
@@ -1622,7 +1646,18 @@ def main(argv=None):
             flow = importlib.util.module_from_spec(_fspec)
             _fspec.loader.exec_module(flow)
             root = a.root
-            if a.command == 'capture':
+            if a.command == 'card':
+                card_text = Path(a.file).read_text(encoding='utf-8')
+                usage = json.loads(a.llm_usage) if a.llm_usage else None
+                info = flow.write_session_card(
+                    root, agent=a.agent, session=a.session, stage=a.stage,
+                    text=card_text, llm_usage=usage)
+                print('会话卡：card-%04d（%s）' % (info['seq'], info['path']))
+                print('正文字符：%d / %d；本月 LLM 已记录：%d tokens；月度上限：%s'
+                      % (info['semantic_chars'], info['char_cap'],
+                         info['month_llm_tokens'],
+                         '未设置' if info['monthly_cap'] is None else info['monthly_cap']))
+            elif a.command == 'capture':
                 info = flow.capture(root, agent=a.agent, session=a.session,
                                     message=a.message)
                 if info.get('deduped'):
@@ -1743,11 +1778,11 @@ def main(argv=None):
                          info.get('last_summary_seq'),
                          info.get('entries_reverted_to_pending')))
             elif a.command == 'inject':
-                info = flow.inject(root, budget=a.budget, agent=a.agent)
+                info = flow.inject(root, budget=a.budget, agent=a.agent, full=a.full)
                 print(info['text'])
                 print('\n[注入 token 粗估：%d / 预算 %d]' % (info['tokens_estimate'], info['budget']))
             elif a.command == 'resume':
-                result = flow.resume(root)
+                result = flow.resume(root, full=a.full)
                 if result.get('no_archive'):
                     print(result['message'])
                 else:
