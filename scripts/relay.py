@@ -380,7 +380,8 @@ def _open_command(path, shell='auto'):
     if shell == 'posix':
         return 'cd ' + shlex.quote(text)
     if shell == 'powershell':
-        return "cd '" + text.replace("'", "''") + "'"
+        # Set-Location -Path interprets [ ] and wildcards; use -LiteralPath.
+        return "Set-Location -LiteralPath '" + text.replace("'", "''") + "'"
     # CMD: the printed line is pasted into an interactive prompt, so the
     # path goes in double quotes as-is; %% is batch-file syntax and would
     # point the command at a different (wrong) path here.
@@ -404,6 +405,7 @@ def adopt_project(toplevel):
     root = Path(main_worktree(toplevel)).resolve()
     store_dir = root / STORE_DIRNAME
     require(store_dir.is_dir(), '项目尚未建仓：' + str(store_dir))
+    _reject_store_symlinks(store_dir)
     project = ensure_project_file(store_dir, root)
     register_project(root, store_dir, project)
     return {'root': str(root), 'project': project}
@@ -426,6 +428,9 @@ def move_project(toplevel, destination):
         require(False, '目标目录不能位于项目内部')
     except ValueError:
         pass
+    source_store = root / STORE_DIRNAME
+    if source_store.exists() or source_store.is_symlink():
+        _reject_store_symlinks(source_store)
     dest.parent.mkdir(parents=True, exist_ok=True)
     old_root = root
     old_cwd = Path.cwd()
@@ -443,6 +448,7 @@ def move_project(toplevel, destination):
             except OSError:
                 pass
     store_dir = dest / STORE_DIRNAME
+    _reject_store_symlinks(store_dir)
     project = ensure_project_file(store_dir, dest)
     unregister_project_path(old_root)
     register_project(dest, store_dir, project)

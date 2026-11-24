@@ -22,8 +22,10 @@ tests below used to assert as actual behaviour --
 import json
 import shutil
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from v3_helpers import V3Base, relay, flow
@@ -340,6 +342,21 @@ class TestPackageWorkbuddy(V3Base):
         self.assertIn('name: project-relay', skill)
         self.assertIn('description:', skill)
         self.assertIn('agent_created: true', skill)
+
+
+class TestSkillTextFallback(V3Base):
+    def test_packaged_skill_text_is_used_without_repo_skill_md(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_root = root / 'data'
+            packaged = data_root / 'share' / 'project-relay' / 'SKILL.md'
+            packaged.parent.mkdir(parents=True)
+            packaged.write_text('# Packaged Skill\n', encoding='utf-8')
+            fake_flow = root / 'site-packages' / 'scripts' / 'relay_flow.py'
+            fake_flow.parent.mkdir(parents=True)
+            with mock.patch.object(flow, '__file__', str(fake_flow)), \
+                    mock.patch.object(flow.sysconfig, 'get_path', return_value=str(data_root)):
+                self.assertEqual('# Packaged Skill\n', flow._load_skill_text())
 
 
 if __name__ == '__main__':
