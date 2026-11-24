@@ -108,7 +108,7 @@ python scripts/relay.py --root <项目根> recipe install --tool deepseek-harnes
 
 ```bash
 # 旧设备
-python3 scripts/relay.py export-zip --zip <文件.zip>
+python3 scripts/relay.py export-zip              # 默认输出到项目根
 # 新设备解开后
 python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```
@@ -144,7 +144,7 @@ python3 scripts/relay.py work enter      # 进入 Agent 分支/工作树
 python3 scripts/relay.py work status     # 看各工作树
 python3 scripts/relay.py work review     # 看待合并改动
 python3 scripts/relay.py work merge --confirm  # 用户批准后合并
-python3 scripts/relay.py export-zip --zip <文件.zip>
+python3 scripts/relay.py export-zip              # 默认输出到项目根
 python3 scripts/relay.py import-zip --zip <文件.zip> --confirm
 ```
 

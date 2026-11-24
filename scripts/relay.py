@@ -1409,7 +1409,7 @@ def _parser():
     # its RelayError is the same class main() catches, since the sibling
     # modules share one process-wide relay copy.
     ez = sub.add_parser('export-zip')
-    ez.add_argument('--zip', required=True)
+    ez.add_argument('--zip', help='输出 zip；默认 <项目根>/<项目名>-project-relay-<时间>.zip')
     ez.add_argument('--strict', action='store_true',
                     help='导出质量缺口为阻断级时直接失败，不产出包')
     iz = sub.add_parser('import-zip')

@@ -358,3 +358,10 @@
 - SKILL 的 DSH 钩子说明补“接了 Stop 钩子就不用再手动 card/capture”。
 - 分支已 rebase 到 PR11 新 head `1f24906`。
 - 验证：`tests.test_v3_dsh_hooks`：9 tests OK；全量 **279 tests OK**（421.298s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-review-full-tests.log`）；`git diff --check` 通过。
+
+### 自动交接（2026-11-24）
+
+- `relay export-zip` 的 `--zip` 改为可选；不传时自动生成 `<项目根>/<项目名>-project-relay-<时间>.zip`，默认落在项目根。
+- `import-zip` 落盘后无论新/旧档案都登记本机定位缓存；fresh import 仍采用包内 project_id。
+- 新增默认导出路径、fresh import 注册、existing import 注册测试。
+- 验证：`tests.test_v3_handoff_auto`：3 tests OK；全量 **303 tests OK**（398.058s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\auto-handoff-full-tests.log`）；`git diff --check` 通过。

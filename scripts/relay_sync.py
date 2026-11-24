@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -1341,7 +1342,15 @@ def export_bundle(store_dir, dest_dir, device_name, device_id, strict=False):
     return manifest
 
 
-def export_zip(toplevel, zip_path, device_name=None, device_id=None,
+def default_export_zip_path(toplevel):
+    """Default handoff filename in the project root: one project, one zip."""
+    root = Path(relay.main_worktree(toplevel)).resolve()
+    slug = relay.slug_for(root.name)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    return root / ('%s-project-relay-%s.zip' % (slug, stamp))
+
+
+def export_zip(toplevel, zip_path=None, device_name=None, device_id=None,
                strict=False):
     """Manual zip carrier, export half: build a 2.0 bundle for the project
     at toplevel and pack it into a zip file.
@@ -1354,6 +1363,8 @@ def export_zip(toplevel, zip_path, device_name=None, device_id=None,
     """
     toplevel = Path(toplevel)
     store_dir = relay.resolve_store_dir(toplevel)
+    if zip_path is None:
+        zip_path = default_export_zip_path(toplevel)
     zip_path = Path(zip_path)
     require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
     name, did = _zip_device(device_name, device_id)
@@ -2533,11 +2544,11 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             landed = _land_project(store_dir, merge_result, source_info,
                                    marker_files=marker_files,
                                    quarantined=merge_result['quarantined'])
-            if fresh_store:
-                # The import may have adopted an identity during merge;
-                # refresh the locator row so the old placeholder ID is gone.
-                project = relay.ensure_project_file(store_dir, toplevel)
-                relay.register_project(toplevel, store_dir, project)
+            # Register both fresh and existing imports: import-zip is a
+            # locator event, and a fresh store's placeholder ID is replaced
+            # by the adopted archive identity here.
+            project = relay.ensure_project_file(store_dir, toplevel)
+            relay.register_project(toplevel, store_dir, project)
             entry['merge_log'] = landed['merge_log']
             entry['quarantined_files'] = landed['quarantined_files']
             merge_logs.append(landed['merge_log'])
