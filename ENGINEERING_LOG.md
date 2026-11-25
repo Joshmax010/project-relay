@@ -365,3 +365,11 @@
 - `session/disposed` 改为独立 `ctx.on` 清理 `counts` / `lastText`，不再放在 `session/event` 里。
 - 新增 Node 事件形状测试：真实 `{agent:{id,session:{id,header:{cwd}}},turn,signal}` 断言触发 hook stop；空会话只警告不崩。
 - 验证：`tests.test_dsh_plugin` 1 test OK；全量 **301 tests OK**（421.049s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\pr12-plugin-followup-full-tests.log`）；`git diff --check` 通过。
+### PR13 落地后清理（2026-11-24）
+
+- 坏卡容错：`list_session_cards` 跳过损坏卡并收集错误，`resume_cards` 在完整性横幅列出，不再因一张坏卡崩掉接手。
+- `adopt_project` / `move_project` 在 `ensure_project_file` 前调用 `_reject_store_symlinks`，防止符号链接档案目录写到仓库外。
+- PowerShell `relay open` 改用 `Set-Location -LiteralPath`，方括号路径不再被当通配符。
+- `pyproject.toml` data-files 增加 `share/project-relay/SKILL.md`，`_load_skill_text` 增加 pip 安装位置回退；新增 packaged-layout 测试。
+- 新增坏卡、PowerShell 方括号、packaged SKILL 回退测试；符号链接测试在本机因缺少权限跳过。
+- 验证：全量 **304 tests OK**（424.756s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\pr13-cleanup-full-tests.log`）；`git diff --check` 通过。

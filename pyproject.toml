@@ -36,6 +36,7 @@ py-modules = [
 # under <prefix>/share/project-relay/template-v2; relay.py falls back to
 # that path when the repo checkout is not around the installed module.
 [tool.setuptools.data-files]
+"share/project-relay" = ["SKILL.md"]
 "share/project-relay/template-v2" = [
     "assets/template-v2/agent-goal.md",
     "assets/template-v2/backlog.md",

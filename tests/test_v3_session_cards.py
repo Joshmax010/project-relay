@@ -248,6 +248,16 @@ class TestSessionCards(V3Base):
             flow.resume(root)
         self.assertEqual(1, latest.call_count)
 
+    def test_corrupt_card_warns_instead_of_crashing_resume(self):
+        root = self.init()
+        flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)
+        bad = self.adir(root, 'codex') / 'sessions' / 'card-9999.md'
+        bad.write_text('truncated', encoding='utf-8')
+        result = flow.resume(root)
+        self.assertIn('档案完整性', result['banner'])
+        self.assertIn('card-9999.md', result['banner'])
+        self.assertIn('会话卡', result['cards_section'])
+
     def test_resume_cards_checks_manifest_and_warns(self):
         root = self.init()
         info = flow.write_session_card(root, 'codex', 's1', 'session-end', CARD)

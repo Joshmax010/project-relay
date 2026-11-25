@@ -41,7 +41,7 @@ class TestProjectIdentity(V3Base):
         self.assertIn(str(root.resolve()), out)
         code, out = self.cli('open', 'proj', '--shell', 'powershell')
         self.assertEqual(0, code, out)
-        self.assertIn("cd '", out)
+        self.assertIn("Set-Location -LiteralPath '", out)
 
     def test_project_json_is_payload(self):
         root = self.init()
@@ -159,6 +159,28 @@ class TestProjectIdentity(V3Base):
         info = relay.adopt_project(root)
         self.assertEqual(project_id, info['project']['project_id'])
         self.assertTrue(any(row['project_id'] == project_id for row in relay.locate_projects('adopt-me')))
+
+    def test_powershell_open_uses_literal_path_for_brackets(self):
+        root = self.init('proj-[ab]')
+        code, out = self.cli('open', 'proj-[ab]', '--shell', 'powershell')
+        self.assertEqual(0, code, out)
+        self.assertIn('Set-Location -LiteralPath', out)
+        self.assertIn('[ab]', out)
+
+    def test_adopt_and_move_reject_symlink_store(self):
+        outside = Path(self.temp.name) / 'outside-store'
+        outside.mkdir()
+        for name in ('adopt-symlink', 'move-symlink'):
+            root = self.make_repo(name)
+            link = root / '.project-relay'
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest('symlinks not available on this host')
+            with self.assertRaises(relay.RelayError):
+                relay.adopt_project(root)
+            with self.assertRaises(relay.RelayError):
+                relay.move_project(root, Path(self.temp.name) / (name + '-moved'))
 
     def test_private_root_warning_has_migration_hint(self):
         base = Path(self.temp.name) / '.dsh' / 'proj'

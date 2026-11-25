@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 import uuid
@@ -188,18 +189,26 @@ def _parse_session_card(path):
     return {'header': header, 'body': body, 'path': Path(path)}
 
 
-def list_session_cards(adir):
-    """All session cards for one agent, ordered by their local sequence."""
+def list_session_cards(adir, errors=None):
+    """All readable session cards for one agent, ordered by local sequence.
+
+    Corrupt/truncated cards are skipped and collected in errors; one bad
+    file must not take down the whole takeover.
+    """
     out = []
     directory = _sessions_dir(adir)
     if directory.exists():
         for path in sorted(directory.glob('card-*.md')):
-            out.append(_parse_session_card(path))
+            try:
+                out.append(_parse_session_card(path))
+            except (OSError, ValueError, UnicodeDecodeError, RelayError) as exc:
+                if errors is not None:
+                    errors.append({'file': str(path), 'error': str(exc)})
     out.sort(key=lambda card: card['header'].get('seq', 0))
     return out
 
 
-def latest_session_cards(store_dir, agents):
+def latest_session_cards(store_dir, agents, errors=None):
     """The newest event per agent, plus all fork copies of that event.
 
     A legitimate later milestone in the same session is a different event
@@ -209,7 +218,7 @@ def latest_session_cards(store_dir, agents):
     """
     cards = []
     for agent in agents:
-        owned = list_session_cards(relay.agent_dir(store_dir, agent))
+        owned = list_session_cards(relay.agent_dir(store_dir, agent), errors=errors)
         if not owned:
             continue
         # Latest means captured last, not highest storage seq: an import
@@ -387,16 +396,19 @@ def resume_cards(toplevel):
     store_dir = relay.resolve_store_dir(toplevel)
     cfg = load_config(store_dir)
     agents = list(relay.list_agents(store_dir))
-    cards = latest_session_cards(store_dir, agents)
+    card_errors = []
+    cards = latest_session_cards(store_dir, agents, errors=card_errors)
     cross = session_card_cross_check(store_dir, agents, cards=cards)
     stats = _stats_module()
     fuse = _record_stats_safe(stats.compute_fuse, store_dir) or {}
     _present, manifest_mismatches = relay.verify_checksum_manifest(store_dir)
+    integrity = [m['file'] for m in manifest_mismatches]
+    integrity.extend('%s（%s）' % (e['file'], e['error']) for e in card_errors)
     banner = None
-    if manifest_mismatches:
-        banner = ('【档案完整性】校验清单不符（可能被截断或冲突副本污染）：%s；'
+    if integrity:
+        banner = ('【档案完整性】以下档案不可读或校验不符：%s；'
                   '先核对或从其他设备/最近导出包恢复，不要直接相信这份交接。'
-                  % '、'.join(m['file'] for m in manifest_mismatches))
+                  % '、'.join(integrity))
     if fuse.get('cap_alert'):
         cap_banner = ('【月度软上限】本月 LLM 已记录 %d tokens，超过上限 %d；'
                       '请检查成本，但不会仅因此熔断。'
@@ -1722,14 +1734,26 @@ def hook_stage(cwd, agent, session, text, llm_usage=None):
                               llm_usage=llm_usage)
 
 
+def _skill_text_candidates():
+    """Repo checkout first, then the pyproject data-files install location."""
+    candidates = [Path(__file__).resolve().parent.parent / 'SKILL.md']
+    data_root = sysconfig.get_path('data')
+    if data_root:
+        candidates.append(Path(data_root) / 'share' / 'project-relay' / 'SKILL.md')
+    return candidates
+
+
 def _load_skill_text():
     """Load the shipped SKILL.md; fall back to a checked error text if incomplete."""
-    skill_md = Path(__file__).resolve().parent.parent / 'SKILL.md'
-    try:
-        return skill_md.read_text(encoding='utf-8')
-    except OSError as exc:
-        return ('---\nname: project-relay\ndescription: 项目接力技能安装包不完整。\n---\n\n'
-                '# Relay\n\n安装包缺少 SKILL.md（%s）；请重新安装完整技能包。\n' % exc)
+    errors = []
+    for skill_md in _skill_text_candidates():
+        try:
+            return skill_md.read_text(encoding='utf-8')
+        except OSError as exc:
+            errors.append(str(exc))
+    detail = errors[-1] if errors else 'not found'
+    return ('---\nname: project-relay\ndescription: 项目接力技能安装包不完整。\n---\n\n'
+            '# Relay\n\n安装包缺少 SKILL.md（%s）；请重新安装完整技能包。\n' % detail)
 
 
 RELAY_SKILL_TEXT = _load_skill_text()
