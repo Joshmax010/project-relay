@@ -80,7 +80,7 @@ def _read_config(store_dir):
     relay_flow's defaults tell users to put knobs.
     Returns (cfg, path).
     """
-    cfg = {'monthly_llm_token_cap': None}
+    cfg = {'monthly_llm_token_cap': 200000}
     outer = Path(store_dir) / 'config.json'
     state = Path(store_dir) / 'state' / 'config.json'
     path = outer

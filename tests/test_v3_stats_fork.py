@@ -89,7 +89,7 @@ class TestFuse(V3Base):
         self.assertEqual(1000, result['week_llm_tokens'])
         self.assertEqual(1000, result['prev_week_llm_tokens'])
         self.assertFalse(result['cap_alert'])
-        self.assertIsNone(result['monthly_cap'])
+        self.assertEqual(200000, result['monthly_cap'])
 
     def test_compute_fuse_tolerates_legacy_row_without_total(self):
         root = self.init()

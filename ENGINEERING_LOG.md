@@ -358,3 +358,10 @@
 - SKILL 的 DSH 钩子说明补“接了 Stop 钩子就不用再手动 card/capture”。
 - 分支已 rebase 到 PR11 新 head `1f24906`。
 - 验证：`tests.test_v3_dsh_hooks`：9 tests OK；全量 **279 tests OK**（421.298s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-review-full-tests.log`）；`git diff --check` 通过。
+
+### resume 分区首屏 + 月度上限校准（2026-11-25）
+
+- `resume` 首屏新增「你的分区」：当前分支为 `agent/<name>` 时显示 Agent、分支、工作树和只写 `agents/<name>/` 的边界；项目根显示单 Agent 模式。
+- `monthly_llm_token_cap` 默认值从 None 校准为 200000（软告警，不拦截）；项目可在 `state/config.json` 调整或显式设 null 关闭。
+- 更新 `references/v2-stats.md`；新增 Agent 分区/单 Agent 首屏测试，更新默认 cap 断言。
+- 验证：全量 302 tests OK（387.091s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\resume-partition-cap-full-tests.log`）；`git diff --check` 通过。

@@ -337,6 +337,34 @@ def render_session_cards_section(store_dir, agents, cfg, budget_tokens=None,
     return '\n\n'.join(lines)
 
 
+def partition_section(toplevel):
+    """First-screen ownership: show the current Agent's branch/worktree."""
+    current = Path(relay.git_toplevel(toplevel)).resolve()
+    main_root = Path(relay.main_worktree(toplevel)).resolve()
+    branch = ''
+    result = git(toplevel, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)
+    if result.returncode == 0:
+        branch = os.fsdecode(result.stdout).strip()
+    agent = None
+    if branch.startswith('agent/'):
+        agent = branch[len('agent/'):].split('/', 1)[0] or None
+    lines = ['你的分区']
+    if agent:
+        lines.extend([
+            '- Agent：%s' % agent,
+            '- 分支：%s' % branch,
+            '- 工作树：%s' % current,
+            '- 只写 agents/%s/ 下的分区；合并需要用户批准。' % agent,
+        ])
+    else:
+        lines.extend([
+            '- 当前在项目根（单 Agent 模式）',
+            '- 分支：%s' % (branch or '未知'),
+            '- 项目根：%s' % main_root,
+        ])
+    return '\n'.join(lines)
+
+
 def render_cost_section(fuse):
     """Make the monthly soft cap visible at every takeover."""
     cap = fuse.get('monthly_cap')
@@ -417,6 +445,7 @@ def resume_cards(toplevel):
                         'manifest_mismatches': len(manifest_mismatches)},
                        prev_summarize_llm_tokens=(_prev or {}).get('llm_tokens', 0))
     return {'no_archive': False, 'mode': 'cards', 'sections': [],
+            'partition_section': partition_section(toplevel),
             'cards_section': cards_section, 'cross': cross,
             'cross_section': cross_section, 'cost_section': cost_section,
             'fuse': fuse, 'banner': banner}
@@ -628,10 +657,11 @@ DEFAULT_CONFIG = {
     'inject_budget_tokens': 2000,
     # Session-end/milestone cards are deliberately short and bounded.
     'session_card_char_cap': 3000,
-    # Batch 3.4: tuning knobs. None means uncapped (current behavior);
-    # the monthly cap is alert-only by design, never a hard block.
+    # Batch 3.4: tuning knobs. None means uncapped (current behavior).
+    # The monthly cap is a starting calibration point, alert-only by design;
+    # projects can raise/lower it or set null to disable the alert.
     'precompress_sample_cap': None,
-    'monthly_llm_token_cap': None,
+    'monthly_llm_token_cap': 200000,
     'smoke_command': None,
     'exclude_globs': [],
     'chain_compress_threshold': 200,
@@ -3581,6 +3611,7 @@ def _resume_full(toplevel):
                       % (_fuse.get('month_llm_tokens', 0), _fuse.get('monthly_cap')))
         banner = _cap_alert + ('\n' + banner if banner else '')
     return {'no_archive': False, 'banner': banner, 'sections': sections,
+            'partition_section': partition_section(toplevel),
             'cards_section': cards_section, 'cost_section': cost_section,
             'sick': banner is not None,
             'fork_section': fork_section, 'drift_section': drift_section,
@@ -3599,6 +3630,9 @@ def render_resume(result):
     out = []
     if result.get('banner'):
         out.append(result['banner'])
+        out.append('')
+    if result.get('partition_section'):
+        out.append(result['partition_section'])
         out.append('')
     out.extend(result['sections'])
     if result.get('cards_section'):

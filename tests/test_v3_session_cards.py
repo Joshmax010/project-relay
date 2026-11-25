@@ -50,6 +50,22 @@ class TestSessionCards(V3Base):
             info = flow.write_session_card(root, 'codex', 's1', 'milestone', CARD)
         self.assertEqual(1, info['seq'])
 
+    def test_resume_first_screen_shows_agent_partition(self):
+        root = self.init()
+        self.git(root, 'checkout', '-b', 'agent/deepseek-harness')
+        flow.write_session_card(root, 'deepseek-harness', 's1', 'session-end', CARD)
+        result = flow.resume(root)
+        self.assertIn('你的分区', result['partition_section'])
+        self.assertIn('Agent：deepseek-harness', result['partition_section'])
+        self.assertIn('agent/deepseek-harness', result['partition_section'])
+        self.assertIn('你的分区', flow.render_resume(result))
+
+    def test_resume_first_screen_names_single_agent_project_root(self):
+        root = self.init()
+        result = flow.resume(root)
+        self.assertIn('单 Agent 模式', result['partition_section'])
+        self.assertIn('项目根', result['partition_section'])
+
     def test_resume_reads_latest_card_per_agent(self):
         root = self.init()
         flow.write_session_card(root, 'codex', 's1', 'milestone', '## 决定\n- 旧卡')
@@ -60,7 +76,7 @@ class TestSessionCards(V3Base):
         rendered = flow.render_resume(result)
         self.assertIn('会话卡', rendered)
         self.assertIn('本月 LLM', rendered)
-        self.assertIn('未设置数值上限', rendered)
+        self.assertIn('200000', rendered)
 
     def test_resume_card_injection_has_a_total_bound(self):
         root = self.init()
