@@ -1394,6 +1394,8 @@ def _parser():
     res = sub.add_parser('resume')
     res.add_argument('--full', action='store_true',
                      help='旧五段接手：读全档案、Git 对账并补汇总（会写入）')
+    doc = sub.add_parser('doctor', help='项目体检：档案/卡/清单/定位缓存/分区')
+    doc.add_argument('--json', action='store_true', help='输出 JSON 供脚本使用')
     wk = sub.add_parser('work', help='多 Agent 的分支与工作树事务层')
     wksub = wk.add_subparsers(dest='work_command', required=True)
     for name in ('enter', 'status', 'review', 'merge'):
@@ -1656,7 +1658,7 @@ def main(argv=None):
                                                    confirm=a.confirm)))
         elif a.command in ('capture', 'card', 'queue', 'enforce', 'hook', 'recipe', 'precompress',
                            'fingerprint', 'scales', 'summarize', 'recover',
-                           'inject', 'resume'):
+                           'inject', 'resume', 'doctor'):
             _fspec = importlib.util.spec_from_file_location(
                 'relay_flow', Path(__file__).resolve().parent / 'relay_flow.py')
             flow = importlib.util.module_from_spec(_fspec)
@@ -1837,6 +1839,13 @@ def main(argv=None):
                 info = flow.inject(root, budget=a.budget, agent=a.agent, full=a.full)
                 print(info['text'])
                 print('\n[注入 token 粗估：%d / 预算 %d]' % (info['tokens_estimate'], info['budget']))
+            elif a.command == 'doctor':
+                result = flow.doctor(root)
+                if a.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(flow.render_doctor(result))
+                return 1 if result.get('errors') else 0
             elif a.command == 'resume':
                 result = flow.resume(root, full=a.full)
                 if result.get('no_archive'):

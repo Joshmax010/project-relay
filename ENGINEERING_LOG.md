@@ -385,3 +385,9 @@
 - `monthly_llm_token_cap` 默认值从 None 校准为 200000（软告警，不拦截）；项目可在 `state/config.json` 调整或显式设 null 关闭。
 - 更新 `references/v2-stats.md`；新增 Agent 分区/单 Agent 首屏测试，更新默认 cap 断言。
 - 验证：全量 302 tests OK（387.091s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\resume-partition-cap-full-tests.log`）；`git diff --check` 通过。
+
+### relay doctor（2026-11-25）
+
+- 新增 `relay doctor`：只读检查项目身份证、本机定位缓存、`.gitignore`、配置、checksum manifest、会话卡可读性、工作树/分区状态。
+- 新增 `--json` 结构化输出；存在 error 时命令退出码为 1，warning 不影响退出码。
+- 新增 4 个项目体检测试；全量 **314 tests OK**（404.377s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\relay-doctor-full-tests.log`）；`git diff --check` 通过。

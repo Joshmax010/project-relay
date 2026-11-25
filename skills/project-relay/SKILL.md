@@ -130,6 +130,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 - `relay locate [--name]` / `relay open <name> [--shell posix|powershell|cmd]`：查/打开本机项目
 - `relay project move --to <新目录>` / `relay project adopt`：迁移/登记已有项目
 - `relay resume`（默认只读会话卡）/ `relay resume --full`（旧五段）
+- `relay doctor`：项目体检（档案/卡/清单/定位缓存/分区）
 - `relay card --agent <名> --session <会话> --stage session-end|milestone --file <短卡>`
 - `relay hook stop --agent <名> --session <会话> --card-file <短卡>`（Stop 钩子）
 - `relay hook stage --agent <名> --session <会话> --file <短卡>`（阶段钩子）
