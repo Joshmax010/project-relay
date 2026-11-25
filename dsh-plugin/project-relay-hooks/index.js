@@ -100,11 +100,6 @@ export function apply(ctx, config = {}) {
 
   const turn = ctx.on('session/event', async (session, event) => {
     const sessionId = String(session.id)
-    if (event?.type === 'session/disposed') {
-      counts.delete(sessionId)
-      lastText.delete(sessionId)
-      return
-    }
     if (event?.type !== 'turn/end') return
     const carried = payloadText(event.data)
     if (carried) lastText.set(sessionId, carried)
@@ -126,9 +121,12 @@ export function apply(ctx, config = {}) {
   const stop = ctx.on('agent/turn-stopping', async (input, next) => {
     const result = typeof next === 'function' ? await next() : undefined
     try {
-      const sessionId = String(input?.sessionId ?? input?.session?.id ?? input?.id ?? '')
-      const session = (sessionId && ctx.sessions?.get?.(sessionId)) || input?.session || input
-      const cwd = session?.header?.cwd ?? input?.cwd
+      // Official agent/turn-stopping payload: { agent, turn, signal }.
+      // The agent owns the session object; there is no top-level cwd.
+      const agentObj = input?.agent
+      const session = agentObj?.session
+      const sessionId = String(session?.id ?? agentObj?.id ?? '')
+      const cwd = session?.header?.cwd
       if (!sessionId || !cwd) {
         logWarn(ctx, 'project-relay: turn-stopping without a session id or cwd; hook stop skipped')
         return result
@@ -143,7 +141,13 @@ export function apply(ctx, config = {}) {
     return result
   })
 
-  return () => { stop(); turn() }
+  const disposed = ctx.on('session/disposed', (session) => {
+    const sessionId = String(session.id)
+    counts.delete(sessionId)
+    lastText.delete(sessionId)
+  })
+
+  return () => { disposed(); stop(); turn() }
 }
 
 export const inject = ['sessions']

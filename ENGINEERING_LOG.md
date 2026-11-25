@@ -358,3 +358,10 @@
 - SKILL 的 DSH 钩子说明补“接了 Stop 钩子就不用再手动 card/capture”。
 - 分支已 rebase 到 PR11 新 head `1f24906`。
 - 验证：`tests.test_v3_dsh_hooks`：9 tests OK；全量 **279 tests OK**（421.298s，EXIT 0，skipped=1，日志 `D:\AAAAA\dsh\dsh-stop-cards-review-full-tests.log`）；`git diff --check` 通过。
+
+### PR12 插件事件修复（2026-11-23）
+
+- `agent/turn-stopping` 从 `input.agent.session` 取 session/id/cwd，修掉真实 Stop 载荷下 hook stop 不触发的问题。
+- `session/disposed` 改为独立 `ctx.on` 清理 `counts` / `lastText`，不再放在 `session/event` 里。
+- 新增 Node 事件形状测试：真实 `{agent:{id,session:{id,header:{cwd}}},turn,signal}` 断言触发 hook stop；空会话只警告不崩。
+- 验证：`tests.test_dsh_plugin` 1 test OK；全量 **301 tests OK**（421.049s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\pr12-plugin-followup-full-tests.log`）；`git diff --check` 通过。
