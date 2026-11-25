@@ -1365,6 +1365,7 @@ def export_zip(toplevel, zip_path=None, device_name=None, device_id=None,
     store_dir = relay.resolve_store_dir(toplevel)
     if zip_path is None:
         zip_path = default_export_zip_path(toplevel)
+        relay.ensure_gitignore(toplevel)
     zip_path = Path(zip_path)
     require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
     name, did = _zip_device(device_name, device_id)
@@ -2544,11 +2545,17 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             landed = _land_project(store_dir, merge_result, source_info,
                                    marker_files=marker_files,
                                    quarantined=merge_result['quarantined'])
-            # Register both fresh and existing imports: import-zip is a
-            # locator event, and a fresh store's placeholder ID is replaced
-            # by the adopted archive identity here.
-            project = relay.ensure_project_file(store_dir, toplevel)
-            relay.register_project(toplevel, store_dir, project)
+            # Registration is part of the import result, but a broken
+            # machine-local registry must not turn an already-landed archive
+            # into a reported failure. Repair identity first, then refresh
+            # the checksum manifest (repair can change project.json bytes).
+            try:
+                canonical = Path(relay.main_worktree(toplevel)).resolve()
+                project = relay.ensure_project_file(store_dir, canonical)
+                relay.update_checksum_manifest(store_dir)
+                relay.register_project(canonical, store_dir, project)
+            except Exception as exc:
+                warnings.append('定位缓存登记失败（档案已导入）：%s' % exc)
             entry['merge_log'] = landed['merge_log']
             entry['quarantined_files'] = landed['quarantined_files']
             merge_logs.append(landed['merge_log'])
