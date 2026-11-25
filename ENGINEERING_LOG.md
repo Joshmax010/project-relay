@@ -373,3 +373,9 @@
 - `pyproject.toml` data-files 增加 `share/project-relay/SKILL.md`，`_load_skill_text` 增加 pip 安装位置回退；新增 packaged-layout 测试。
 - 新增坏卡、PowerShell 方括号、packaged SKILL 回退测试；符号链接测试在本机因缺少权限跳过。
 - 验证：全量 **304 tests OK**（424.756s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\pr13-cleanup-full-tests.log`）；`git diff --check` 通过。
+### 自动交接（2026-11-24）
+
+- `relay export-zip` 的 `--zip` 改为可选；不传时自动生成 `<项目根>/<项目名>-project-relay-<时间>.zip`，默认落在项目根。
+- `import-zip` 落盘后无论新/旧档案都登记本机定位缓存；fresh import 仍采用包内 project_id。
+- 新增默认导出路径、fresh import 注册、existing import 注册测试。
+- 验证：`tests.test_v3_handoff_auto`：3 tests OK；全量 **303 tests OK**（398.058s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\auto-handoff-full-tests.log`）；`git diff --check` 通过。

@@ -98,7 +98,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 
 只走 zip，没有别的搬法：
 
-- `relay export-zip --zip <文件.zip>` 导出一个 zip，拷到另一台电脑，`relay import-zip --zip <文件.zip> --confirm` 导入（不带 `--confirm` 只干跑预览、零写入）。zip 里是整个 `.project-relay/` 树，另一台设备上任何 Agent 既能读别人的记忆，也能读自己的。
+- `relay export-zip` 默认在项目根生成 `<项目名>-project-relay-<时间>.zip`，也可用 `--zip` 指定路径；拷到另一台电脑，`relay import-zip --zip <文件.zip> --confirm` 导入（不带 `--confirm` 只干跑预览、零写入）。zip 里是整个 `.project-relay/` 树，另一台设备上任何 Agent 既能读别人的记忆，也能读自己的。
 - 导入先校验、再脱敏复扫、后落盘，任何一步失败整体拒绝且零写入。已有档案就按合并规则合，缺口记进合并日志。
 - 导出质量闸门：`export-zip` 会检查采集语义是否填完、基线 commit 是否可解析、待办字段是否被截断、目标收据是否仍匹配，结果写进 `manifest.quality_gaps` 并列在命令行。要硬门槛就加 `--strict`，阻断级缺口直接失败、不产出包。
 - 接手方验：`relay resume` 默认只读最新会话卡；要看旧五段交接简报时用 `relay resume --full`。确认能看到对方的记录再接着做；接完给评级（顺畅 / 有缺口 / 失败）并写明缺口。`--full` 简报除五段之外还会有两块只读补充：**接手对账·交接包指纹**（交接包导出后代码漂移了哪些文件，直接列出来）和**目标对齐·承诺与档案**（目标里提到、但待办/状态没有对应条目或进度记录的承诺）。
@@ -137,7 +137,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 - `relay goal draft|show|confirm`
 - `relay stack` / `relay outlook`
 - `relay work enter|status|review|merge`：分支与工作树
-- `relay export-zip --zip <文件.zip>` / `relay import-zip --zip <文件.zip> --confirm`
+- `relay export-zip [--zip <文件.zip>]` / `relay import-zip --zip <文件.zip> --confirm`
 - `relay recipe install|uninstall --tool deepseek-harness`
 
 深规格见 `references/v2-foundation.md`、`references/v2-flow.md`、`references/v2-sync.md`。
