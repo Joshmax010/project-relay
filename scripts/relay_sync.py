@@ -2509,7 +2509,14 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
     if store_dir.is_dir():
         store_dir = relay.resolve_store_dir(toplevel)
     elif confirm:
-        relay.init(toplevel)
+        try:
+            relay.init(toplevel)
+        except Exception as exc:
+            # init may have created the archive before its locator step
+            # failed; continue when the archive is usable.
+            if not store_dir.is_dir():
+                raise
+            warnings.append('初始化登记失败（继续导入）：%s' % exc)
         store_dir = relay.resolve_store_dir(toplevel)
     # else: keep the (nonexistent) store path; merge_project is pure and
     # previews against an empty archive without writing anything.

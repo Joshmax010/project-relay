@@ -394,4 +394,4 @@
 - 登记目标：import 从 linked worktree 进来时注册 `relay.main_worktree`，`relay open` 回主工作树。
 - 默认导出 zip：`.gitignore` 自动加入 `*-project-relay-*.zip`，不再弄脏主工作树阻塞 merge。
 - 分区显示：detached HEAD 显示“游离状态、分支未知”；多 Agent 项目的主工作树不再误标“单 Agent 模式”。
-- 新增 8 个回归测试；全量 **318 tests OK**（388.454s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\p2-cleanup-full-tests.log`）；`git diff --check` 通过。
+- 新增 9 个回归测试（含 fresh import 登记失败）；全量 **319 tests OK**（389.402s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\p2-cleanup-final-full-tests.log`）；`git diff --check` 通过。

@@ -52,6 +52,18 @@ class TestP2Cleanup(V3Base):
         self.assertTrue(result['landed'])
         self.assertTrue(any('定位缓存' in warning for warning in result['report']['warnings']))
 
+    def test_import_fresh_registration_failure_still_lands(self):
+        source = self.init('source-fresh')
+        self.confirm_goal(source)
+        zip_path = Path(self.temp.name) / 'fresh.zip'
+        sync.export_zip(source, zip_path)
+        dest = self.make_repo('fresh-dest')
+        with mock.patch.object(relay, 'register_project', side_effect=relay.RelayError('registry unavailable')):
+            result = sync.import_zip(dest, zip_path, confirm=True)
+        self.assertTrue(result['landed'])
+        self.assertTrue(any('定位缓存' in warning or '初始化登记' in warning
+                            for warning in result['report']['warnings']))
+
     def test_import_repairs_identity_and_refreshes_manifest(self):
         source = self.init('source-manifest')
         self.confirm_goal(source)
