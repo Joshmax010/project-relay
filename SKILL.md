@@ -70,7 +70,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 
 ## 会话开始：先对账
 
-跑 `relay resume`：默认只读最新会话卡，不读原始聊天、不写档案、不补汇总。要看旧的五段对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟）时用 `relay resume --full`。档案不存在时：有包就先 import-zip，没有就 `relay init` 从零建档，不猜不编。
+跑 `relay resume`：首屏先显示「你的分区」（当前 Agent/分支/工作树），默认只读最新会话卡，不读原始聊天、不写档案、不补汇总。要看旧的五段对账（读档 → 现状对账 → 积压 → 补汇总 → 冒烟）时用 `relay resume --full`。档案不存在时：有包就先 import-zip，没有就 `relay init` 从零建档，不猜不编。
 
 简报里有一段跨 Agent 核对：各家最新会话卡或记忆里互相矛盾的地方直接列出来，并标 `[待用户确认]`。看到矛盾先摆出来，别自己悄悄选一边。
 

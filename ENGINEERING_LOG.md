@@ -379,3 +379,9 @@
 - `import-zip` 落盘后无论新/旧档案都登记本机定位缓存；fresh import 仍采用包内 project_id。
 - 新增默认导出路径、fresh import 注册、existing import 注册测试。
 - 验证：`tests.test_v3_handoff_auto`：3 tests OK；全量 **303 tests OK**（398.058s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\auto-handoff-full-tests.log`）；`git diff --check` 通过。
+### resume 分区首屏 + 月度上限校准（2026-11-25）
+
+- `resume` 首屏新增「你的分区」：当前分支为 `agent/<name>` 时显示 Agent、分支、工作树和只写 `agents/<name>/` 的边界；项目根显示单 Agent 模式。
+- `monthly_llm_token_cap` 默认值从 None 校准为 200000（软告警，不拦截）；项目可在 `state/config.json` 调整或显式设 null 关闭。
+- 更新 `references/v2-stats.md`；新增 Agent 分区/单 Agent 首屏测试，更新默认 cap 断言。
+- 验证：全量 302 tests OK（387.091s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\resume-partition-cap-full-tests.log`）；`git diff --check` 通过。
