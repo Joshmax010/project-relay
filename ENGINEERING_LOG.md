@@ -385,3 +385,13 @@
 - `monthly_llm_token_cap` 默认值从 None 校准为 200000（软告警，不拦截）；项目可在 `state/config.json` 调整或显式设 null 关闭。
 - 更新 `references/v2-stats.md`；新增 Agent 分区/单 Agent 首屏测试，更新默认 cap 断言。
 - 验证：全量 302 tests OK（387.091s，EXIT 0，skipped=2，日志 `D:\AAAAA\dsh\resume-partition-cap-full-tests.log`）；`git diff --check` 通过。
+
+### PR18 后续 P2 清理（2026-11-25）
+
+- 坏卡同号覆盖：新增 `_next_card_seq`，按所有 `card-*.md` 文件名和卡头 seq 取最大值，坏卡编号不再被新卡复用。
+- pip --user：`_skill_text_candidates` 增加 nt_user / posix_user / osx_framework_user 数据目录回退。
+- import 登记：注册失败改为 warning，不再把已落盘导入报成失败；身份修复后刷新 checksum manifest。
+- 登记目标：import 从 linked worktree 进来时注册 `relay.main_worktree`，`relay open` 回主工作树。
+- 默认导出 zip：`.gitignore` 自动加入 `*-project-relay-*.zip`，不再弄脏主工作树阻塞 merge。
+- 分区显示：detached HEAD 显示“游离状态、分支未知”；多 Agent 项目的主工作树不再误标“单 Agent 模式”。
+- 新增 9 个回归测试（含 fresh import 登记失败）；全量 **319 tests OK**（389.402s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\p2-cleanup-final-full-tests.log`）；`git diff --check` 通过。

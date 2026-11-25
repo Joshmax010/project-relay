@@ -178,6 +178,28 @@ def _card_path(adir, seq):
     return _sessions_dir(adir) / ('card-%04d.md' % seq)
 
 
+def _next_card_seq(adir):
+    """Next sequence from every card filename, including unreadable ones.
+
+    A corrupt highest-numbered card is skipped by list_session_cards(), but
+    its filename must still reserve that number; otherwise the next write
+    would overwrite the only damaged copy.
+    """
+    seqs = []
+    directory = _sessions_dir(adir)
+    if directory.exists():
+        for path in directory.glob('card-*.md'):
+            match = re.match(r'card-(\d+)\.md$', path.name)
+            if match:
+                seqs.append(int(match.group(1)))
+    for card in list_session_cards(adir):
+        try:
+            seqs.append(int(card['header'].get('seq', 0)))
+        except (TypeError, ValueError):
+            pass
+    return (max(seqs) if seqs else 0) + 1
+
+
 def _parse_session_card(path):
     """Read one bounded session card without consulting raw captures."""
     text = Path(path).read_text(encoding='utf-8')
@@ -280,8 +302,7 @@ def write_session_card(toplevel, agent, session, stage, text, llm_usage=None):
             fuse = stats.compute_fuse(store_dir)
             require(not fuse.get('tripped'),
                     '成本保险丝已触发，会话卡暂停写入：' + fuse.get('reason', ''))
-            owned = list_session_cards(adir)
-            seq = (owned[-1]['header']['seq'] + 1) if owned else 1
+            seq = _next_card_seq(adir)
             header = {
                 'version': 1, 'seq': seq, 'event_id': uuid.uuid4().hex,
                 'captured_at': utc(), 'agent': agent, 'session': session,
@@ -358,7 +379,13 @@ def partition_section(toplevel):
     if branch.startswith('agent/'):
         agent = branch[len('agent/'):].split('/', 1)[0] or None
     lines = ['你的分区']
-    if agent:
+    if branch in ('', 'HEAD'):
+        lines.extend([
+            '- 游离状态，分支未知',
+            '- 工作树：%s' % current,
+            '- 不在 agent/<name> 分区；提交前请确认不会写进别人的 agents/。',
+        ])
+    elif agent:
         lines.extend([
             '- Agent：%s' % agent,
             '- 分支：%s' % branch,
@@ -366,9 +393,14 @@ def partition_section(toplevel):
             '- 只写 agents/%s/ 下的分区；合并需要用户批准。' % agent,
         ])
     else:
+        try:
+            agents = relay.list_agents(relay.store_dir_for(toplevel))
+        except OSError:
+            agents = []
+        mode = '多 Agent 主工作树（验收树）' if len(agents) > 1 else '单 Agent 模式'
         lines.extend([
-            '- 当前在项目根（单 Agent 模式）',
-            '- 分支：%s' % (branch or '未知'),
+            '- 当前在项目根（%s）' % mode,
+            '- 分支：%s' % branch,
             '- 项目根：%s' % main_root,
         ])
     return '\n'.join(lines)
@@ -1765,11 +1797,23 @@ def hook_stage(cwd, agent, session, text, llm_usage=None):
 
 
 def _skill_text_candidates():
-    """Repo checkout first, then the pyproject data-files install location."""
+    """Repo checkout, prefix data files, then pip --user data files."""
     candidates = [Path(__file__).resolve().parent.parent / 'SKILL.md']
-    data_root = sysconfig.get_path('data')
-    if data_root:
-        candidates.append(Path(data_root) / 'share' / 'project-relay' / 'SKILL.md')
+    roots = [sysconfig.get_path('data')]
+    for scheme in ('nt_user', 'posix_user', 'osx_framework_user'):
+        try:
+            roots.append(sysconfig.get_path('data', scheme=scheme))
+        except (KeyError, AttributeError):
+            continue
+    seen = set()
+    for data_root in roots:
+        if not data_root:
+            continue
+        path = Path(data_root) / 'share' / 'project-relay' / 'SKILL.md'
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(path)
     return candidates
 
 

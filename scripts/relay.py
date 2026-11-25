@@ -161,6 +161,7 @@ def anchor(root):
 # ---------------------------------------------------------------- store
 VERSION = '0.2.0'
 STORE_DIRNAME = '.project-relay'
+HANDOFF_ZIP_PATTERN = '*-project-relay-*.zip'
 PROJECT_FILE = 'project.json'
 REGISTRY_DIRNAME = '.project-relay'
 REGISTRY_FILE = 'registry.json'
@@ -610,23 +611,25 @@ def agent_lock(store_dir, agent):
 
 
 def ensure_gitignore(toplevel):
-    """Make sure <root>/.gitignore excludes .project-relay/ (init + import).
+    """Make sure .project-relay/ and generated handoff zips stay out of git.
 
-    档案默认不进 git，换设备只走 ZIP。已有的 .gitignore 只追加一行，
+    档案默认不进 git，换设备只走 ZIP。已有的 .gitignore 只追加缺失行，
     不动其他内容（CRLF 文件保持 CRLF）。"""
     root = Path(main_worktree(toplevel))
     gi = root / '.gitignore'
-    entry = STORE_DIRNAME + '/'
+    entries = [STORE_DIRNAME + '/', HANDOFF_ZIP_PATTERN]
     if gi.exists():
         raw = gi.read_bytes()
         newline = b'\r\n' if b'\r\n' in raw else b'\n'
         lines = raw.decode('utf-8', errors='replace').splitlines()
-        if entry in [line.strip() for line in lines]:
+        present = [line.strip() for line in lines]
+        missing = [entry for entry in entries if entry not in present]
+        if not missing:
             return False
-        lines.append(entry)
+        lines.extend(missing)
         atomic(gi, (newline.decode().join(lines) + newline.decode()).encode('utf-8'))
         return True
-    atomic(gi, (entry + '\n').encode('utf-8'))
+    atomic(gi, ('\n'.join(entries) + '\n').encode('utf-8'))
     return True
 
 
