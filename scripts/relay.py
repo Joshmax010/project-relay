@@ -160,6 +160,7 @@ def anchor(root):
 
 # ---------------------------------------------------------------- store
 VERSION = '0.2.0'
+ARCHIVE_SCHEMA_VERSION = 1
 STORE_DIRNAME = '.project-relay'
 HANDOFF_ZIP_PATTERN = '*-project-relay-*.zip'
 PROJECT_FILE = 'project.json'
@@ -332,6 +333,9 @@ def _ensure_project_file_unlocked(store_dir, root):
             current = {}
     project = dict(current)
     changed = not path.exists()
+    if project.get('schema_version') != ARCHIVE_SCHEMA_VERSION:
+        project['schema_version'] = ARCHIVE_SCHEMA_VERSION
+        changed = True
     if not isinstance(project.get('project_id'), str) or \
             not re.fullmatch(r'[0-9a-f]{32}', project['project_id']):
         project['project_id'] = uuid.uuid4().hex
@@ -410,6 +414,24 @@ def adopt_project(toplevel):
     project = ensure_project_file(store_dir, root)
     register_project(root, store_dir, project)
     return {'root': str(root), 'project': project}
+
+
+def upgrade_project(toplevel):
+    """Bring an existing archive's project.json up to the current schema.
+
+    The migration is intentionally idempotent: ensure_project_file stamps
+    the current schema_version and repairs missing identity fields, then the
+    checksum manifest is refreshed so the next resume does not warn.
+    """
+    root = Path(main_worktree(toplevel)).resolve()
+    store_dir = root / STORE_DIRNAME
+    require(store_dir.is_dir(), '项目尚未建仓：' + str(store_dir))
+    _reject_store_symlinks(store_dir)
+    project = ensure_project_file(store_dir, root)
+    update_checksum_manifest(store_dir)
+    register_project(root, store_dir, project)
+    return {'root': str(root), 'project': project,
+            'schema_version': project.get('schema_version')}
 
 
 def move_project(toplevel, destination):
@@ -1309,6 +1331,7 @@ def _parser():
     pm = prjsub.add_parser('move', help='移动项目目录并保留 project_id')
     pm.add_argument('--to', required=True, help='新的项目目录（精确路径）')
     prjsub.add_parser('adopt', help='把已有 .project-relay 登记到本机定位缓存')
+    prjsub.add_parser('upgrade', help='把已有档案升级到当前 schema 版本')
     sub.add_parser('agents')
     g = sub.add_parser('goal')
     gsub = g.add_subparsers(dest='goal_command', required=True)
@@ -1465,6 +1488,10 @@ def main(argv=None):
                 info = move_project(a.root, a.to)
                 print('项目已迁移：%s -> %s' % (info['from'], info['to']))
                 print('project_id：' + info['project']['project_id'])
+            elif a.project_command == 'upgrade':
+                info = upgrade_project(a.root)
+                print('档案已升级：' + info['root'])
+                print('schema_version：' + str(info['schema_version']))
             else:
                 info = adopt_project(a.root)
                 print('项目已登记：' + info['root'])
@@ -1779,6 +1806,9 @@ def main(argv=None):
                     info = flow.install_deepseek_harness(root,
                         target_root=a.target_root, home_dir=home)
                     print('skill 目录：' + info['skill_dir'])
+                    check = info.get('self_check') or {}
+                    print('自检：' + ('通过' if check.get('ok') else
+                                      '未通过，缺少 ' + '、'.join(check.get('missing') or [])))
                     print(info['note'])
                 else:
                     info = flow.uninstall_deepseek_harness(root)

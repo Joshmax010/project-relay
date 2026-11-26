@@ -400,3 +400,10 @@
 - 新增 `relay doctor`：只读检查项目身份证、本机定位缓存、`.gitignore`、配置、checksum manifest、会话卡可读性、工作树/分区状态。
 - 新增 `--json` 结构化输出；存在 error 时命令退出码为 1，warning 不影响退出码。
 - 新增 4 个项目体检测试；全量 **314 tests OK**（404.377s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\relay-doctor-full-tests.log`）；`git diff --check` 通过。
+
+### 分发与升级（2026-11-26）
+
+- 发行 zip / `recipe install` 现在会带上 `dsh-plugin/project-relay-hooks`；安装后用户可直接用 `dsh plugin --profile <profile> add <技能目录>/dsh-plugin/project-relay-hooks` 安装插件。
+- `recipe install` 增加安装自检：检查 SKILL.md、scripts、template-v2、插件 package/index/cordis；缺失时直接失败并列出缺少文件。
+- `project.json` 增加 `schema_version`（当前 1）；旧档案缺字段时 doctor 给出 warning，`relay project upgrade` 会补齐并刷新 checksum manifest。
+- 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示测试；全量 **327 tests OK**（414.304s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\dist-upgrade-full-tests.log`）；`git diff --check` 通过。

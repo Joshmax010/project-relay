@@ -527,6 +527,21 @@ def doctor(toplevel):
         except Exception as exc:
             add('error', 'project_invalid', 'project.json 无法读取：%s' % exc)
 
+    if isinstance(project, dict) and project.get('project_id'):
+        schema = project.get('schema_version')
+        if schema is None:
+            add('warning', 'archive_version_missing',
+                '档案未标记 schema_version；跑 relay project upgrade')
+        elif not isinstance(schema, int) or schema > relay.ARCHIVE_SCHEMA_VERSION:
+            add('error', 'archive_version_newer',
+                '档案版本 %r 高于当前工具版本 %d' % (schema, relay.ARCHIVE_SCHEMA_VERSION))
+        elif schema < relay.ARCHIVE_SCHEMA_VERSION:
+            add('warning', 'archive_version_old',
+                '档案版本 %r 低于当前版本 %d；跑 relay project upgrade'
+                % (schema, relay.ARCHIVE_SCHEMA_VERSION))
+        else:
+            add('ok', 'archive_version', '档案 schema：%d' % schema)
+
     try:
         registry = relay.read_registry()
         rows = registry.get('projects', {}) if isinstance(registry, dict) else {}
@@ -1958,6 +1973,31 @@ RELAY_SKILL_TEXT = _load_skill_text()
 
 _SKILL_SCRIPT_FILES = ('relay.py', 'relay_flow.py', 'relay_fork.py',
                       'relay_stats.py', 'relay_sync.py', 'relay_work.py')
+_SKILL_REQUIRED = ('SKILL.md', 'scripts/relay.py', 'scripts/relay_flow.py',
+                   'scripts/relay_fork.py', 'scripts/relay_stats.py',
+                   'scripts/relay_sync.py', 'scripts/relay_work.py',
+                   'assets/template-v2/state.md',
+                   'dsh-plugin/project-relay-hooks/package.json',
+                   'dsh-plugin/project-relay-hooks/index.js',
+                   'dsh-plugin/project-relay-hooks/cordis.patch.yml')
+
+
+def _plugin_hook_source():
+    """Locate the bundled DSH plugin beside the repo or in pip data files."""
+    candidates = [_HERE.parent / 'dsh-plugin' / 'project-relay-hooks']
+    data_root = sysconfig.get_path('data')
+    if data_root:
+        candidates.append(Path(data_root) / 'share' / 'project-relay'
+                          / 'dsh-plugin' / 'project-relay-hooks')
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _skill_payload_missing(skill_dir):
+    root = Path(skill_dir)
+    return [rel for rel in _SKILL_REQUIRED if not (root / rel).is_file()]
 
 
 def _copy_skill_payload(skill_dir):
@@ -1995,6 +2035,20 @@ def _copy_skill_payload(skill_dir):
         source = _HERE.parent / name
         if source.is_file():
             atomic(skill_dir / name, source.read_bytes())
+    # The DSH hook plugin is part of the skill distribution: unpacking the
+    # skill must give the user a local plugin bundle for `dsh plugin add`.
+    plugin_src = _plugin_hook_source()
+    if plugin_src:
+        plugin_dst = skill_dir / 'dsh-plugin' / 'project-relay-hooks'
+        for source in sorted(plugin_src.rglob('*')):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(plugin_src)
+            if any(part in ('node_modules', '.git') for part in relative.parts):
+                continue
+            target = plugin_dst / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic(target, source.read_bytes())
 
 
 def install_workbuddy(toplevel):
@@ -2052,12 +2106,15 @@ def install_deepseek_harness(toplevel, target_root=None, home_dir=None):
         location = '<repo>/.dsh/skills/project-relay'
     dest = skill_dir / 'SKILL.md'
     _copy_skill_payload(skill_dir)
+    missing = _skill_payload_missing(skill_dir)
+    require(not missing, '技能包自检失败，缺少：%s' % '、'.join(missing))
     _save_recipe_state(store_dir, 'deepseek-harness',
                        {'tool': 'deepseek-harness', 'installed_at': utc(),
                         'source': 'installed', 'skill_dir': str(skill_dir),
                         'skill_path': str(dest)})
     return {'tool': 'deepseek-harness', 'installed_at': utc(), 'source': 'installed',
             'skill_dir': str(skill_dir), 'skill_path': str(dest), 'installed': True,
+            'self_check': {'ok': True, 'missing': []},
             'note': '已装到 DeepSeek Harness（%s）' % location,
             'message': '已装到 DeepSeek Harness（%s）' % location}
 
