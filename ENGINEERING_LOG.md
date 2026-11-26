@@ -408,3 +408,9 @@
 - doctor 的 registry 比较对象改为 `main_worktree`，在 Agent 工作树里不再误报定位缓存过期。
 - `.gitignore` 检查改用 `git check-ignore` 的有效结果，注释/反选不再骗过体检。
 - 新增 cap=0、坏 project_id、linked worktree、gitignore 注释/反选 4 个回归测试；全量 **327 tests OK**（425.188s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\doctor-followup-full-tests.log`）；`git diff --check` 通过。
+### 分发与升级（2026-11-26）
+
+- 发行 zip / `recipe install` 现在会带上 `dsh-plugin/project-relay-hooks`；安装后用户可直接用 `dsh plugin --profile <profile> add <技能目录>/dsh-plugin/project-relay-hooks` 安装插件。
+- `recipe install` 增加安装自检：检查 SKILL.md、scripts、template-v2、插件 package/index/cordis；缺失时直接失败并列出缺少文件。
+- `project.json` 增加 `schema_version`（当前 1）；旧档案缺字段时 doctor 给出 warning，`relay project upgrade` 会补齐并刷新 checksum manifest。
+- 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示测试；全量 **327 tests OK**（414.304s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\dist-upgrade-full-tests.log`）；`git diff --check` 通过。

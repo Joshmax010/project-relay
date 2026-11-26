@@ -37,6 +37,16 @@ py-modules = [
 # that path when the repo checkout is not around the installed module.
 [tool.setuptools.data-files]
 "share/project-relay" = ["SKILL.md"]
+"share/project-relay/dsh-plugin/project-relay-hooks" = [
+    "dsh-plugin/project-relay-hooks/README.md",
+    "dsh-plugin/project-relay-hooks/cordis.patch.yml",
+    "dsh-plugin/project-relay-hooks/index.js",
+    "dsh-plugin/project-relay-hooks/package.json",
+]
+"share/project-relay/dsh-plugin/project-relay-hooks/locale" = [
+    "dsh-plugin/project-relay-hooks/locale/en.json",
+    "dsh-plugin/project-relay-hooks/locale/zh.json",
+]
 "share/project-relay/template-v2" = [
     "assets/template-v2/agent-goal.md",
     "assets/template-v2/backlog.md",

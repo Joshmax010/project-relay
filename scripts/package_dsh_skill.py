@@ -37,6 +37,10 @@ def _install_text(version):
    也可以放到项目级：<项目根>/.dsh/skills/project-relay。
 3. 重启 DSH 会话，在项目里说「接力」或「装上接力」。
 4. 需要 Git 和 Python 3.8+。
+5. 自动写会话卡还需要安装 DSH 插件：
+   在项目里运行
+   `dsh plugin --profile <profile> add <project-relay>\dsh-plugin\project-relay-hooks`，
+   或在 DSH 的 Plugins 界面选择该本地插件目录。
 '''
 
 
@@ -59,6 +63,12 @@ def build(out=None):
     for p in sorted((ROOT / 'references').glob('*.md')):
         if p.is_file():
             entries.append((p, 'project-relay/references/' + p.name))
+    plugin_root = ROOT / 'dsh-plugin' / 'project-relay-hooks'
+    if plugin_root.is_dir():
+        for p in sorted(plugin_root.rglob('*')):
+            if p.is_file():
+                rel = p.relative_to(plugin_root).as_posix()
+                entries.append((p, 'project-relay/dsh-plugin/project-relay-hooks/' + rel))
     with zipfile.ZipFile(dest, 'w', zipfile.ZIP_DEFLATED) as zf:
         for source, arcname in entries:
             zf.write(source, arcname)

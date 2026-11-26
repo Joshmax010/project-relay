@@ -22,7 +22,7 @@ Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命
 
 ```
 <项目根目录>/.project-relay/
-  project.json                                 # 项目身份证：project_id、名称、创建时间
+  project.json                                 # 项目身份证：project_id、名称、创建时间、schema_version
   goal.md、state.md、backlog.md、decisions.md   # 外层：总目标、总记忆、共用待办与决定
   stack.md、outlook.md、index.md               # 外层：技术栈、未来预期、指路表
   receipts/                                     # 目标确认收据
@@ -75,7 +75,7 @@ relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
 - macOS / Linux：`~/.agents/skills/project-relay`
 - 或项目级：`<项目根>/.dsh/skills/project-relay`
 
-重启 DSH 会话即可。zip 里自带 `SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`，不依赖额外 clone。
+重启 DSH 会话即可。zip 里自带 `SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`，以及 `dsh-plugin/project-relay-hooks/`；不依赖额外 clone。自动写会话卡还需要安装插件：`dsh plugin --profile <profile> add <skill目录>\dsh-plugin\project-relay-hooks`，或在 DSH Plugins 界面选择该目录。
 
 ### 方式二：从源码安装（开发或自定义）
 
@@ -91,7 +91,7 @@ python scripts/relay.py --root <项目根> recipe install --tool deepseek-harnes
 python scripts/relay.py --root <项目根> recipe install --tool deepseek-harness --home <用户目录>
 ```
 
-`recipe install` 会复制**完整技能包**：`SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`。默认项目级路径是 `<项目根>/.dsh/skills/project-relay/`；`--home` 写 `<用户目录>/.agents/skills/project-relay/`。DSH 会扫描项目级 `.dsh/skills`、`.agents/skills` 和用户级 `~/.dsh/skills`、`~/.agents/skills`。卸载用 `recipe uninstall --tool deepseek-harness`。
+`recipe install` 会复制**完整技能包**：`SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`、`dsh-plugin/project-relay-hooks/`，并对缺失文件做安装自检。默认项目级路径是 `<项目根>/.dsh/skills/project-relay/`；`--home` 写 `<用户目录>/.agents/skills/project-relay/`。DSH 会扫描项目级 `.dsh/skills`、`.agents/skills` 和用户级 `~/.dsh/skills`、`~/.agents/skills`。卸载用 `recipe uninstall --tool deepseek-harness`。
 
 ## 快速开始
 
@@ -127,6 +127,7 @@ python3 scripts/relay.py locate [--name] # 查本机项目定位
 python3 scripts/relay.py open <name>     # 打印项目的 cd 路径（--shell posix|powershell|cmd）
 python3 scripts/relay.py project move --to <新目录>  # 迁移项目并保留 project_id
 python3 scripts/relay.py project adopt   # 把已有档案登记到本机定位缓存
+python3 scripts/relay.py project upgrade # 把已有档案升级到当前 schema 版本
 python3 scripts/relay.py agents          # 看指路表
 python3 scripts/relay.py resume          # 接手（默认只读会话卡）
 python3 scripts/relay.py resume --full   # 旧五段对账（会补汇总、写 state.md）

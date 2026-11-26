@@ -112,7 +112,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 1. 在项目根跑 `relay init`（如果还没建档）。
 2. 跑 `python scripts/relay.py recipe install --tool deepseek-harness`。
 
-默认会把完整技能写到项目级 `<项目根>/.dsh/skills/project-relay/`（SKILL.md、scripts、assets/template-v2、references）。要给整台机器装，用 `--home <用户目录>` 写 `<用户目录>/.agents/skills/project-relay/`；两种路径 DSH 都会扫。也可以直接把发行 zip 解压到这两个目录之一。装完 DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
+默认会把完整技能写到项目级 `<项目根>/.dsh/skills/project-relay/`（SKILL.md、scripts、assets/template-v2、references、dsh-plugin/project-relay-hooks）。自动写卡插件需再执行 `dsh plugin --profile <profile> add <技能目录>\dsh-plugin\project-relay-hooks`，或在 Plugins 界面选择该目录。要给整台机器装，用 `--home <用户目录>` 写 `<用户目录>/.agents/skills/project-relay/`；两种路径 DSH 都会扫。也可以直接把发行 zip 解压到这两个目录之一。装完 DSH 下个会话就能看到 project-relay。卸载用 `recipe uninstall --tool deepseek-harness`。
 
 ## 边界
 
@@ -128,7 +128,7 @@ DSH 侧 Stop 钩子调用 `relay hook stop --agent deepseek-harness --session <�
 
 - `relay init`：建 `.project-relay/`，写 `project.json` 和本机定位缓存
 - `relay locate [--name]` / `relay open <name> [--shell posix|powershell|cmd]`：查/打开本机项目
-- `relay project move --to <新目录>` / `relay project adopt`：迁移/登记已有项目
+- `relay project move --to <新目录>` / `relay project adopt` / `relay project upgrade`：迁移/登记/升级已有项目
 - `relay resume`（默认只读会话卡）/ `relay resume --full`（旧五段）
 - `relay doctor`：项目体检（档案/卡/清单/定位缓存/分区）
 - `relay card --agent <名> --session <会话> --stage session-end|milestone --file <短卡>`
