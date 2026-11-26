@@ -400,3 +400,11 @@
 - 新增 `relay doctor`：只读检查项目身份证、本机定位缓存、`.gitignore`、配置、checksum manifest、会话卡可读性、工作树/分区状态。
 - 新增 `--json` 结构化输出；存在 error 时命令退出码为 1，warning 不影响退出码。
 - 新增 4 个项目体检测试；全量 **314 tests OK**（404.377s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\relay-doctor-full-tests.log`）；`git diff --check` 通过。
+
+### PR20 审核后续（2026-11-26）
+
+- doctor 的 cap 校验改为 `cap < 0` 才报错，0 与配置校验器语义对齐（0 表示任何用量都告警）。
+- doctor 的身份证校验改为 `[0-9a-f]{32}`，与 ensure_project_file 的修复规则一致。
+- doctor 的 registry 比较对象改为 `main_worktree`，在 Agent 工作树里不再误报定位缓存过期。
+- `.gitignore` 检查改用 `git check-ignore` 的有效结果，注释/反选不再骗过体检。
+- 新增 cap=0、坏 project_id、linked worktree、gitignore 注释/反选 4 个回归测试；全量 **327 tests OK**（425.188s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\doctor-followup-full-tests.log`）；`git diff --check` 通过。

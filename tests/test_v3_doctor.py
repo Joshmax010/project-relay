@@ -46,6 +46,41 @@ class TestDoctor(V3Base):
         self.assertIn('bad_card', [check['code'] for check in result['checks']])
         self.assertIn('card-9999.md', flow.render_doctor(result))
 
+    def test_zero_monthly_cap_is_valid(self):
+        root = self.init()
+        (self.store_dir(root) / 'state' / 'config.json').write_text(
+            json.dumps({'monthly_llm_token_cap': 0}), encoding='utf-8')
+        result = flow.doctor(root)
+        codes = [check['code'] for check in result['checks']]
+        self.assertNotIn('cap_invalid', codes)
+        self.assertEqual(0, result['errors'])
+
+    def test_bad_project_id_format_is_reported(self):
+        root = self.init()
+        path = self.store_dir(root) / 'project.json'
+        project = json.loads(path.read_text(encoding='utf-8'))
+        project['project_id'] = 'not-a-32-char-hex-id'
+        path.write_text(json.dumps(project), encoding='utf-8')
+        result = flow.doctor(root)
+        self.assertIn('project_invalid', [check['code'] for check in result['checks']])
+        self.assertEqual(1, result['errors'])
+
+    def test_linked_worktree_does_not_report_stale_registry(self):
+        root = self.init()
+        linked = Path(self.temp.name) / 'linked-doctor'
+        self.git(root, 'worktree', 'add', '-b', 'agent/test', str(linked), 'HEAD')
+        result = flow.doctor(linked)
+        codes = [check['code'] for check in result['checks']]
+        self.assertNotIn('registry_stale', codes)
+
+    def test_gitignore_comment_and_negation_do_not_fool_doctor(self):
+        root = self.init()
+        (root / '.gitignore').write_text(
+            '# .project-relay/\n!.project-relay/\n', encoding='utf-8')
+        result = flow.doctor(root)
+        codes = [check['code'] for check in result['checks']]
+        self.assertIn('gitignore_store', codes)
+
     def test_cli_json(self):
         root = self.init()
         self.confirm_goal(root)

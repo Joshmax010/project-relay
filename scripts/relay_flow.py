@@ -499,6 +499,7 @@ def doctor(toplevel):
     """Read-only project health check; returns structured checks for CLI."""
     root = Path(relay.git_toplevel(toplevel)).resolve()
     store_dir = relay.store_dir_for(root)
+    main_root = Path(relay.main_worktree(root)).resolve()
     checks = []
 
     def add(level, code, message):
@@ -520,10 +521,12 @@ def doctor(toplevel):
     else:
         try:
             project = relay.read_json(project_path)
-            if not isinstance(project, dict) or not project.get('project_id'):
-                add('error', 'project_invalid', 'project.json 不是有效身份证')
+            project_id = project.get('project_id') if isinstance(project, dict) else None
+            if not isinstance(project_id, str) or not re.fullmatch(r'[0-9a-f]{32}', project_id):
+                add('error', 'project_invalid',
+                    'project.json 的 project_id 必须是 32 位小写十六进制')
             else:
-                add('ok', 'project', '项目身份证：%s' % project['project_id'])
+                add('ok', 'project', '项目身份证：%s' % project_id)
         except Exception as exc:
             add('error', 'project_invalid', 'project.json 无法读取：%s' % exc)
 
@@ -534,30 +537,28 @@ def doctor(toplevel):
         row = rows.get(pid) if pid else None
         if row is None:
             add('warning', 'registry_missing', '本机定位缓存没有这个项目；可跑 relay project adopt')
-        elif Path(str(row.get('path', ''))).expanduser().resolve() != root:
+        elif Path(str(row.get('path', ''))).expanduser().resolve() != main_root:
             add('warning', 'registry_stale', '定位缓存路径不是项目根：%s' % row.get('path'))
         else:
             add('ok', 'registry', '本机定位缓存指向项目根')
     except Exception as exc:
         add('warning', 'registry_unreadable', '本机定位缓存不可读：%s' % exc)
 
-    gi = root / '.gitignore'
-    try:
-        gitignore = gi.read_text(encoding='utf-8') if gi.is_file() else ''
-    except OSError as exc:
-        gitignore = ''
-        add('warning', 'gitignore_unreadable', '.gitignore 读不到：%s' % exc)
-    if relay.STORE_DIRNAME + '/' not in gitignore:
-        add('warning', 'gitignore_store', '.gitignore 未忽略 .project-relay/')
+    def ignored(path):
+        result = git(root, 'check-ignore', '-q', '--', path, check=False)
+        return result.returncode == 0
+
+    if not ignored(relay.STORE_DIRNAME + '/'):
+        add('warning', 'gitignore_store', 'git 实际未忽略 .project-relay/')
     zip_pattern = getattr(relay, 'HANDOFF_ZIP_PATTERN', None)
-    if zip_pattern and zip_pattern not in gitignore:
-        add('warning', 'gitignore_zip', '.gitignore 未忽略默认交接 zip（%s）' % zip_pattern)
+    if zip_pattern and not ignored('probe-project-relay-20200101-000000.zip'):
+        add('warning', 'gitignore_zip', 'git 实际未忽略默认交接 zip（%s）' % zip_pattern)
 
     try:
         cfg = load_config(store_dir)
         cap = cfg.get('monthly_llm_token_cap')
-        if cap is not None and (not isinstance(cap, int) or cap <= 0):
-            add('error', 'cap_invalid', 'monthly_llm_token_cap 应为正整数或 null：%r' % cap)
+        if cap is not None and (not isinstance(cap, int) or cap < 0):
+            add('error', 'cap_invalid', 'monthly_llm_token_cap 应为非负整数或 null：%r' % cap)
         else:
             add('ok', 'config', '配置可读；月度软上限 %s' % ('未设置' if cap is None else cap))
     except Exception as exc:
