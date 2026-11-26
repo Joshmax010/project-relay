@@ -395,3 +395,8 @@
 - 默认导出 zip：`.gitignore` 自动加入 `*-project-relay-*.zip`，不再弄脏主工作树阻塞 merge。
 - 分区显示：detached HEAD 显示“游离状态、分支未知”；多 Agent 项目的主工作树不再误标“单 Agent 模式”。
 - 新增 9 个回归测试（含 fresh import 登记失败）；全量 **319 tests OK**（389.402s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\p2-cleanup-final-full-tests.log`）；`git diff --check` 通过。
+### relay doctor（2026-11-25）
+
+- 新增 `relay doctor`：只读检查项目身份证、本机定位缓存、`.gitignore`、配置、checksum manifest、会话卡可读性、工作树/分区状态。
+- 新增 `--json` 结构化输出；存在 error 时命令退出码为 1，warning 不影响退出码。
+- 新增 4 个项目体检测试；全量 **314 tests OK**（404.377s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\relay-doctor-full-tests.log`）；`git diff --check` 通过。

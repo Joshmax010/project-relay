@@ -130,6 +130,7 @@ python3 scripts/relay.py project adopt   # 把已有档案登记到本机定位�
 python3 scripts/relay.py agents          # 看指路表
 python3 scripts/relay.py resume          # 接手（默认只读会话卡）
 python3 scripts/relay.py resume --full   # 旧五段对账（会补汇总、写 state.md）
+python3 scripts/relay.py doctor          # 项目体检：档案/卡/清单/定位缓存/分区
 python3 scripts/relay.py card --agent deepseek-harness --session <会话> --stage session-end --file <短卡>
 python3 scripts/relay.py hook stop --agent deepseek-harness --session <会话> --card-file <短卡>
 python3 scripts/relay.py hook stage --agent deepseek-harness --session <会话> --file <短卡>

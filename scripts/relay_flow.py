@@ -495,6 +495,130 @@ def resume_cards(toplevel):
             'fuse': fuse, 'banner': banner}
 
 
+def doctor(toplevel):
+    """Read-only project health check; returns structured checks for CLI."""
+    root = Path(relay.git_toplevel(toplevel)).resolve()
+    store_dir = relay.store_dir_for(root)
+    checks = []
+
+    def add(level, code, message):
+        checks.append({'level': level, 'code': code, 'message': message})
+
+    if not store_dir.is_dir():
+        add('error', 'no_archive', '项目尚未建仓：%s；先 relay init 或 import-zip' % store_dir)
+        return {'root': str(root), 'store_dir': str(store_dir),
+                'checks': checks, 'errors': 1, 'warnings': 0, 'ok': False}
+    if store_dir.is_symlink():
+        add('error', 'store_symlink', '档案目录是符号链接：%s' % store_dir)
+    else:
+        add('ok', 'store', '档案目录存在：%s' % store_dir)
+
+    project = None
+    project_path = store_dir / relay.PROJECT_FILE
+    if not project_path.is_file():
+        add('error', 'project_missing', '缺少 project.json；跑 relay adopt 或重新 init')
+    else:
+        try:
+            project = relay.read_json(project_path)
+            if not isinstance(project, dict) or not project.get('project_id'):
+                add('error', 'project_invalid', 'project.json 不是有效身份证')
+            else:
+                add('ok', 'project', '项目身份证：%s' % project['project_id'])
+        except Exception as exc:
+            add('error', 'project_invalid', 'project.json 无法读取：%s' % exc)
+
+    try:
+        registry = relay.read_registry()
+        rows = registry.get('projects', {}) if isinstance(registry, dict) else {}
+        pid = project.get('project_id') if isinstance(project, dict) else None
+        row = rows.get(pid) if pid else None
+        if row is None:
+            add('warning', 'registry_missing', '本机定位缓存没有这个项目；可跑 relay project adopt')
+        elif Path(str(row.get('path', ''))).expanduser().resolve() != root:
+            add('warning', 'registry_stale', '定位缓存路径不是项目根：%s' % row.get('path'))
+        else:
+            add('ok', 'registry', '本机定位缓存指向项目根')
+    except Exception as exc:
+        add('warning', 'registry_unreadable', '本机定位缓存不可读：%s' % exc)
+
+    gi = root / '.gitignore'
+    try:
+        gitignore = gi.read_text(encoding='utf-8') if gi.is_file() else ''
+    except OSError as exc:
+        gitignore = ''
+        add('warning', 'gitignore_unreadable', '.gitignore 读不到：%s' % exc)
+    if relay.STORE_DIRNAME + '/' not in gitignore:
+        add('warning', 'gitignore_store', '.gitignore 未忽略 .project-relay/')
+    zip_pattern = getattr(relay, 'HANDOFF_ZIP_PATTERN', None)
+    if zip_pattern and zip_pattern not in gitignore:
+        add('warning', 'gitignore_zip', '.gitignore 未忽略默认交接 zip（%s）' % zip_pattern)
+
+    try:
+        cfg = load_config(store_dir)
+        cap = cfg.get('monthly_llm_token_cap')
+        if cap is not None and (not isinstance(cap, int) or cap <= 0):
+            add('error', 'cap_invalid', 'monthly_llm_token_cap 应为正整数或 null：%r' % cap)
+        else:
+            add('ok', 'config', '配置可读；月度软上限 %s' % ('未设置' if cap is None else cap))
+    except Exception as exc:
+        add('error', 'config_invalid', 'state/config.json 无法读取：%s' % exc)
+
+    try:
+        present, mismatches = relay.verify_checksum_manifest(store_dir)
+        if not present:
+            add('warning', 'manifest_missing', '没有校验清单；完整性无法核对')
+        elif mismatches:
+            for mismatch in mismatches:
+                add('error', 'manifest_mismatch', '校验清单不符：%s' % mismatch.get('file'))
+        else:
+            add('ok', 'manifest', '校验清单匹配')
+    except Exception as exc:
+        add('error', 'manifest_unreadable', '校验清单无法读取：%s' % exc)
+
+    agents = relay.list_agents(store_dir)
+    if not agents:
+        add('warning', 'no_agents', '没有 Agent 目录')
+    for agent in agents:
+        errors = []
+        try:
+            cards = list_session_cards(relay.agent_dir(store_dir, agent), errors=errors)
+            for error in errors:
+                add('warning', 'bad_card', '坏卡：%s（%s）' % (error['file'], error['error']))
+            if cards:
+                add('ok', 'cards:' + agent, '%s：%d 张可读会话卡' % (agent, len(cards)))
+        except Exception as exc:
+            add('warning', 'cards_unreadable:' + agent, '%s：会话卡目录读不到：%s' % (agent, exc))
+
+    try:
+        branch_result = git(root, 'rev-parse', '--abbrev-ref', 'HEAD', check=False)
+        branch = os.fsdecode(branch_result.stdout).strip() if branch_result.returncode == 0 else ''
+        main_root = Path(relay.main_worktree(root)).resolve()
+        if root != main_root:
+            add('info', 'worktree', '当前是工作树：%s（分支 %s）' % (root, branch or '未知'))
+        if branch.startswith('agent/'):
+            agent = branch[len('agent/'):].split('/', 1)[0]
+            if agent and agent not in agents:
+                add('warning', 'partition_missing', '分支 %s 的 Agent 目录不存在：agents/%s/' % (branch, agent))
+    except Exception as exc:
+        add('warning', 'worktree_unreadable', '工作树信息读不到：%s' % exc)
+
+    errors = sum(1 for check in checks if check['level'] == 'error')
+    warnings = sum(1 for check in checks if check['level'] == 'warning')
+    return {'root': str(root), 'store_dir': str(store_dir), 'checks': checks,
+            'errors': errors, 'warnings': warnings, 'ok': errors == 0}
+
+
+def render_doctor(result):
+    """Human-readable relay doctor output."""
+    labels = {'ok': '[OK]', 'info': '[..]', 'warning': '[WARN]', 'error': '[ERR]'}
+    lines = ['项目体检：' + result['root']]
+    for check in result.get('checks', []):
+        lines.append('%s %s' % (labels.get(check.get('level'), '[?]'), check.get('message')))
+    lines.append('结果：%d 个错误，%d 个警告' % (result.get('errors', 0),
+                                                result.get('warnings', 0)))
+    return '\n'.join(lines)
+
+
 def cross_agent_check(store_dir, agents=None):
     """Compare per-agent memory facts; return {'conflicts': [...], 'facts': {agent: {...}}}.
 
