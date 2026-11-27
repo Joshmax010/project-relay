@@ -75,7 +75,7 @@ relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
 - macOS / Linux：`~/.agents/skills/project-relay`
 - 或项目级：`<项目根>/.dsh/skills/project-relay`
 
-重启 DSH 会话即可。zip 里自带 `SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`，以及 `dsh-plugin/project-relay-hooks/`；不依赖额外 clone。自动写会话卡还需要安装插件：`dsh plugin --profile <profile> add <skill目录>\dsh-plugin\project-relay-hooks`，或在 DSH Plugins 界面选择该目录。
+重启 DSH 会话即可。zip 里自带 `SKILL.md`、`scripts/`、`assets/template-v2/`、`references/`，以及 `dsh-plugin/project-relay-hooks/`；不依赖额外 clone。自动写会话卡还需要安装插件：`dsh plugin --profile <profile> add <skill目录>/dsh-plugin/project-relay-hooks`，或在 DSH Plugins 界面选择该目录。
 
 ### 方式二：从源码安装（开发或自定义）
 

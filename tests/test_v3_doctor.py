@@ -61,6 +61,7 @@ class TestDoctor(V3Base):
         project = json.loads(path.read_text(encoding='utf-8'))
         project['project_id'] = 'not-a-32-char-hex-id'
         path.write_text(json.dumps(project), encoding='utf-8')
+        relay.update_checksum_manifest(self.store_dir(root))
         result = flow.doctor(root)
         self.assertIn('project_invalid', [check['code'] for check in result['checks']])
         self.assertEqual(1, result['errors'])

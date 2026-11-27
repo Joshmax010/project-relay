@@ -39,7 +39,7 @@ def _install_text(version):
 4. 需要 Git 和 Python 3.8+。
 5. 自动写会话卡还需要安装 DSH 插件：
    在项目里运行
-   `dsh plugin --profile <profile> add <project-relay>\dsh-plugin\project-relay-hooks`，
+   `dsh plugin --profile <profile> add <project-relay>/dsh-plugin/project-relay-hooks`，
    或在 DSH 的 Plugins 界面选择该本地插件目录。
 '''
 
