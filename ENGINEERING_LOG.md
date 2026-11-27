@@ -413,4 +413,5 @@
 - 发行 zip / `recipe install` 现在会带上 `dsh-plugin/project-relay-hooks`；安装后用户可直接用 `dsh plugin --profile <profile> add <技能目录>/dsh-plugin/project-relay-hooks` 安装插件。
 - `recipe install` 增加安装自检：检查 SKILL.md、scripts、template-v2、插件 package/index/cordis；缺失时直接失败并列出缺少文件。
 - `project.json` 增加 `schema_version`（当前 1）；旧档案缺字段时 doctor 给出 warning，`relay project upgrade` 会补齐并刷新 checksum manifest。
-- 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示测试；全量 **327 tests OK**（414.304s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\dist-upgrade-full-tests.log`）；`git diff --check` 通过。
+- 复核清理：ensure_project_file 在补 schema/身份字段后刷新 checksum manifest，避免 init/adopt 产生假警；_plugin_hook_source 复用 pip --user 的 data roots；文档里的插件路径改成正斜杠；默认导出 zip 改走 .git/info/exclude，不再改脏已跟踪 .gitignore。
+- 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示、pip --user 插件源、manifest 刷新、已跟踪 .gitignore 导出测试；全量 **334 tests OK**（454.482s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\cleanup-21-22-full-tests.log`）；`git diff --check` 通过。
