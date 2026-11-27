@@ -2,7 +2,7 @@
 
 给 Git 代码项目建一份项目记忆，让 Agent 住进项目里。项目是宿主，Agent 是住户：项目记忆归项目所有，不是某个 Agent 的全部记忆。会话、设备或 Agent 换了，都不用重新交代；只有项目目标需要人确认，代码合并需要你批准。
 
-当前技能包版本：**0.2.0**。
+当前技能包版本：**0.3.0**。
 
 Project Relay 是一个 Agent Skill（见 [SKILL.md](SKILL.md)），配一套命令行工具（`scripts/relay.py`，只用 Python 标准库）。它记录项目做到哪了、为什么这么写、下一步该干什么，并给多个 Agent 提供互不干扰的 Git 分支和工作树。单 Agent 是正常模式，多 Agent 不是门槛；每个 Agent 只写自己的活动分区，不拥有整份项目记忆。
 
@@ -65,11 +65,11 @@ relay work merge --agent deepseek-harness --confirm   # 你批准之后才跑
 
 ## 安装（DeepSeek Harness）
 
-需要 Git 和 Python 3.8+。技能包版本 0.2.0。
+需要 Git 和 Python 3.8+。技能包版本 0.3.0。
 
 ### 方式一：下载发行 zip（推荐普通 DSH 用户）
 
-下载 [project-relay-dsh-skill-v0.2.0.zip](https://github.com/Joshmax010/project-relay/releases/tag/v0.2.0)，解压后把整个 `project-relay/` 文件夹放到：
+下载 [project-relay-dsh-skill-v0.3.0.zip](https://github.com/Joshmax010/project-relay/releases/tag/v0.3.0)，解压后把整个 `project-relay/` 文件夹放到：
 
 - Windows：`%USERPROFILE%\.agents\skills\project-relay`
 - macOS / Linux：`~/.agents/skills/project-relay`
