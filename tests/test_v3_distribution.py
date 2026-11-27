@@ -81,6 +81,25 @@ class TestSkillDistribution(V3Base):
         self.assertEqual(relay.ARCHIVE_SCHEMA_VERSION,
                          json.loads(path.read_text(encoding='utf-8'))['schema_version'])
 
+    def test_init_repair_preserves_unrelated_manifest_damage(self):
+        root = self.init()
+        store = self.store_dir(root)
+        state = store / 'state.md'
+        state.write_text(state.read_text(encoding='utf-8') + 'corrupt\n',
+                         encoding='utf-8')
+        project_path = store / 'project.json'
+        project = json.loads(project_path.read_text(encoding='utf-8'))
+        project.pop('schema_version', None)
+        project_path.write_text(json.dumps(project), encoding='utf-8')
+        relay.update_checksum_manifest_entry(store, relay.PROJECT_FILE)
+        relay.init(root)
+        _present, mismatches = relay.verify_checksum_manifest(store)
+        self.assertEqual(['state.md'], [m['file'] for m in mismatches])
+        result = flow.doctor(root)
+        self.assertIn('manifest_mismatch',
+                      [check['code'] for check in result['checks']])
+        self.assertEqual(1, result['errors'])
+
     def test_doctor_warns_when_schema_version_missing(self):
         root = self.init()
         path = self.store_dir(root) / 'project.json'

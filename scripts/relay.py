@@ -348,10 +348,9 @@ def _ensure_project_file_unlocked(store_dir, root):
         changed = True
     if changed:
         save(path, project)
-        # A schema/identity repair changes project.json bytes. Refresh the
-        # manifest here so a later doctor/resume does not report a fake
-        # integrity error after an otherwise harmless init/adopt.
-        update_checksum_manifest(store_dir)
+        # Only project.json changed; updating the whole manifest here would
+        # launder any unrelated pre-existing damage into "valid".
+        update_checksum_manifest_entry(store_dir, PROJECT_FILE)
     return project
 
 
@@ -432,7 +431,7 @@ def upgrade_project(toplevel):
     require(store_dir.is_dir(), '项目尚未建仓：' + str(store_dir))
     _reject_store_symlinks(store_dir)
     project = ensure_project_file(store_dir, root)
-    update_checksum_manifest(store_dir)
+    update_checksum_manifest_entry(store_dir, PROJECT_FILE)
     register_project(root, store_dir, project)
     return {'root': str(root), 'project': project,
             'schema_version': project.get('schema_version')}
@@ -931,6 +930,33 @@ def update_checksum_manifest(store_dir):
          {'updated_at': utc(),
           'files': {rel: digest(data) for rel, data in files.items()}})
     return len(files)
+
+def update_checksum_manifest_entry(store_dir, relpath):
+    """Refresh one manifest entry without re-stamping unrelated damage.
+
+    ensure_project_file repairs one file. A full manifest rebuild would
+    launder any other pre-existing mismatches into "valid", destroying the
+    evidence doctor/resume need to report.
+    """
+    path = Path(store_dir) / CHECKSUM_MANIFEST
+    if not path.exists():
+        return update_checksum_manifest(store_dir)
+    try:
+        data = read_json(path)
+    except (OSError, ValueError):
+        return update_checksum_manifest(store_dir)
+    files = data.get('files') if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return update_checksum_manifest(store_dir)
+    rel = str(relpath).replace('\\', '/')
+    target = Path(store_dir) / rel
+    if target.is_file():
+        files[rel] = digest(target.read_bytes())
+    else:
+        files.pop(rel, None)
+    save(path, {'updated_at': utc(), 'files': files})
+    return len(files)
+
 
 def verify_checksum_manifest(store_dir):
     """Returns (present, mismatches). Extra files are ignored: merges and

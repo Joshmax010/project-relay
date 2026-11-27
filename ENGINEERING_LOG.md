@@ -415,3 +415,9 @@
 - `project.json` 增加 `schema_version`（当前 1）；旧档案缺字段时 doctor 给出 warning，`relay project upgrade` 会补齐并刷新 checksum manifest。
 - 复核清理：ensure_project_file 在补 schema/身份字段后刷新 checksum manifest，避免 init/adopt 产生假警；_plugin_hook_source 复用 pip --user 的 data roots；文档里的插件路径改成正斜杠；默认导出 zip 改走 .git/info/exclude，不再改脏已跟踪 .gitignore。
 - 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示、pip --user 插件源、manifest 刷新、已跟踪 .gitignore 导出测试；全量 **334 tests OK**（454.482s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\cleanup-21-22-full-tests.log`）；`git diff --check` 通过。
+
+### 清单假警后续（2026-11-27）
+
+- 新增 `update_checksum_manifest_entry`：只更新被修复文件（project.json）的清单项，不整表重算。
+- `ensure_project_file` / `project upgrade` / import 身份修复都改用单条更新；其他文件的既有损坏保留在清单里，doctor 仍能报出。
+- 新增「先改坏 state.md，再 init 修复身份，doctor 仍报 state.md 不符」回归测试；全量 **335 tests OK**（478.206s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\manifest-incremental-full-tests.log`）；`git diff --check` 通过。

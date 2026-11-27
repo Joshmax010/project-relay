@@ -2559,7 +2559,7 @@ def import_bundle(bundle_dir, toplevel, confirm=False):
             try:
                 canonical = Path(relay.main_worktree(toplevel)).resolve()
                 project = relay.ensure_project_file(store_dir, canonical)
-                relay.update_checksum_manifest(store_dir)
+                relay.update_checksum_manifest_entry(store_dir, relay.PROJECT_FILE)
                 relay.register_project(canonical, store_dir, project)
             except Exception as exc:
                 warnings.append('定位缓存登记失败（档案已导入）：%s' % exc)
