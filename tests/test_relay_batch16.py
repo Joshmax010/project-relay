@@ -122,9 +122,9 @@ class TestDshRecipe(unittest.TestCase):
 
     def test_version_and_packaged_templates_are_consistent(self):
         from v3_helpers import relay
-        self.assertEqual('0.2.0', relay.VERSION)
+        self.assertEqual('0.3.0', relay.VERSION)
         pyproject = (SKILL / 'pyproject.toml').read_text(encoding='utf-8')
-        self.assertIn('version = "0.2.0"', pyproject)
+        self.assertIn('version = "0.3.0"', pyproject)
         for name in relay.AGENT_FILES:
             template = 'agent-goal.md' if name == 'goal.md' else name
             self.assertIn('assets/template-v2/' + template, pyproject,

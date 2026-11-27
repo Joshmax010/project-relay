@@ -415,3 +415,9 @@
 - `project.json` 增加 `schema_version`（当前 1）；旧档案缺字段时 doctor 给出 warning，`relay project upgrade` 会补齐并刷新 checksum manifest。
 - 复核清理：ensure_project_file 在补 schema/身份字段后刷新 checksum manifest，避免 init/adopt 产生假警；_plugin_hook_source 复用 pip --user 的 data roots；文档里的插件路径改成正斜杠；默认导出 zip 改走 .git/info/exclude，不再改脏已跟踪 .gitignore。
 - 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示、pip --user 插件源、manifest 刷新、已跟踪 .gitignore 导出测试；全量 **334 tests OK**（454.482s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\cleanup-21-22-full-tests.log`）；`git diff --check` 通过。
+
+### v0.3.0 正式发行（2026-11-27）
+
+- 版本号从 0.2.0 升至 0.3.0；发行包包含 DSH 插件、schema_version 和 doctor。
+- 生成 `dist/project-relay-dsh-skill-v0.3.0.zip`（36 entries，188251 bytes）；验证包含 `dsh-plugin/project-relay-hooks`。
+- 验证：`tests.test_relay_batch16` / `test_package_dsh` / `test_v3_distribution` 16 tests OK；全量 **334 tests OK**（536.584s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\release-v0.3.0-full-tests.log`）；`git diff --check` 通过。

@@ -159,7 +159,7 @@ def anchor(root):
 
 
 # ---------------------------------------------------------------- store
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 ARCHIVE_SCHEMA_VERSION = 1
 STORE_DIRNAME = '.project-relay'
 HANDOFF_ZIP_PATTERN = '*-project-relay-*.zip'
