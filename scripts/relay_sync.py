@@ -1365,7 +1365,7 @@ def export_zip(toplevel, zip_path=None, device_name=None, device_id=None,
     store_dir = relay.resolve_store_dir(toplevel)
     if zip_path is None:
         zip_path = default_export_zip_path(toplevel)
-        relay.ensure_gitignore(toplevel)
+        relay.ensure_local_exclude(toplevel, relay.HANDOFF_ZIP_PATTERN)
     zip_path = Path(zip_path)
     require(not zip_path.exists(), '目标 zip 已存在，不覆盖：' + str(zip_path))
     name, did = _zip_device(device_name, device_id)

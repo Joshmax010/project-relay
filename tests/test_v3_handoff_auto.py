@@ -17,6 +17,17 @@ class TestAutomaticHandoff(V3Base):
         self.assertTrue(path.name.startswith('proj-project-relay-'))
         self.assertTrue(path.is_file())
 
+    def test_default_export_does_not_dirty_tracked_gitignore(self):
+        root = self.init()
+        self.confirm_goal(root)
+        self.git(root, 'add', '.gitignore')
+        self.git(root, 'commit', '-m', 'gitignore')
+        before = (root / '.gitignore').read_bytes()
+        result = sync.export_zip(root)
+        self.assertEqual(before, (root / '.gitignore').read_bytes())
+        self.assertEqual('', self.git(root, 'status', '--porcelain').stdout.decode('utf-8').strip())
+        self.assertTrue(Path(result['zip']).is_file())
+
     def test_import_zip_registers_fresh_project(self):
         source = self.init('source')
         self.confirm_goal(source)

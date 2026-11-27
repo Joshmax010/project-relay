@@ -348,6 +348,10 @@ def _ensure_project_file_unlocked(store_dir, root):
         changed = True
     if changed:
         save(path, project)
+        # A schema/identity repair changes project.json bytes. Refresh the
+        # manifest here so a later doctor/resume does not report a fake
+        # integrity error after an otherwise harmless init/adopt.
+        update_checksum_manifest(store_dir)
     return project
 
 
@@ -632,26 +636,53 @@ def agent_lock(store_dir, agent):
     return _StoreLock(agent_dir(store_dir, agent) / '.write.lock')
 
 
+def _local_exclude_path(toplevel):
+    """Path to the repository-local .git/info/exclude."""
+    root = Path(main_worktree(toplevel))
+    result = git(root, 'rev-parse', '--git-path', 'info/exclude', check=False)
+    if result.returncode == 0:
+        path = Path(os.fsdecode(result.stdout).strip())
+        return path if path.is_absolute() else root / path
+    return root / '.git' / 'info' / 'exclude'
+
+
+def ensure_local_exclude(toplevel, pattern):
+    """Add one pattern to .git/info/exclude without touching tracked files."""
+    path = _local_exclude_path(toplevel)
+    if path.exists():
+        raw = path.read_bytes()
+        newline = b'\r\n' if b'\r\n' in raw else b'\n'
+        lines = raw.decode('utf-8', errors='replace').splitlines()
+        if pattern in [line.strip() for line in lines]:
+            return False
+        lines.append(pattern)
+        atomic(path, (newline.decode().join(lines) + newline.decode()).encode('utf-8'))
+        return True
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic(path, (pattern + '\n').encode('utf-8'))
+    return True
+
+
 def ensure_gitignore(toplevel):
-    """Make sure .project-relay/ and generated handoff zips stay out of git.
+    """Make sure .project-relay/ stays out of tracked .gitignore.
 
     档案默认不进 git，换设备只走 ZIP。已有的 .gitignore 只追加缺失行，
-    不动其他内容（CRLF 文件保持 CRLF）。"""
+    不动其他内容（CRLF 文件保持 CRLF）。生成的交接 zip 走本地
+    .git/info/exclude，避免弄脏已跟踪文件。
+    """
     root = Path(main_worktree(toplevel))
     gi = root / '.gitignore'
-    entries = [STORE_DIRNAME + '/', HANDOFF_ZIP_PATTERN]
+    entry = STORE_DIRNAME + '/'
     if gi.exists():
         raw = gi.read_bytes()
         newline = b'\r\n' if b'\r\n' in raw else b'\n'
         lines = raw.decode('utf-8', errors='replace').splitlines()
-        present = [line.strip() for line in lines]
-        missing = [entry for entry in entries if entry not in present]
-        if not missing:
+        if entry in [line.strip() for line in lines]:
             return False
-        lines.extend(missing)
+        lines.append(entry)
         atomic(gi, (newline.decode().join(lines) + newline.decode()).encode('utf-8'))
         return True
-    atomic(gi, ('\n'.join(entries) + '\n').encode('utf-8'))
+    atomic(gi, (entry + '\n').encode('utf-8'))
     return True
 
 
@@ -839,6 +870,7 @@ def init(toplevel):
             dest.write_text('', encoding='utf-8')
     write_index(store_dir)
     ignored = ensure_gitignore(root)
+    ensure_local_exclude(root, HANDOFF_ZIP_PATTERN)
     project = ensure_project_file(store_dir, root)
     register_project(root, store_dir, project)
     return {'store_dir': str(store_dir), 'root': str(root),

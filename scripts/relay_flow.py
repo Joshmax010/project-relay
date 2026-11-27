@@ -1935,24 +1935,29 @@ def hook_stage(cwd, agent, session, text, llm_usage=None):
                               llm_usage=llm_usage)
 
 
-def _skill_text_candidates():
-    """Repo checkout, prefix data files, then pip --user data files."""
-    candidates = [Path(__file__).resolve().parent.parent / 'SKILL.md']
+def _data_roots():
+    """Prefix data dir plus pip --user scheme dirs, de-duplicated."""
     roots = [sysconfig.get_path('data')]
     for scheme in ('nt_user', 'posix_user', 'osx_framework_user'):
         try:
             roots.append(sysconfig.get_path('data', scheme=scheme))
         except (KeyError, AttributeError):
             continue
+    out = []
     seen = set()
-    for data_root in roots:
-        if not data_root:
+    for root in roots:
+        if not root or root in seen:
             continue
-        path = Path(data_root) / 'share' / 'project-relay' / 'SKILL.md'
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            candidates.append(path)
+        seen.add(root)
+        out.append(Path(root))
+    return out
+
+
+def _skill_text_candidates():
+    """Repo checkout, prefix data files, then pip --user data files."""
+    candidates = [Path(__file__).resolve().parent.parent / 'SKILL.md']
+    for data_root in _data_roots():
+        candidates.append(data_root / 'share' / 'project-relay' / 'SKILL.md')
     return candidates
 
 
@@ -1985,9 +1990,8 @@ _SKILL_REQUIRED = ('SKILL.md', 'scripts/relay.py', 'scripts/relay_flow.py',
 def _plugin_hook_source():
     """Locate the bundled DSH plugin beside the repo or in pip data files."""
     candidates = [_HERE.parent / 'dsh-plugin' / 'project-relay-hooks']
-    data_root = sysconfig.get_path('data')
-    if data_root:
-        candidates.append(Path(data_root) / 'share' / 'project-relay'
+    for data_root in _data_roots():
+        candidates.append(data_root / 'share' / 'project-relay'
                           / 'dsh-plugin' / 'project-relay-hooks')
     for candidate in candidates:
         if candidate.is_dir():
