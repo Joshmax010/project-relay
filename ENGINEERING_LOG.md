@@ -416,6 +416,13 @@
 - 复核清理：ensure_project_file 在补 schema/身份字段后刷新 checksum manifest，避免 init/adopt 产生假警；_plugin_hook_source 复用 pip --user 的 data roots；文档里的插件路径改成正斜杠；默认导出 zip 改走 .git/info/exclude，不再改脏已跟踪 .gitignore。
 - 新增发行 zip 包含插件、安装自检、schema 升级、doctor 缺版本提示、pip --user 插件源、manifest 刷新、已跟踪 .gitignore 导出测试；全量 **334 tests OK**（454.482s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\cleanup-21-22-full-tests.log`）；`git diff --check` 通过。
 
+### DSH plugin session lookup 修复（2026-11-28）
+
+- DSH 0.2.2 的 `Agent` 只有 `id`（SessionId），没有 `agent.session`；插件改为优先 `agent.session`，否则 `ctx.sessions.get(agent.id)`。
+- 会话 cwd 改用 `ctx.workingDirectory.get(session)`（`session.header.cwd` 是会话初始目录，不等于用户当前工作目录）。
+- 更新插件事件测试为真实 `{ agent: { id: "sess-1" }, turn, signal }` 形状，并模拟 `workingDirectory` 投影，验证 Stop 仍触发 `relay hook stop`。
+- 新增 `references/dsh-plugin-integration.md`，记录真实 DSH 事件字段、cwd 取值和排查顺序。
+
 ### v0.3.0 正式发行（2026-11-27）
 
 - 版本号从 0.2.0 升至 0.3.0；发行包包含 DSH 插件、schema_version 和 doctor。
