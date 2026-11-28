@@ -19,6 +19,10 @@ function logWarn(ctx, message) {
   else console.warn(message)
 }
 
+function sessionCwd(ctx, session) {
+  return ctx?.workingDirectory?.get?.(session) || session?.header?.cwd
+}
+
 function textFromBlocks(blocks) {
   if (!Array.isArray(blocks)) return ''
   return blocks
@@ -107,7 +111,7 @@ export function apply(ctx, config = {}) {
     const count = (counts.get(sessionId) || 0) + 1
     counts.set(sessionId, count)
     if (count % stageEveryTurns !== 0) return
-    const cwd = session.header?.cwd
+    const cwd = sessionCwd(ctx, session)
     if (!cwd) return
     const text = latestText(sessionId, session)
     if (!text) return
@@ -121,12 +125,13 @@ export function apply(ctx, config = {}) {
   const stop = ctx.on('agent/turn-stopping', async (input, next) => {
     const result = typeof next === 'function' ? await next() : undefined
     try {
-      // Official agent/turn-stopping payload: { agent, turn, signal }.
-      // The agent owns the session object; there is no top-level cwd.
+      // Official agent/turn-stopping payload carries the agent subject.
+      // DSH's Agent exposes its SessionId as agent.id; the Session object
+      // lives in ctx.sessions, not as agent.session.
       const agentObj = input?.agent
-      const session = agentObj?.session
-      const sessionId = String(session?.id ?? agentObj?.id ?? '')
-      const cwd = session?.header?.cwd
+      const sessionId = String(agentObj?.id ?? agentObj?.session?.id ?? '')
+      const session = agentObj?.session || (sessionId && ctx.sessions?.get?.(sessionId))
+      const cwd = sessionCwd(ctx, session)
       if (!sessionId || !cwd) {
         logWarn(ctx, 'project-relay: turn-stopping without a session id or cwd; hook stop skipped')
         return result
@@ -150,4 +155,4 @@ export function apply(ctx, config = {}) {
   return () => { disposed(); stop(); turn() }
 }
 
-export const inject = ['sessions']
+export const inject = ['sessions', 'workingDirectory']

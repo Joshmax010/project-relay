@@ -421,3 +421,10 @@
 - 版本号从 0.2.0 升至 0.3.0；发行包包含 DSH 插件、schema_version 和 doctor。
 - 生成 `dist/project-relay-dsh-skill-v0.3.0.zip`（36 entries，188251 bytes）；验证包含 `dsh-plugin/project-relay-hooks`。
 - 验证：`tests.test_relay_batch16` / `test_package_dsh` / `test_v3_distribution` 16 tests OK；全量 **334 tests OK**（536.584s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\release-v0.3.0-full-tests.log`）；`git diff --check` 通过。
+
+### DSH 插件真实接线修复（2026-11-28）
+
+- `agent/turn-stopping` 实际 `agent` 只有 `id`，Session 改用 `ctx.sessions.get(agent.id)` 取。
+- 当前项目目录用 `ctx.workingDirectory.get(session)`，不再使用 `session.header.cwd`。
+- `inject` 增加 `workingDirectory`；新增 `references/dsh-plugin-integration.md` 记录排查经验。
+- 真实桌面会话验证：Stop 自动生成 `cap-0001` / `card-0001`（session-end，306 字符）。

@@ -13,6 +13,7 @@
 ## 主要变化
 
 - DSH Stop / 阶段钩子：`relay hook stop` / `relay hook stage`，配套 `project-relay-hooks` 插件
+- DSH 插件真实事件修复：`agent/turn-stopping` 用 `agent.id` + `ctx.sessions.get` 取 Session，用 `ctx.workingDirectory.get` 取当前项目目录
 - `relay resume` 首屏「你的分区」，支持 `agent/<name>` 分支/工作树识别
 - 会话卡默认上限 3000 字符，坏卡不阻断接手，成本保险丝和月度软上限（默认 200000）
 - 项目身份证 `project.json` 增加 `schema_version`，新增 `relay project upgrade`
@@ -47,4 +48,4 @@ relay project upgrade
 ## 验证
 
 - 全量：334 tests OK（skipped=3）
-- 发行 zip：36 entries，含插件文件
+- 发行 zip：36 entries，含插件文件（插件已包含真实 DSH 事件修复）
