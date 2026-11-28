@@ -422,3 +422,9 @@
 - 会话 cwd 改用 `ctx.workingDirectory.get(session)`（`session.header.cwd` 是会话初始目录，不等于用户当前工作目录）。
 - 更新插件事件测试为真实 `{ agent: { id: "sess-1" }, turn, signal }` 形状，并模拟 `workingDirectory` 投影，验证 Stop 仍触发 `relay hook stop`。
 - 新增 `references/dsh-plugin-integration.md`，记录真实 DSH 事件字段、cwd 取值和排查顺序。
+
+### v0.3.0 正式发行（2026-11-27）
+
+- 版本号从 0.2.0 升至 0.3.0；发行包包含 DSH 插件、schema_version 和 doctor。
+- 生成 `dist/project-relay-dsh-skill-v0.3.0.zip`（36 entries，188251 bytes）；验证包含 `dsh-plugin/project-relay-hooks`。
+- 验证：`tests.test_relay_batch16` / `test_package_dsh` / `test_v3_distribution` 16 tests OK；全量 **334 tests OK**（536.584s，EXIT 0，skipped=3，日志 `D:\AAAAA\dsh\release-v0.3.0-full-tests.log`）；`git diff --check` 通过。
