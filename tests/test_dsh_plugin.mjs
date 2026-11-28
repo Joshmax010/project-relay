@@ -18,6 +18,12 @@ const warnings = []
 const ctx = {
   logger: { warn: (message) => warnings.push(message) },
   on: (name, fn) => { listeners.set(name, fn); return () => {} },
+  sessions: {
+    get: (id) => id === 'sess-1' ? { id: 'sess-1', header: { cwd: 'D:\\stale' } } : undefined,
+  },
+  workingDirectory: {
+    get: () => tmp,
+  },
 }
 
 try {
@@ -25,7 +31,8 @@ try {
   const stop = listeners.get('agent/turn-stopping')
   assert.equal(typeof stop, 'function')
   const result = await stop({
-    agent: { id: 'agent-1', session: { id: 'sess-1', header: { cwd: tmp } } },
+    // Real DSH 0.2.2 shape: Agent carries only its SessionId; Session comes from ctx.sessions.
+    agent: { id: 'sess-1' },
     turn: 1,
     signal: {},
   }, async () => 'next-result')
